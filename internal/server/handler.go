@@ -310,6 +310,11 @@ func NewHandler(cfg Config) *Handler {
 		cfg.ReqProxy.SetTTFBAccounts(ttfbAccountSource{h: h})
 		cfg.ReqProxy.SetTTFBRefresher(ttfbTokenRefresher{h: h})
 	}
+	// 代理分组解析器：账号归属分组 → 绑定的代理分组并集（D4）。
+	// Groups 或 ReqProxy 未启用时不注入（Pool.groupResolver=nil = 不限制）。
+	if cfg.ReqProxy != nil && cfg.Groups != nil {
+		cfg.ReqProxy.SetGroupResolver(proxyGroupResolver{h: h})
+	}
 	h.featuresMu.Lock()
 	h.sanitizeHooks.setSanitize = cfg.SetSanitizeFingerprints
 	h.sanitizeHooks.setCodex = cfg.SetCodexCompat
@@ -335,6 +340,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/groups", h.withFrontend(h.adminGroups))
 	h.mux.HandleFunc("PUT /admin/groups/{name}", h.withFrontend(h.adminGroup))
 	h.mux.HandleFunc("DELETE /admin/groups/{name}", h.withFrontend(h.adminGroup))
+	h.mux.HandleFunc("GET /admin/groups/{name}/proxy-bindings", h.withFrontend(h.adminGroupProxyBindings))
+	h.mux.HandleFunc("PUT /admin/groups/{name}/proxy-bindings", h.withFrontend(h.adminGroupProxyBindings))
+	h.mux.HandleFunc("POST /admin/groups/auto-detect-regions", h.withFrontend(h.adminAutoDetectRegions))
 	h.mux.HandleFunc("GET /admin/accounts/{uid}/groups", h.withFrontend(h.adminAccountGroups))
 	h.mux.HandleFunc("PUT /admin/accounts/{uid}/groups", h.withFrontend(h.adminAccountGroups))
 	h.mux.HandleFunc("GET /admin/keys", h.withFrontend(h.adminKeys))
@@ -380,6 +388,12 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("DELETE /admin/reqproxy/subscriptions/{id}", h.withFrontend(h.reqproxySubPutDelete))
 	h.mux.HandleFunc("POST /admin/reqproxy/subscriptions/{id}/refresh", h.withFrontend(h.reqproxySubRefresh))
 	h.mux.HandleFunc("POST /admin/reqproxy/subscriptions/preview", h.withFrontend(h.reqproxySubPreview))
+	// 代理分组管理 + 手动节点归组。
+	h.mux.HandleFunc("GET /admin/reqproxy/groups", h.withFrontend(h.reqproxyGroupsGet))
+	h.mux.HandleFunc("POST /admin/reqproxy/groups", h.withFrontend(h.reqproxyGroupsPost))
+	h.mux.HandleFunc("PUT /admin/reqproxy/groups/{id}", h.withFrontend(h.reqproxyGroupPutDelete))
+	h.mux.HandleFunc("DELETE /admin/reqproxy/groups/{id}", h.withFrontend(h.reqproxyGroupPutDelete))
+	h.mux.HandleFunc("PUT /admin/reqproxy/nodes/{id}/group", h.withFrontend(h.reqproxyNodeGroup))
 	h.mux.HandleFunc("GET /admin/reqproxy/nodes", h.withFrontend(h.reqproxyNodesGet))
 	h.mux.HandleFunc("POST /admin/reqproxy/nodes/import", h.withFrontend(h.reqproxyNodesImport))
 	h.mux.HandleFunc("DELETE /admin/reqproxy/nodes/{id}", h.withFrontend(h.reqproxyNodeDelete))
@@ -442,7 +456,9 @@ func NewHandler(cfg Config) *Handler {
 				if h.cfg.Groups == nil {
 					return nil // 分组存储未启用：登记是无操作
 				}
-				return h.cfg.Groups.SetAccountGroups(uid, gs)
+				// 区域校验：自动加号拉的都是中国区账号，目标分组区域
+				// 必须兼容 cn（default/all 或 cn 分组）。
+				return h.setAccountGroupsChecked(uid, gs)
 			},
 		)
 		h.cfg.AutoEnroll.SetLedgerPath(cfg.AutoEnrollLedger)
@@ -2876,6 +2892,17 @@ func (h *Handler) persistAccount(cred accountCredential, region string) (map[str
 		// The account is already usable in the current process. Return a warning
 		// so an unwritable config mount does not hide the restart persistence fix.
 		response["warning"] = "账号已添加，但混合区域配置未能保存：" + configErr.Error()
+	}
+	// 新账号登记分组归属：未登记账号读取时兜底 default，但区域化后
+	// default（all）装任何区域都兼容；显式登记让计数/选号过滤可见。
+	// 已登记的账号不动（管理员可能已手动调过分组）。
+	if h.cfg.Groups != nil {
+		if len(h.cfg.Groups.AccountGroups(cred.UID)) == 0 {
+			if err := h.setAccountGroupsChecked(cred.UID, []string{groups.DefaultGroup}); err != nil {
+				// default 是 all 区域组，任何账号都能进；失败仅记录。
+				log.Printf("account add: register default group failed: %v", err)
+			}
+		}
 	}
 	return response, http.StatusOK, nil
 }

@@ -1,36 +1,61 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Alert, App, Button, Card, Empty, Form, Input, Modal, Popconfirm,
+  Alert, App, Button, Card, Empty, Form, Input, Modal, Popconfirm, Select,
   Space, Table, Tag, Tooltip, Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons';
 
 const { Text, Paragraph } = Typography;
 
+// 区域标签。
+const regionTag = region => {
+  if (region === 'cn') return <Tag color="volcano">CN 区</Tag>;
+  if (region === 'global') return <Tag color="geekblue">国际区</Tag>;
+  return <Tag color="default">不限区域</Tag>;
+};
+const REGION_OPTIONS = [
+  { value: 'cn', label: 'CN 区（只装中国区账号）' },
+  { value: 'global', label: '国际区（只装国际区账号）' },
+  { value: 'all', label: '不限区域（CN + 国际都可）' },
+];
+const REGION_EDIT_OPTIONS = REGION_OPTIONS; // 编辑时 all 也允许（回退迁移态）
+
 // GroupsAndKeysPage 分组与密钥管理。
 //
-// 分组：default 恒存在不可改删（后端兜底），其余可建/改名/删（组内有账号
-// 或密钥引用时后端拒绝删除，界面如实报错）。
+// 分组：default 恒存在不可改删（后端兜底），其余可建/改名/改区域/删（组内
+// 有账号或密钥引用时后端拒绝删除，界面如实报错）。区域：cn/global/all，
+// 区域化后 CN 分组不能装国际账号、不能绑国际代理分组。
 // 密钥：创建时完整密钥只在弹窗里出现一次；列表脱敏展示。
 export default function GroupsAndKeysPage({ api }) {
   const { message } = App.useApp();
   const [groups, setGroups] = useState(null);
   const [keys, setKeys] = useState(null);
+  const [proxyGroups, setProxyGroups] = useState([]);
   const [loading, setLoading] = useState(false);
   // groupModal: {mode:'create'|'rename', name?}
   const [groupModal, setGroupModal] = useState(null);
   const [keyModal, setKeyModal] = useState(null);
+  // bindModal: {name} 编辑账号分组的代理分组绑定。
+  const [bindModal, setBindModal] = useState(null);
   // createdKey: 新建密钥的一次性完整回显。
   const [createdKey, setCreatedKey] = useState(null);
   const [groupForm] = Form.useForm();
   const [keyForm] = Form.useForm();
+  const [bindForm] = Form.useForm();
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [g, k] = await Promise.all([api('/admin/groups'), api('/admin/keys')]);
-      setGroups(g.groups || []);
-      setKeys(k.keys || []);
+      const reqs = [api('/admin/groups'), api('/admin/keys')];
+      // 代理分组列表可选（reqproxy 模块未启用时 503，绑定编辑器降级隐藏）。
+      const results = await Promise.allSettled(reqs);
+      setGroups(results[0].status === 'fulfilled' ? results[0].value.groups || [] : null);
+      setKeys(results[1].status === 'fulfilled' ? results[1].value.keys || [] : null);
+      setProxyGroups([]);
+      try {
+        const pg = await api('/admin/reqproxy/groups');
+        setProxyGroups(pg.data || []);
+      } catch { /* 模块未启用 */ }
     } catch (err) {
       message.error(err.message);
     } finally {
@@ -46,7 +71,7 @@ export default function GroupsAndKeysPage({ api }) {
     const values = await groupForm.validateFields();
     try {
       if (groupModal.mode === 'create') {
-        await api('/admin/groups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: values.name }) });
+        await api('/admin/groups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: values.name, region: values.region }) });
         message.success(`分组 ${values.name} 已创建`);
       } else {
         await api(`/admin/groups/${encodeURIComponent(groupModal.name)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: values.name }) });
@@ -59,10 +84,48 @@ export default function GroupsAndKeysPage({ api }) {
     }
   };
 
+  const changeRegion = async (name, region) => {
+    try {
+      await api(`/admin/groups/${encodeURIComponent(name)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ region }) });
+      message.success(`分组 ${name} 区域已更新`);
+      await load();
+    } catch (err) {
+      message.error(err.message);
+      await load(); // 刷新回显真实值
+    }
+  };
+
+  const autoDetect = async () => {
+    try {
+      const res = await api('/admin/groups/auto-detect-regions', { method: 'POST' });
+      const set = (res.results || []).filter(r => r.action === 'set').length;
+      const skipped = (res.results || []).length - set;
+      message.success(`区域识别完成：${set} 个分组已设置${skipped ? `，${skipped} 个跳过（混合区域或已设置）` : ''}`);
+      await load();
+    } catch (err) {
+      message.error(err.message);
+    }
+  };
+
   const deleteGroup = async name => {
     try {
       await api(`/admin/groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
       message.success(`分组 ${name} 已删除`);
+      await load();
+    } catch (err) {
+      message.error(err.message);
+    }
+  };
+
+  const submitBind = async () => {
+    const values = await bindForm.validateFields();
+    try {
+      await api(`/admin/groups/${encodeURIComponent(bindModal.name)}/proxy-bindings`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ proxy_groups: values.proxy_groups || [] }),
+      });
+      message.success('代理分组绑定已更新（已绑定的账号下次分配代理时生效）');
+      setBindModal(null);
       await load();
     } catch (err) {
       message.error(err.message);
@@ -127,13 +190,21 @@ export default function GroupsAndKeysPage({ api }) {
 
   const groupColumns = [
     { title: '分组', dataIndex: 'name', render: groupName },
+    { title: '区域', dataIndex: 'region', width: 130, render: regionTag },
     { title: '账号数', dataIndex: 'accounts', render: v => <Text>{v}</Text> },
     { title: '绑定密钥', dataIndex: 'keys', render: v => (v ? <Tag color="geekblue">{v} 把</Tag> : <Text type="secondary">无</Text>) },
+    {
+      title: '绑定代理分组',
+      dataIndex: 'proxy_bindings',
+      render: (v, record) => (v
+        ? <Tooltip title="该分组的账号只能走这些代理分组的节点（所有归属分组都绑定时生效）"><Tag color="cyan">{v} 个</Tag></Tooltip>
+        : <Text type="secondary">不限制</Text>),
+    },
     {
       title: '操作',
       render: (_, record) => (
         record.default
-          ? <Tooltip title="默认分组不可编辑或删除"><Text type="secondary">—</Text></Tooltip>
+          ? <Tooltip title="默认分组不可改名或删除（区域与代理绑定可改）"><Space><Text type="secondary">—</Text></Space></Tooltip>
           : (
             <Space>
               <Button size="small" icon={<EditOutlined />} onClick={() => { setGroupModal({ mode: 'rename', name: record.name }); groupForm.setFieldsValue({ name: record.name }); }}>改名</Button>
@@ -164,6 +235,14 @@ export default function GroupsAndKeysPage({ api }) {
     },
   ];
 
+  // 代理分组绑定选项（区域兼容过滤：账号分组为 all 时都可，否则同区）。
+  const bindOptions = record => proxyGroups
+    .filter(pg => !record.region || record.region === 'all' || pg.region === record.region)
+    .map(pg => ({
+      value: pg.id,
+      label: `${pg.name}（${pg.region === 'cn' ? 'CN' : '国际'}区 · ${pg.nodes} 节点${pg.sub_id ? ' · 订阅专属' : ''}）`,
+    }));
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Card
@@ -171,12 +250,40 @@ export default function GroupsAndKeysPage({ api }) {
         extra={(
           <Space>
             <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>刷新</Button>
+            <Tooltip title="按组内成员账号的实际区域自动设置：纯 CN 账号组→CN 区、纯国际组→国际区；混合或空组跳过。仅处理「不限区域」的分组。">
+              <Button icon={<ThunderboltOutlined />} onClick={autoDetect}>区域识别</Button>
+            </Tooltip>
             <Button type="primary" icon={<PlusOutlined />} onClick={() => { setGroupModal({ mode: 'create' }); groupForm.resetFields(); }}>新建分组</Button>
           </Space>
         )}
       >
-        <Paragraph type="secondary">账号可属于多个分组（在账号列表里设置）；密钥绑定一个分组后只能使用该分组的账号。</Paragraph>
-        <Table rowKey="name" size="small" pagination={false} columns={groupColumns} dataSource={groups} />
+        <Paragraph type="secondary">
+          账号可属于多个分组（在账号列表里设置）；密钥绑定一个分组后只能使用该分组的账号。
+          区域化后：CN 区分组不能装国际区账号，反之亦然；「不限区域」为迁移过渡态，兼容两类账号。
+        </Paragraph>
+        <Table
+          rowKey="name" size="small" pagination={false} columns={groupColumns} dataSource={groups}
+          expandable={{
+            expandedRowRender: record => (
+              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                <Space wrap>
+                  <Text type="secondary">区域：</Text>
+                  <Select
+                    size="small" defaultValue={record.region} style={{ minWidth: 220 }}
+                    options={REGION_EDIT_OPTIONS} onChange={v => changeRegion(record.name, v)}
+                  />
+                  <Button size="small" onClick={() => { setBindModal({ name: record.name }); bindForm.setFieldsValue({ proxy_groups: record.proxy_binding_ids || [] }); }}>
+                    绑定代理分组{record.proxy_bindings ? `（${record.proxy_bindings}）` : ''}
+                  </Button>
+                </Space>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  改区域后组内已有账号不会自动移出；如提示区域不匹配，请先到账号列表调整。绑定变更不会自动迁移账号的代理槽位——需要时在「请求代理」页点「重新分配槽位」。
+                </Text>
+              </Space>
+            ),
+            rowExpandable: () => true,
+          }}
+        />
       </Card>
 
       <Card
@@ -208,7 +315,38 @@ export default function GroupsAndKeysPage({ api }) {
           >
             <Input placeholder="例如 vip、cn-pool" maxLength={32} />
           </Form.Item>
+          {groupModal?.mode === 'create' && (
+            <Form.Item
+              name="region" label="区域" initialValue="cn"
+              rules={[{ required: true, message: '请选择区域' }]}
+              extra="CN 区分组只能加入中国区账号；国际区分组只能加入国际区账号。"
+            >
+              <Select options={REGION_OPTIONS.slice(0, 2)} />
+            </Form.Item>
+          )}
         </Form>
+      </Modal>
+
+      <Modal
+        open={!!bindModal}
+        title={`分组「${bindModal?.name}」绑定的代理分组`}
+        onOk={submitBind}
+        onCancel={() => setBindModal(null)}
+        okText="保存"
+        cancelText="取消"
+      >
+        {proxyGroups.length === 0
+          ? <Alert type="info" showIcon message="没有可绑定的代理分组" description="请先在「请求代理」页创建订阅（自动建专属分组）或手动分组。" style={{ marginBottom: 12 }} />
+          : (
+            <Form form={bindForm} layout="vertical">
+              <Form.Item
+                name="proxy_groups" label="允许的代理分组（多选）"
+                extra="留空 = 不限制（该分组账号可用全部节点）。绑定的分组全部生效后，账号只能走这些分组里的节点；与其他分组的绑定取并集。"
+              >
+                <Select mode="multiple" placeholder="不限制" options={bindOptions(groups.find(g => g.name === bindModal?.name) || { region: 'all' })} />
+              </Form.Item>
+            </Form>
+          )}
       </Modal>
 
       <Modal
@@ -224,7 +362,10 @@ export default function GroupsAndKeysPage({ api }) {
             <Input placeholder="例如：给 NewAPI 的中转密钥" maxLength={64} />
           </Form.Item>
           <Form.Item name="group" label="绑定分组" rules={[{ required: true, message: '请选择分组' }]}>
-            <Input placeholder="default" />
+            <Select
+              options={groups.map(g => ({ value: g.name, label: `${g.name}${g.region && g.region !== 'all' ? `（${g.region === 'cn' ? 'CN' : '国际'}区）` : ''}` }))}
+              placeholder="default"
+            />
           </Form.Item>
         </Form>
       </Modal>

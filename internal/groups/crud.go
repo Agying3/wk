@@ -57,17 +57,7 @@ func (s *Store) ValidateName(name string) error {
 	return nil
 }
 
-// Create 新建分组。
-func (s *Store) Create(name string) error {
-	name = strings.TrimSpace(name)
-	if err := s.ValidateName(name); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.groups = append(s.groups, name)
-	return s.persistLocked()
-}
+// Create 在 region.go 中定义（CreateWithRegion 的 all 兼容入口）。
 
 // Rename 重命名分组：同步迁移账号归属与密钥引用。default 不可改。
 func (s *Store) Rename(oldName, newName string) error {
@@ -104,6 +94,17 @@ func (s *Store) Rename(oldName, newName string) error {
 		}
 	}
 	s.dirtyKeys = true
+	// 区域与代理绑定跟随改名（键迁移）。
+	if r, ok := s.regions[oldName]; ok {
+		s.regions[newName] = r
+		delete(s.regions, oldName)
+		s.dirtyReg = true
+	}
+	if ids, ok := s.pgBindings[oldName]; ok {
+		s.pgBindings[newName] = ids
+		delete(s.pgBindings, oldName)
+		s.dirtyBind = true
+	}
 	return s.persistLocked()
 }
 
@@ -147,6 +148,12 @@ func (s *Store) Delete(name string) error {
 		s.accountOf[uid] = next
 	}
 	s.dirtyAcc = true
+	// 区域与代理绑定随组删除（绑定引用的代理分组由 server 侧提示清理，
+	// 失效 ID 在解析时被忽略，不产生错误）。
+	delete(s.regions, name)
+	s.dirtyReg = true
+	delete(s.pgBindings, name)
+	s.dirtyBind = true
 	return s.persistLocked()
 }
 
@@ -229,8 +236,12 @@ func (s *Store) RemoveAccount(uid string) {
 // 前的存量账号会因此"看得见（回落）但选不着（不在表里）"：default
 // 密钥按 default 组过滤时一个号都选不到。
 //
+// regionOf 可为 nil（不做区域过滤）。非 nil 时只登记区域与 default 分组
+// 兼容（default 为 all，或与账号同区）的账号；区域不匹配的账号保持未
+// 登记（不受绑定限制、也不进 default 计数），由管理员显式归组。
+//
 // 返回补登记的账号数（0 = 无需迁移）。
-func (s *Store) MigrateUnregistered(uids []string) int {
+func (s *Store) MigrateUnregistered(uids []string, regionOf func(string) string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	migrated := 0
@@ -239,6 +250,15 @@ func (s *Store) MigrateUnregistered(uids []string) int {
 			continue
 		}
 		if _, ok := s.accountOf[uid]; !ok {
+			if regionOf != nil {
+				def := s.regions[DefaultGroup]
+				if def == "" {
+					def = RegionAll
+				}
+				if ar := regionOf(uid); !RegionCompatible(def, ar) {
+					continue // 区域不匹配：保持未登记，管理员显式归组
+				}
+			}
 			s.accountOf[uid] = []string{DefaultGroup}
 			migrated++
 		}

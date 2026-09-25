@@ -10,10 +10,12 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/reqproxy"
 )
 
@@ -109,11 +111,18 @@ func (h *Handler) reqproxySubsGet(w http.ResponseWriter, r *http.Request) {
 	h.cfg.ReqProxy.View(func(st *reqproxy.State) {
 		out := make([]map[string]any, 0, len(st.Subscriptions))
 		for _, s := range st.Subscriptions {
+			region := ""
+			for _, g := range st.ProxyGroups {
+				if g.ID == s.GroupID {
+					region = g.Region
+				}
+			}
 			out = append(out, map[string]any{
 				"id": s.ID, "name": s.Name, "url": maskSubURL(s.URL),
 				"auto_refresh": s.AutoRefresh, "interval": s.Interval,
 				"last_refreshed_at": s.LastRefreshedAt,
 				"last_status":       s.LastStatus, "last_error": s.LastError,
+				"group_id": s.GroupID, "region": region,
 				"userinfo": s.Userinfo,
 			})
 		}
@@ -130,6 +139,7 @@ func (h *Handler) reqproxySubsPost(w http.ResponseWriter, r *http.Request) {
 		URL         string `json:"url"`
 		AutoRefresh bool   `json:"auto_refresh"`
 		Interval    string `json:"interval"`
+		Region      string `json:"region"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
@@ -139,14 +149,19 @@ func (h *Handler) reqproxySubsPost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name 和 url 必填"})
 		return
 	}
+	if req.Region != groups.RegionCN && req.Region != groups.RegionGlobal {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "新建订阅必须指定区域（cn 或 global）：订阅节点将归入对应区域的专属代理分组"})
+		return
+	}
 	if req.Interval == "" {
 		req.Interval = "1h"
 	}
-	sub := reqproxy.NewSubscription(req.Name, req.URL, req.AutoRefresh, req.Interval)
-	h.cfg.ReqProxy.Update(func(st *reqproxy.State) {
-		st.Subscriptions = append(st.Subscriptions, sub)
-	})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": sub.ID})
+	sub, err := h.cfg.ReqProxy.AddSubscription(req.Name, req.URL, req.AutoRefresh, req.Interval, req.Region)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": sub.ID, "group_id": sub.GroupID, "region": req.Region})
 }
 
 func (h *Handler) reqproxySubPutDelete(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +171,13 @@ func (h *Handler) reqproxySubPutDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	switch r.Method {
 	case http.MethodDelete:
-		h.cfg.ReqProxy.DeleteSubscription(id)
+		pgID := h.cfg.ReqProxy.DeleteSubscription(id)
+		// 连带清理账号分组绑定侧对该专属分组的引用。
+		if pgID != "" && h.cfg.Groups != nil {
+			if n := h.cfg.Groups.RemoveProxyGroupRef(pgID); n > 0 {
+				h.cfg.ReqProxy.Emit("info", "订阅删除：已解除 "+strconv.Itoa(n)+" 个账号分组对分组 "+pgID+" 的绑定引用")
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	case http.MethodPut:
 		var req struct {
@@ -164,10 +185,38 @@ func (h *Handler) reqproxySubPutDelete(w http.ResponseWriter, r *http.Request) {
 			URL         *string `json:"url"`
 			AutoRefresh *bool   `json:"auto_refresh"`
 			Interval    *string `json:"interval"`
+			Region      *string `json:"region"`
 		}
 		if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
 			return
+		}
+		// 区域变更：专属分组区域同步 + 反向绑定校验。
+		if req.Region != nil && *req.Region != "" {
+			region := *req.Region
+			if region != groups.RegionCN && region != groups.RegionGlobal {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "订阅区域必须是 cn 或 global"})
+				return
+			}
+			// 找到该订阅的专属分组 ID 做反向校验。
+			var pgID string
+			h.cfg.ReqProxy.View(func(st *reqproxy.State) {
+				for _, s := range st.Subscriptions {
+					if s.ID == id {
+						pgID = s.GroupID
+					}
+				}
+			})
+			if pgID != "" {
+				if err := h.checkProxyGroupRegionChange(pgID, region); err != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+					return
+				}
+			}
+			if err := h.cfg.ReqProxy.SetSubscriptionRegion(id, region); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
 		}
 		h.cfg.ReqProxy.Update(func(st *reqproxy.State) {
 			for i := range st.Subscriptions {
@@ -251,6 +300,7 @@ func (h *Handler) reqproxyNodesGet(w http.ResponseWriter, r *http.Request) {
 		row := map[string]any{
 			"id": n.ID, "name": n.Name, "protocol": n.Protocol,
 			"source": n.Source, "region": n.Region,
+			"group_id":      n.GroupID,
 			"probed":        n.Probed,
 			"pointed_slots": pointed[n.ID],
 			"requests":      loads[n.ID], // 累计请求数（真实负载）
@@ -280,18 +330,19 @@ func (h *Handler) reqproxyNodesImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Text string `json:"text"`
+		Text    string `json:"text"`
+		GroupID string `json:"group_id"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 256<<10)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
 		return
 	}
-	added, err := h.cfg.ReqProxy.ImportManualNodes(req.Text)
+	added, err := h.cfg.ReqProxy.ImportManualNodes(req.Text, req.GroupID)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added, "group_id": req.GroupID})
 }
 
 func (h *Handler) reqproxyNodeDelete(w http.ResponseWriter, r *http.Request) {

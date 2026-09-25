@@ -18,6 +18,18 @@ import (
 // 这是池级故障，不是账号的错——调用方不应据此惩罚账号。
 var ErrNoNode = errors.New("无可用代理节点")
 
+// GroupResolver 账号 → 允许的代理分组集合（server 层注入；避免 reqproxy
+// 依赖 groups/pool）。
+//
+//   - nil 返回值 = 不限制（账号的所有分组都没绑定代理分组，或分组存储
+//     未启用——两种情况都回落全池行为）。
+//   - 空 map = 限制为空集（所有分组都绑定了代理分组但并集为空）——选不到
+//     任何已分组节点（未分组节点仍可见，见 nodeServesRegionLocked）。
+type GroupResolver interface {
+	// AllowedProxyGroups 返回该账号允许使用的代理分组 ID 集合。
+	AllowedProxyGroups(uid string) map[string]bool
+}
+
 // Node 节点池里的运行时节点（订阅刷新产物 + 手动导入）。
 // 纯数据可值拷贝（快照到处传）；负载计数在 Pool.loads（锁保护），不内嵌
 // atomic——避免 noCopy 拷贝违规。
@@ -35,6 +47,12 @@ type Pool struct {
 	slots   map[string]*Slot   // slot_id → slot
 	bindngs map[string]Binding // uid → binding（store.st.Bindings 的运行时镜像）
 	loads   map[string]int64   // node_id → 累计请求数（保留：API/审计用，不再是均衡主信号）
+	// groupResolver 账号 → 允许的代理分组（nil = 全部；server 注入）。
+	groupResolver GroupResolver
+	// groupRegions groupID → 区域（cn|global），从 state 的代理分组构建，
+	// rebuildGroupIndexLocked 刷新。未分组节点不在此索引——按"两区域都
+	// 可见"处理（D3：归组才隔离）。
+	groupRegions map[string]string
 	// 三层滑动窗口（近 6 分钟速率，均衡主信号）：
 	//   nodeWin 节点级——替换累计值的历史包袱（昨天热今天闲不再被惩罚）
 	//   slotWin 槽位级——同节点槽位间分流（热连接不再挤同一个 inbound）
@@ -57,18 +75,19 @@ type Pool struct {
 // NewPool 构建池。portMin/portMax 是槽位端口段。
 func NewPool(store *Store, portMin, portMax int) *Pool {
 	p := &Pool{
-		store:      store,
-		nodes:      map[string]*Node{},
-		slots:      map[string]*Slot{},
-		bindngs:    map[string]Binding{},
-		loads:      map[string]int64{},
-		nodeWin:    map[string]*WinRate{},
-		slotWin:    map[string]*WinRate{},
-		uidWin:     map[string]*WinRate{},
-		nextPort:   portMin,
-		portMin:    portMin,
-		portMax:    portMax,
-		probePorts: map[int]bool{},
+		store:        store,
+		nodes:        map[string]*Node{},
+		slots:        map[string]*Slot{},
+		bindngs:      map[string]Binding{},
+		loads:        map[string]int64{},
+		groupRegions: map[string]string{},
+		nodeWin:      map[string]*WinRate{},
+		slotWin:      map[string]*WinRate{},
+		uidWin:       map[string]*WinRate{},
+		nextPort:     portMin,
+		portMin:      portMin,
+		portMax:      portMax,
+		probePorts:   map[int]bool{},
 	}
 	// 从 store 恢复槽位/绑定
 	store.View(func(st *State) {
@@ -82,8 +101,67 @@ func NewPool(store *Store, portMin, portMax int) *Pool {
 		for uid, b := range st.Bindings {
 			p.bindngs[uid] = b
 		}
+		p.groupRegions = st.GroupRegionIndex()
 	})
 	return p
+}
+
+// SetGroupResolver 注入账号 → 代理分组解析器（nil = 不限制）。
+func (p *Pool) SetGroupResolver(r GroupResolver) {
+	p.mu.Lock()
+	p.groupResolver = r
+	p.mu.Unlock()
+}
+
+// rebuildGroupIndexLocked 重建 groupID → region 索引（须持 Pool.mu；
+// 代理分组 CRUD 后由调用方触发）。
+func (p *Pool) rebuildGroupIndexLocked() {
+	p.groupRegions = p.store.st.GroupRegionIndex()
+}
+
+// nodeServesRegionLocked 节点（按其分组）能否服务指定账号区域的槽位。
+// 未分组节点对两区域都可见（与旧版一致）；归组节点只能服务同区槽位——
+// 这是结构性隔离，与账号分组绑定无关。
+func (p *Pool) nodeServesRegionLocked(node Node, region string) bool {
+	if node.GroupID == "" {
+		return true
+	}
+	gr, ok := p.groupRegions[node.GroupID]
+	if !ok {
+		// 分组已消失（订阅删除的窗口期）：按未分组处理，等 rebuildPool
+		// 把节点出池。宁可短暂放行也不能把全池打死。
+		return true
+	}
+	return gr == region
+}
+
+// nodeAllowedGroup 节点是否在账号允许的代理分组集合内。
+// allowed=nil = 不限制。allowed 非 nil 时未分组节点也不可用——绑定的语义
+// 是"只能走这些代理分组"，放行未分组节点会让限制漏风（管理员绑定后
+// 可以精确控制出口）。
+func nodeAllowedGroup(node Node, allowed map[string]bool) bool {
+	if allowed == nil {
+		return true
+	}
+	return node.GroupID != "" && allowed[node.GroupID]
+}
+
+// nodeServesRegion nodeServesRegionLocked 的线程安全包装（Manager 清扫用）。
+func (p *Pool) nodeServesRegion(node Node, region string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.nodeServesRegionLocked(node, region)
+}
+
+// nodeByID 按 ID 查节点快照；不存在返回 nil。
+func (p *Pool) nodeByID(id string) *Node {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n, ok := p.nodes[id]; ok {
+		cp := *n
+		return &cp
+	}
+	return nil
 }
 
 // SetNodes 订阅刷新/导入后整体替换节点集（保留 health 状态）。
@@ -97,12 +175,14 @@ type NodeDiff struct {
 func (p *Pool) SetNodes(nodes []NodeSpec) NodeDiff {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// 节点池整体替换前刷新分组索引：GroupID 变化判重依赖最新的 region 定义。
+	p.rebuildGroupIndexLocked()
 	diff := NodeDiff{}
 	seen := map[string]bool{}
 	for _, n := range nodes {
 		seen[n.ID] = true
 		if old, ok := p.nodes[n.ID]; ok {
-			if old.Raw != n.Raw {
+			if old.Raw != n.Raw || old.GroupID != n.GroupID {
 				old.NodeSpec = n // 定义变更：保留 reqCount/Probed（负载记忆不因刷新清零）
 				diff.Changed = append(diff.Changed, n)
 			}
@@ -202,10 +282,11 @@ func (p *Pool) healthLocked(nodeID string) *NodeHealth {
 }
 
 // Candidates 计算 region 的合格节点（设计文档 3.5 的 candidate()）。
+// 不做分组绑定过滤（绑定是账号维度；此入口用于池级探测/预热检查等）。
 func (p *Pool) Candidates(region string) []Node {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := p.candidatesLocked(region)
+	out := p.candidatesLocked(region, nil)
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
@@ -231,21 +312,31 @@ func (p *Pool) Assign(uid, region string) (int, *KernelOp, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 账号的代理分组约束（D4）：所有归属分组都绑定了代理分组时限制为并集；
+	// 任一分组未绑定（或未登记）则不限制。resolver 未注入 = 不限制。
+	var allowed map[string]bool
+	if p.groupResolver != nil {
+		allowed = p.groupResolver.AllowedProxyGroups(uid)
+	}
+
 	// 已有绑定 → 不变（稳定性核心）。
 	// 但槽位指向的节点必须还在池里：节点被订阅刷新删掉、且当时没有
 	// 替代节点可切换时，槽位会悬空指向一个已消失的节点。继续返回它的
 	// 端口只会让请求打到死出口（connection refused），而不是给出明确的
 	// "无可用代理节点"。节点已消失 → 落到重选。
+	// 分组区域隔离（D3）生效后，历史绑定还可能指向"区域不符"的节点——
+	// 同样落到重选，否则区域隔离会被旧绑定绕过。
 	if b, ok := p.bindngs[uid]; ok {
 		if s := p.slots[b.SlotID]; s != nil && s.NodeID != "" {
-			if _, alive := p.nodes[s.NodeID]; alive {
+			if n, alive := p.nodes[s.NodeID]; alive &&
+				p.nodeServesRegionLocked(*n, region) && nodeAllowedGroup(*n, allowed) {
 				return s.Port, nil, nil
 			}
 		}
-		// 槽位指向空或指向已消失节点 → 落到重选
+		// 槽位指向空、指向已消失节点、或节点不再满足分组约束 → 落到重选
 	}
 
-	cands := p.candidatesLocked(region)
+	cands := p.candidatesLocked(region, allowed)
 	if len(cands) == 0 {
 		// 空池降级：整个节点池为空时直连（D4 的边界修正）
 		if len(p.nodes) == 0 {
@@ -259,6 +350,8 @@ func (p *Pool) Assign(uid, region string) (int, *KernelOp, error) {
 	//   热账号（uidRPM 高）只能进剩余预算足够的槽；冷账号可填充。
 	//   accounts_per_node 退化为硬上限兜底（窗口信号失灵时不至于全挤一个槽）。
 	//   窗口全零（冷启动/重启）时自然退化为旧行为，几分钟内信号出现。
+	// 槽位过滤追加分组约束（D3+D4）：槽位指向的节点必须能服务该 region
+	// 且在该账号允许的分组内。
 	apn := p.store.st.Rules.AccountsPerNode
 	budget := p.store.st.Rules.SlotBudgetRPM
 	if budget <= 0 {
@@ -278,7 +371,11 @@ func (p *Pool) Assign(uid, region string) (int, *KernelOp, error) {
 		if s.NodeID == "" {
 			continue
 		}
-		if _, alive := p.nodes[s.NodeID]; !alive {
+		n, alive := p.nodes[s.NodeID]
+		if !alive {
+			continue
+		}
+		if !p.nodeServesRegionLocked(*n, region) || !nodeAllowedGroup(*n, allowed) {
 			continue
 		}
 		joinable = append(joinable, s)
@@ -333,6 +430,9 @@ func (p *Pool) Assign(uid, region string) (int, *KernelOp, error) {
 }
 
 // Retarget 槽位换指向（节点故障/被过滤/消失时）。返回需内核执行的操作。
+//
+// 分组约束（D5）：槽上全部账号的允许分组取交集（nil 视为全集），
+// 新指向必须同时满足所有账号的约束，否则换向等于替某个账号越权。
 func (p *Pool) Retarget(slotID, region string) (*KernelOp, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -340,7 +440,8 @@ func (p *Pool) Retarget(slotID, region string) (*KernelOp, error) {
 	if s == nil {
 		return nil, fmt.Errorf("槽位 %s 不存在", slotID)
 	}
-	cands := p.candidatesLocked(region)
+	allowed := p.slotAllowedGroupsLocked(slotID)
+	cands := p.candidatesLocked(region, allowed)
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("无可用节点可切换")
 	}
@@ -351,6 +452,38 @@ func (p *Pool) Retarget(slotID, region string) (*KernelOp, error) {
 	p.persistLocked()
 	_ = old
 	return &KernelOp{Kind: "retarget", SlotID: slotID, Port: s.Port, NodeSpec: node.NodeSpec}, nil
+}
+
+// slotAllowedGroupsLocked 槽上全部账号的允许分组交集。
+// nil = 某账号不受限（或槽上没账号）→ 整体不受限；空 map = 全部受限但
+// 交集为空 → 任何已分组节点都不可用（未分组节点仍可用）。
+func (p *Pool) slotAllowedGroupsLocked(slotID string) map[string]bool {
+	if p.groupResolver == nil {
+		return nil
+	}
+	var out map[string]bool
+	for uid, b := range p.bindngs {
+		if b.SlotID != slotID {
+			continue
+		}
+		a := p.groupResolver.AllowedProxyGroups(uid)
+		if a == nil {
+			return nil // 该账号不受限：交集即全集
+		}
+		if out == nil {
+			out = make(map[string]bool, len(a))
+			for id := range a {
+				out[id] = true
+			}
+			continue
+		}
+		for id := range out {
+			if !a[id] {
+				delete(out, id)
+			}
+		}
+	}
+	return out
 }
 
 // UnbindAccount 解绑账号（账号删除或手动解绑）。返回槽位是否变空（可回收）。
@@ -427,7 +560,7 @@ func (p *Pool) NodesSnapshot() []Node {
 
 // ---- 内部工具（调用方须持锁） ----
 
-func (p *Pool) candidatesLocked(region string) []Node {
+func (p *Pool) candidatesLocked(region string, allowed map[string]bool) []Node {
 	rules := p.store.st.Rules
 	now := time.Now()
 	var out []Node
@@ -459,6 +592,13 @@ func (p *Pool) candidatesLocked(region string) []Node {
 			if !containsStr(allowed, n.Region) {
 				continue
 			}
+		}
+		// 代理分组约束（D3 区域隔离 + D4 绑定过滤）。
+		if !p.nodeServesRegionLocked(*n, region) {
+			continue
+		}
+		if !nodeAllowedGroup(*n, allowed) {
+			continue
 		}
 		out = append(out, *n)
 	}

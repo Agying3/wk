@@ -38,6 +38,26 @@ type Subscription struct {
 	LastStatus      string    `json:"last_status,omitempty"` // ok|error
 	LastError       string    `json:"last_error,omitempty"`
 	Userinfo        *Userinfo `json:"userinfo,omitempty"`
+	// GroupID 订阅的专属代理分组（订阅创建时自动建组并关联，1:1）。
+	// 旧数据为空 = 未分组（升级前的存量订阅，节点对两区域可见）。
+	GroupID string `json:"group_id,omitempty"`
+}
+
+// ProxyGroup 代理分组。
+//
+//   - 订阅专属组（SubID 非空）：订阅创建时自动生成、删除订阅时连带删除，
+//     不允许通过通用分组接口删除/改名。
+//   - 手动组（SubID 空）：管理员建/改名/删除；手动导入的节点可归入任意
+//     手动组（也可不分组）。
+//
+// Region ∈ cn|global：分组的区域决定了它的节点能服务哪个区域的账号槽位
+// （结构性隔离，与账号分组绑定无关）。
+type ProxyGroup struct {
+	ID        string    `json:"id"`   // pg_xxxx
+	Name      string    `json:"name"` // 展示名（可重复，ID 才是键）
+	Region    string    `json:"region"`
+	SubID     string    `json:"sub_id,omitempty"` // 非空 = 订阅专属组
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // ManualNode 手动导入的固定代理。
@@ -46,6 +66,8 @@ type ManualNode struct {
 	Name      string `json:"name"`
 	Raw       string `json:"raw"`        // 原始 share-link / socks5:// / host:port:user:pass
 	RegionTag string `json:"region_tag"` // 可选显式地区（HK/JP/...）；空 = 按名称识别
+	// GroupID 所属代理分组（空 = 未分组：对两区域可见，与旧版行为一致）。
+	GroupID string `json:"group_id,omitempty"`
 }
 
 // Rules 筛选规则（全池生效）。
@@ -166,6 +188,7 @@ type State struct {
 	Enabled       bool                   `json:"enabled"`
 	Subscriptions []Subscription         `json:"subscriptions"`
 	ManualNodes   []ManualNode           `json:"manual_nodes"`
+	ProxyGroups   []ProxyGroup           `json:"proxy_groups"`
 	Rules         Rules                  `json:"rules"`
 	Slots         []Slot                 `json:"slots"`
 	Bindings      map[string]Binding     `json:"bindings"`
@@ -178,6 +201,7 @@ func DefaultState() *State {
 		Enabled:       false,
 		Subscriptions: []Subscription{},
 		ManualNodes:   []ManualNode{},
+		ProxyGroups:   []ProxyGroup{},
 		Rules: Rules{
 			IncludeKeywords: []string{},
 			ExcludeKeywords: []string{},
@@ -189,6 +213,29 @@ func DefaultState() *State {
 		Bindings: map[string]Binding{},
 		Health:   map[string]*NodeHealth{},
 	}
+}
+
+// ProxyGroupByID 按 ID 查代理分组；不存在返回 nil。
+func (s *State) ProxyGroupByID(id string) *ProxyGroup {
+	if id == "" {
+		return nil
+	}
+	for i := range s.ProxyGroups {
+		if s.ProxyGroups[i].ID == id {
+			return &s.ProxyGroups[i]
+		}
+	}
+	return nil
+}
+
+// GroupRegionIndex 构建 groupID → region 索引（Assign 热路径用；
+// 每次 View 快照后重建一次，Pool 缓存住）。未分组（""）不在索引里。
+func (s *State) GroupRegionIndex() map[string]string {
+	out := make(map[string]string, len(s.ProxyGroups))
+	for _, g := range s.ProxyGroups {
+		out[g.ID] = g.Region
+	}
+	return out
 }
 
 // Normalize 补全空字段（加载旧/部分状态文件后调用）。
@@ -204,6 +251,23 @@ func (s *State) Normalize() {
 	if s.ManualNodes == nil {
 		s.ManualNodes = []ManualNode{}
 	}
+	if s.ProxyGroups == nil {
+		s.ProxyGroups = []ProxyGroup{}
+	}
+	// 订阅↔分组一致性兜底：SubID 关联的订阅已不存在时，把悬空的专属组
+	// 降级为手动组？不——直接删掉。理由：专属组的节点全部来自该订阅，
+	// 订阅没了节点也即将出池，留着只会是悬空引用（绑定侧由 server 清理）。
+	alive := map[string]bool{}
+	for _, sub := range s.Subscriptions {
+		alive[sub.ID] = true
+	}
+	out := s.ProxyGroups[:0]
+	for _, g := range s.ProxyGroups {
+		if g.SubID == "" || alive[g.SubID] {
+			out = append(out, g)
+		}
+	}
+	s.ProxyGroups = out
 	if s.Rules.IncludeKeywords == nil {
 		s.Rules.IncludeKeywords = []string{}
 	}

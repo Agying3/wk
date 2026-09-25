@@ -14,13 +14,16 @@ import (
 
 // NodeSpec 解析后的节点规格（kernel 无关）。
 type NodeSpec struct {
-	ID       string         `json:"id"` // 稳定 ID（来源前缀 + 名称哈希/导入ID）
-	Name     string         `json:"name"`
-	Protocol string         `json:"protocol"` // vmess|vless|trojan|ss|wireguard|socks|http
-	Source   string         `json:"source"`   // 订阅ID 或 "manual"
-	Region   string         `json:"region"`   // HK|JP|SG|US|...|other（按名称识别）
-	Spec     map[string]any `json:"spec"`     // 协议参数（kernel 层消费）
-	Raw      string         `json:"-"`        // 原始链接（定义变更检测用）
+	ID       string `json:"id"` // 稳定 ID（来源前缀 + 名称哈希/导入ID）
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"` // vmess|vless|trojan|ss|wireguard|socks|http
+	Source   string `json:"source"`   // 订阅ID 或 "manual"
+	Region   string `json:"region"`   // HK|JP|SG|US|...|other（按名称识别）
+	// GroupID 所属代理分组（运行时派生：订阅节点=订阅的 GroupID，手动节点
+	// =ManualNode.GroupID；不落盘，跟随 state 里的分组定义实时变化）。
+	GroupID string         `json:"group_id,omitempty"`
+	Spec    map[string]any `json:"spec"` // 协议参数（kernel 层消费）
+	Raw     string         `json:"-"`    // 原始链接（定义变更检测用）
 }
 
 // ParseText 解析多行文本：每行一个 share-link 或 host:port:user:pass，或整体 Base64。

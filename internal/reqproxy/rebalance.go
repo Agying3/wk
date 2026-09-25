@@ -64,7 +64,7 @@ func (p *Pool) PlanRebalance() []RebalanceOp {
 
 	var ops []RebalanceOp
 	for region := range regions {
-		cands := p.candidatesLocked(region)
+		cands := p.candidatesLocked(region, nil)
 		if len(cands) < 2 {
 			continue
 		}
@@ -72,8 +72,13 @@ func (p *Pool) PlanRebalance() []RebalanceOp {
 		for _, c := range cands {
 			candSet[c.ID] = true
 		}
-		// uid → 其槽位指向的节点（仅候选内的、非 pin 的、不在冷却期的）
-		uidNode := map[string]string{}
+		// uid → (其槽位指向的节点, 其允许的代理分组)。仅候选内的、非 pin
+		// 的、不在冷却期的。allowed 在迁移目的地选择时使用（D4/D5）。
+		type victimInfo struct {
+			node    string
+			allowed map[string]bool
+		}
+		uidNode := map[string]victimInfo{}
 		for uid, b := range p.bindngs {
 			s := p.slots[b.SlotID]
 			if s == nil || s.NodeID == "" || !candSet[s.NodeID] {
@@ -85,7 +90,11 @@ func (p *Pool) PlanRebalance() []RebalanceOp {
 			if at, cooled := lastMovedAt[uid]; cooled && now.Sub(at) < rebalanceCooldown {
 				continue // 迁移冷却中
 			}
-			uidNode[uid] = s.NodeID
+			var allowed map[string]bool
+			if p.groupResolver != nil {
+				allowed = p.groupResolver.AllowedProxyGroups(uid)
+			}
+			uidNode[uid] = victimInfo{node: s.NodeID, allowed: allowed}
 		}
 		if len(uidNode) == 0 {
 			continue
@@ -124,8 +133,8 @@ func (p *Pool) PlanRebalance() []RebalanceOp {
 			// 从 heavy 挑 uidRPM 最大的可迁账号（迁冷账号不降压）
 			var victim string
 			var victimRPM float64
-			for uid, node := range uidNode {
-				if node != heavy {
+			for uid, info := range uidNode {
+				if info.node != heavy {
 					continue
 				}
 				rpm := p.uidRPMLocked(uid)
@@ -139,6 +148,31 @@ func (p *Pool) PlanRebalance() []RebalanceOp {
 			if victim == "" {
 				break // 重端无可迁账号（全 pin/冷却中）
 			}
+			victimAllowed := uidNode[victim].allowed
+			// light 若不满足受害者的分组约束（区域隔离已在候选内保证，
+			// 这里再过绑定），换下一个轻端候选。
+			lightOK := func(node string) bool {
+				if n, ok := p.nodes[node]; ok {
+					return nodeAllowedGroup(*n, victimAllowed)
+				}
+				return false
+			}
+			if !lightOK(light) {
+				alt := ""
+				for _, c := range cands {
+					if c.ID == heavy || !lightOK(c.ID) {
+						continue
+					}
+					if alt == "" || eff(c.ID) < eff(alt) {
+						alt = c.ID
+					}
+				}
+				if alt == "" {
+					delete(uidNode, victim)
+					break // 无合规轻端：这个账号本轮不迁
+				}
+				light = alt
+			}
 			// 单步收益检查：迁移后两端差距应缩小，否则不迁（防来回抖——
 			// 1 热账号独占流量时，迁走它反而把轻端压成重端）。
 			// 流量归属跟随账号：窗口计数不迁移，下一窗口自然修正。
@@ -148,7 +182,10 @@ func (p *Pool) PlanRebalance() []RebalanceOp {
 				// 迁后会反向超调且比原来更糟 → 停（热账号独占流量的场景）
 				break
 			}
-			// light 上找有余量的既有槽位
+			// light 上找有余量的既有槽位（同样须满足受害者的分组约束——
+			// 槽位指向 light 本身已检查，但并槽后槽上其他账号可能引入新约束；
+			// 简化：仅检查受害者自己的约束，其他账号的约束在其自身 Assign
+			// 早期返回校验中兜底，违规时该账号会落入重选）
 			var toSlot string
 			for _, s := range p.slots {
 				if s.NodeID == light && s.Region == region &&

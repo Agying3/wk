@@ -137,12 +137,15 @@ func TestAdminGroupsAPI(t *testing.T) {
 		return rec
 	}
 
-	// 创建。
-	if rec := do(http.MethodPost, "/admin/groups", `{"name":"test2"}`); rec.Code != 200 {
+	// 创建（区域必填）。
+	if rec := do(http.MethodPost, "/admin/groups", `{"name":"test2"}`); rec.Code != 400 {
+		t.Fatalf("create without region = %d, want 400", rec.Code)
+	}
+	if rec := do(http.MethodPost, "/admin/groups", `{"name":"test2","region":"cn"}`); rec.Code != 200 {
 		t.Fatalf("create = %d: %s", rec.Code, rec.Body.String())
 	}
 	// 重复创建 → 400。
-	if rec := do(http.MethodPost, "/admin/groups", `{"name":"test2"}`); rec.Code != 400 {
+	if rec := do(http.MethodPost, "/admin/groups", `{"name":"test2","region":"cn"}`); rec.Code != 400 {
 		t.Fatalf("dup create = %d, want 400", rec.Code)
 	}
 	// 改名 default → 403。

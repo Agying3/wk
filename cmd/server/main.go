@@ -405,8 +405,14 @@ func main() {
 	}
 	// 存量账号显式迁移进 default：读取路径有"未登记=default"的兜底，
 	// 但选号过滤和分组计数只看归属表，不迁移的话 default 密钥会
-	// 选不到任何号。
-	if n := groupStore.MigrateUnregistered(p.UIDs()); n > 0 {
+	// 选不到任何号。区域过滤：default 分组的区域只收兼容区域的账号，
+	// 不匹配的保持未登记（等管理员建对应的区域分组再入组）。
+	if n := groupStore.MigrateUnregistered(p.UIDs(), func(uid string) string {
+		if a := p.AuthByUID(uid); a != nil {
+			return a.Region()
+		}
+		return ""
+	}); n > 0 {
 		log.Printf("groups: %d 个存量账号已归入 default 分组", n)
 	}
 

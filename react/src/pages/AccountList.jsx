@@ -110,37 +110,52 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
   const [accountGroupFilter, setAccountGroupFilter] = useState('all');
   // 分组功能：groups 列表来自 /admin/groups；每账号归属来自 /status 的
   // account_groups 快照（一次拉齐，不逐账号 GET）。老后端两个字段都缺时
-  // groupNames 为 null，分组列与按钮整体隐藏。
-  const [groupNames, setGroupNames] = useState(null);
+  // groupList 为 null，分组列与按钮整体隐藏。保留 region 供入组校验展示。
+  const [groupList, setGroupList] = useState(null);
 
   useEffect(() => {
-    if (groupNames !== null || !data.accounts?.length) return;
+    if (groupList !== null || !data.accounts?.length) return;
     api('/admin/groups')
-      .then(body => setGroupNames((body.groups || []).map(g => g.name)))
-      .catch(() => setGroupNames(null));
+      .then(body => setGroupList((body.groups || []).map(g => ({ name: g.name, region: g.region }))))
+      .catch(() => setGroupList(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data.accounts?.length > 0]);
 
   // 每账号分组：data.account_groups 里没有的 uid = 未登记 = default 语义。
   const accountGroups = data.account_groups || {};
+  const groupNames = groupList === null ? null : groupList.map(g => g.name);
 
   // editAccountGroups 打开分组编辑弹窗（多选）。未登记账号初始值 = default。
+  // 区域约束：CN 账号只能进 cn/all 分组，国际账号只能进 global/all 分组——
+  // 后端同样校验（400），前端先过滤掉不兼容项让错误难以发生。
   const editAccountGroups = record => {
     const uid = record.uid || '';
     const current = accountGroups[uid];
     let selected = current && current.length ? [...current] : ['default'];
+    const acctRegion = record.region || '';
+    const regionOK = g => !g.region || g.region === 'all' || !acctRegion || g.region === acctRegion;
+    const options = [
+      { name: 'default', region: (groupList || []).find(g => g.name === 'default')?.region || 'all' },
+      ...(groupList || []).filter(g => g.name !== 'default'),
+    ].filter(regionOK).map(g => ({
+      value: g.name,
+      label: `${g.name}${g.region && g.region !== 'all' ? `（${g.region === 'cn' ? 'CN' : '国际'}区）` : ''}`,
+    }));
     modal.confirm({
       title: `设置账号 ${record.nickname || uid.slice(0, 12)} 的分组`,
       icon: null,
       content: (
         <div style={{ marginTop: 12 }}>
-          <Text type="secondary">账号可属于多个分组；分组密钥只能用对应分组里的账号。</Text>
+          <Text type="secondary">
+            账号可属于多个分组；分组密钥只能用对应分组里的账号。
+            {acctRegion && ` 该账号是 ${acctRegion === 'cn' ? '中国区' : '国际区'}账号，只列出区域兼容的分组。`}
+          </Text>
           <Select
             mode="multiple"
             defaultValue={selected}
             style={{ width: '100%', marginTop: 8 }}
             onChange={value => { selected = value; }}
-            options={(groupNames || []).map(g => ({ value: g, label: g }))}
+            options={options}
           />
         </div>
       ),
@@ -275,7 +290,19 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
       render: (_, record) => {
         const gs = accountGroups[record.uid];
         const shown = gs && gs.length ? gs : ['default'];
-        return <Space size={2} wrap>{shown.map(g => <Tag key={g} color={g === 'default' ? 'blue' : 'purple'} style={{ marginInlineEnd: 0 }}>{g}</Tag>)}</Space>;
+        return (
+          <Space size={2} wrap>
+            {shown.map(g => {
+              const info = (groupList || []).find(x => x.name === g);
+              const region = info?.region;
+              return (
+                <Tag key={g} color={g === 'default' ? 'blue' : 'purple'} style={{ marginInlineEnd: 0 }}>
+                  {g}{region && region !== 'all' ? (region === 'cn' ? '·CN' : '· Intl') : ''}
+                </Tag>
+              );
+            })}
+          </Space>
+        );
       },
     }] : []),
     {

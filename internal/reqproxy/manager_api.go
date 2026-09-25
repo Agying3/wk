@@ -24,6 +24,9 @@ func NewSubscription(name, rawURL string, autoRefresh bool, interval string) Sub
 // View 只读访问状态。
 func (m *Manager) View(fn func(st *State)) { m.store.View(fn) }
 
+// SetGroupResolver 注入账号→代理分组解析器（透传给 Pool）。
+func (m *Manager) SetGroupResolver(r GroupResolver) { m.pool.SetGroupResolver(r) }
+
 // Update 修改状态。
 func (m *Manager) Update(fn func(st *State)) { m.store.Update(fn) }
 
@@ -52,8 +55,19 @@ func (m *Manager) HealthOf(nodeID string) NodeHealth {
 	return out
 }
 
-// ImportManualNodes 手动批量导入节点。返回成功条数。
-func (m *Manager) ImportManualNodes(text string) (int, error) {
+// ImportManualNodes 手动批量导入节点到指定代理分组（空 = 未分组）。
+// 返回成功条数。
+func (m *Manager) ImportManualNodes(text, groupID string) (int, error) {
+	if groupID != "" {
+		var g *ProxyGroup
+		m.store.View(func(st *State) { g = st.ProxyGroupByID(groupID) })
+		if g == nil {
+			return 0, fmt.Errorf("代理分组 %s 不存在", groupID)
+		}
+		if g.SubID != "" {
+			return 0, fmt.Errorf("订阅专属分组的成员由订阅决定，不能手动加入")
+		}
+	}
 	specs, errs := ParseText(text, "manual")
 	for _, e := range errs {
 		return 0, e
@@ -74,7 +88,7 @@ func (m *Manager) ImportManualNodes(text string) (int, error) {
 	var added int
 	m.store.Update(func(st *State) {
 		for _, s := range specs {
-			mn := ManualNode{ID: newID("node"), Name: s.Name, Raw: s.Raw, RegionTag: ""}
+			mn := ManualNode{ID: newID("node"), Name: s.Name, Raw: s.Raw, RegionTag: "", GroupID: groupID}
 			st.ManualNodes = append(st.ManualNodes, mn)
 			added++
 		}
@@ -97,21 +111,12 @@ func (m *Manager) DeleteManualNode(id string) {
 	m.rebuildPool()
 }
 
-// DeleteSubscription 删除订阅（其节点一并移出池）。
-func (m *Manager) DeleteSubscription(id string) {
-	m.store.Update(func(st *State) {
-		for i, s := range st.Subscriptions {
-			if s.ID == id {
-				st.Subscriptions = append(st.Subscriptions[:i], st.Subscriptions[i+1:]...)
-				break
-			}
-		}
-	})
-	m.rebuildPool()
-}
+// DeleteSubscription 在 manager_groups.go 中定义（连带专属分组处理）。
 
 // rebuildPool 按 state（manual_nodes + 各订阅最近产物）重建节点池。
 // 订阅节点用 RefreshSubscription 时已进池的快照；删除订阅时把它们踢出去。
+// GroupID 重新派生（订阅节点 = 订阅当前关联分组；手动 = mn.GroupID），
+// 分组定义变化（区域调整/订阅换组）经此传播到池。
 func (m *Manager) rebuildPool() {
 	var all []NodeSpec
 	m.store.View(func(st *State) {
@@ -126,21 +131,29 @@ func (m *Manager) rebuildPool() {
 				spec.Region = mn.RegionTag
 			}
 			spec.Source = "manual"
+			spec.GroupID = mn.GroupID
 			all = append(all, *spec)
 		}
 	})
-	// 现有池里保留非 manual 且订阅仍存在的节点
-	liveSubs := map[string]bool{}
+	// 现有池里保留非 manual 且订阅仍存在的节点；GroupID 以订阅当前关联为准
+	// （订阅换组/改区域后刷新传播）。
+	type subGroup struct{ sub, group string }
+	var liveGroups []subGroup
 	m.store.View(func(st *State) {
 		for _, s := range st.Subscriptions {
-			liveSubs[s.ID] = true
+			liveGroups = append(liveGroups, subGroup{s.ID, s.GroupID})
 		}
 	})
+	groupOf := map[string]string{}
+	for _, sg := range liveGroups {
+		groupOf[sg.sub] = sg.group
+	}
 	for _, n := range m.pool.NodesSnapshot() {
 		if n.Source == "manual" {
 			continue
 		}
-		if liveSubs[n.Source] {
+		if g, ok := groupOf[n.Source]; ok {
+			n.NodeSpec.GroupID = g
 			all = append(all, n.NodeSpec)
 		}
 	}

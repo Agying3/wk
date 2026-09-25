@@ -195,14 +195,14 @@ func TestMigrateUnregistered(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 两个未登记账号 + 一个已登记账号。
-	if n := s.MigrateUnregistered([]string{"u1", "u2"}); n != 2 {
+	if n := s.MigrateUnregistered([]string{"u1", "u2"}, nil); n != 2 {
 		t.Fatalf("migrated = %d, want 2", n)
 	}
 	if err := s.SetAccountGroups("u3", []string{"vip"}); err != nil {
 		t.Fatal(err)
 	}
 	// 幂等：再跑一遍不再补（都在表里了）。
-	if n := s.MigrateUnregistered([]string{"u1", "u2", "u3"}); n != 0 {
+	if n := s.MigrateUnregistered([]string{"u1", "u2", "u3"}, nil); n != 0 {
 		t.Fatalf("second pass migrated = %d, want 0", n)
 	}
 	// default 组的选号集合现在包含存量账号。

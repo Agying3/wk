@@ -444,10 +444,19 @@ func (m *Manager) RefreshSubscription(subID string) error {
 		m.rebuildPool()
 		return err
 	}
-	// 打上订阅源标记
+	// 打上订阅源标记 + 专属分组
+	groupID := ""
+	m.store.View(func(st *State) {
+		for i := range st.Subscriptions {
+			if st.Subscriptions[i].ID == subID {
+				groupID = st.Subscriptions[i].GroupID
+			}
+		}
+	})
 	for i := range res.Nodes {
 		res.Nodes[i].Source = subID
 		res.Nodes[i].ID = StableNodeID(subID, res.Nodes[i].Name)
+		res.Nodes[i].GroupID = groupID
 	}
 	// 合并：手动节点 + 该订阅节点 + 其他订阅节点（SetNodes 全量替换，先收集现有其他来源）
 	var all []NodeSpec
@@ -463,6 +472,7 @@ func (m *Manager) RefreshSubscription(subID string) error {
 				spec.Region = mn.RegionTag
 			}
 			spec.Source = "manual"
+			spec.GroupID = mn.GroupID
 			all = append(all, *spec)
 		}
 	})

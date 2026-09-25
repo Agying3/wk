@@ -58,12 +58,16 @@ export default function ReqProxy({ api }) {
   const [subs, setSubs] = useState([]);
   const [nodes, setNodes] = useState([]);
   const [slots, setSlots] = useState([]);
+  const [proxyGroups, setProxyGroups] = useState([]);
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [subModal, setSubModal] = useState(null); // {mode:'add'|'edit', sub}
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState('');
+  const [importGroup, setImportGroup] = useState('');
+  const [pgModal, setPgModal] = useState(null); // {mode:'add'|'edit', group}
+  const [pgForm] = Form.useForm();
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewURL, setPreviewURL] = useState('');
   const [previewData, setPreviewData] = useState(null);
@@ -74,16 +78,18 @@ export default function ReqProxy({ api }) {
   const load = async () => {
     setLoading(true);
     try {
-      const [config, subList, nodeList, slotList] = await Promise.all([
+      const [config, subList, nodeList, slotList, pgList] = await Promise.all([
         api('/admin/reqproxy/config'),
         api('/admin/reqproxy/subscriptions').catch(() => ({ data: [] })),
         api('/admin/reqproxy/nodes').catch(() => ({ data: [] })),
         api('/admin/reqproxy/slots').catch(() => ({ data: [] })),
+        api('/admin/reqproxy/groups').catch(() => ({ data: [] })),
       ]);
       setCfg(config);
       setSubs(subList.data || []);
       setNodes(nodeList.data || []);
       setSlots(slotList.data || []);
+      setProxyGroups(pgList.data || []);
       setError('');
     } catch (err) {
       setError(err.message);
@@ -307,14 +313,67 @@ export default function ReqProxy({ api }) {
     try {
       const body = await api('/admin/reqproxy/nodes/import', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: importText }),
+        body: JSON.stringify({ text: importText, group_id: importGroup || '' }),
       });
-      message.success(`已导入 ${body.added} 个节点`);
+      message.success(`已导入 ${body.added} 个节点${importGroup ? '（归入所选分组）' : ''}`);
       setImportOpen(false);
       setImportText('');
+      setImportGroup('');
       load();
     } catch (err) {
       message.error(err.message);
+    }
+  };
+
+  // ---- 代理分组操作 ----
+  const saveProxyGroup = async () => {
+    const values = await pgForm.validateFields();
+    try {
+      if (pgModal.mode === 'add') {
+        await api('/admin/reqproxy/groups', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: values.name, region: values.region }),
+        });
+        message.success(`代理分组 ${values.name} 已创建`);
+      } else {
+        const body = {};
+        if (values.name) body.name = values.name;
+        if (values.region) body.region = values.region;
+        await api(`/admin/reqproxy/groups/${pgModal.group.id}`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        message.success('代理分组已更新');
+      }
+      setPgModal(null);
+      load();
+    } catch (err) {
+      message.error(err.message);
+    }
+  };
+
+  const deleteProxyGroup = async g => {
+    try {
+      await api(`/admin/reqproxy/groups/${g.id}`, { method: 'DELETE' });
+      message.success(`代理分组已删除（${g.nodes} 个手动节点归未分组）`);
+      load();
+    } catch (err) {
+      message.error(err.message);
+    }
+  };
+
+  // 手动节点挪组（订阅节点归组由订阅决定，不提供手动挪组）。
+  const moveNodeGroup = async (nodeID, groupID) => {
+    try {
+      await api(`/admin/reqproxy/nodes/${nodeID}/group`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group_id: groupID || '' }),
+      });
+      message.success('节点已挪组（相关槽位自动合规调整）');
+      load();
+    } catch (err) {
+      message.error(err.message);
+      load();
     }
   };
 
@@ -434,6 +493,14 @@ export default function ReqProxy({ api }) {
   const subColumns = [
     { title: '名称', dataIndex: 'name', width: 120 },
     {
+      title: '区域', dataIndex: 'region', width: 90,
+      render: (v, s) => (v
+        ? <Tooltip title={`节点归入专属代理分组${s.group_id ? `（${s.group_id}）` : ''}，只服务 ${v === 'cn' ? '中国区' : '国际区'}账号`}>
+          <Tag color={v === 'cn' ? 'volcano' : 'geekblue'}>{v === 'cn' ? 'CN' : '国际'}</Tag>
+        </Tooltip>
+        : <Tooltip title="旧订阅未设置区域——编辑补选区域后自动建专属分组"><Tag color="warning">未设置</Tag></Tooltip>),
+    },
+    {
       title: '订阅地址', dataIndex: 'url', ellipsis: true,
       render: v => <Text code style={{ fontSize: 12 }}>{v}</Text>,
     },
@@ -480,6 +547,19 @@ export default function ReqProxy({ api }) {
     { title: '节点名', dataIndex: 'name', ellipsis: true, render: v => <Text strong>{v}</Text> },
     { title: '协议', dataIndex: 'protocol', width: 90, render: v => <Tag color={PROTO_COLORS[v] || 'default'}>{v}</Tag> },
     { title: '地区', dataIndex: 'region', width: 70, render: v => (v === 'other' ? '-' : v) },
+    {
+      title: '代理分组', dataIndex: 'group_id', width: 150,
+      render: (v, n) => {
+        const g = proxyGroups.find(pg => pg.id === v);
+        if (!v) return <Tooltip title="未分组节点对两类区域账号都可用（遗留行为）"><Text type="secondary">未分组</Text></Tooltip>;
+        if (!g) return <Tag color="warning">分组已删</Tag>;
+        return (
+          <Tooltip title={g.sub_id ? '订阅专属分组（随订阅管理）' : '手动分组'}>
+            <Tag color={g.region === 'cn' ? 'volcano' : 'geekblue'}>{g.name}{g.sub_id ? ' · 订阅' : ''}</Tag>
+          </Tooltip>
+        );
+      },
+    },
     { title: '来源', dataIndex: 'source', width: 110, ellipsis: true, render: v => (v === 'manual' ? '手动导入' : v) },
     { title: '被指向槽位', dataIndex: 'pointed_slots', width: 100, render: v => (v ? <Tag color={v > 1 ? 'orange' : 'blue'}>{v}</Tag> : '-') },
     { title: '累计请求', dataIndex: 'requests', width: 100, sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: v => (Number(v || 0) > 0 ? <Text>{Number(v).toLocaleString()}</Text> : <Text type="secondary">-</Text>) },
@@ -495,10 +575,21 @@ export default function ReqProxy({ api }) {
       },
     },
     {
-      title: '操作', width: 130,
+      title: '操作', width: 240,
       render: (_, n) => (
         <Space size={4}>
           <Button size="small" loading={probingID === n.id} disabled={busy && probingID !== n.id} onClick={() => probeOne(n.id)}>测速</Button>
+          {n.source === 'manual' && (
+            <Select
+              size="small" style={{ minWidth: 110 }} placeholder="分组"
+              disabled={busy} value={n.group_id || undefined}
+              options={[
+                { value: '', label: '未分组' },
+                ...proxyGroups.filter(g => !g.sub_id).map(g => ({ value: g.id, label: `${g.name}（${g.region === 'cn' ? 'CN' : '国际'}）` })),
+              ]}
+              onChange={v => moveNodeGroup(n.id, v || '')}
+            />
+          )}
           {n.source === 'manual' && (
             guard(<Popconfirm title="删除该节点？" onConfirm={() => deleteNode(n.id)}>
               <Button size="small" danger disabled={busy}>删除</Button>
@@ -567,6 +658,33 @@ export default function ReqProxy({ api }) {
     ? <Tooltip title={`${busyLabel}进行中，此操作暂不可用`}>{el}</Tooltip>
     : el);
 
+  const pgColumns = [
+    { title: '分组名', dataIndex: 'name', width: 160, render: (v, g) => (
+      <Space size={4}>
+        <Text strong>{v}</Text>
+        {g.sub_id && <Tooltip title="订阅专属分组：名称跟随订阅，成员由订阅决定，删除订阅时一并删除"><Tag color="cyan">订阅专属</Tag></Tooltip>}
+      </Space>
+    ) },
+    { title: '区域', dataIndex: 'region', width: 90, render: v => <Tag color={v === 'cn' ? 'volcano' : 'geekblue'}>{v === 'cn' ? 'CN 区' : '国际区'}</Tag> },
+    { title: '节点数', dataIndex: 'nodes', width: 80, render: v => (v ? <Tag color="blue">{v}</Tag> : <Text type="secondary">0</Text>) },
+    { title: '来源', width: 140, render: (_, g) => (g.sub_id ? <Text type="secondary">订阅 {g.sub_name || g.sub_id}</Text> : <Text type="secondary">手动创建</Text>) },
+    { title: '创建时间', dataIndex: 'created_at', width: 160, render: v => (v ? new Date(v).toLocaleString() : '-') },
+    {
+      title: '操作', width: 220,
+      render: (_, g) => (
+        <Space size={4}>
+          {!g.sub_id && guard(<Button size="small" disabled={busy} onClick={() => { setPgModal({ mode: 'edit', group: g }); pgForm.setFieldsValue({ name: g.name, region: g.region }); }}>编辑</Button>)}
+          {!g.sub_id && guard(
+            <Popconfirm title={`删除代理分组 ${g.name}？`} description="组内手动节点将归入未分组。" onConfirm={() => deleteProxyGroup(g)}>
+              <Button size="small" danger disabled={busy}>删除</Button>
+            </Popconfirm>,
+          )}
+          {g.sub_id && <Tooltip title="订阅专属分组：改名/删除请操作对应订阅"><Text type="secondary">随订阅管理</Text></Tooltip>}
+        </Space>
+      ),
+    },
+  ];
+
   const tabItems = [
     {
       key: 'subs', label: '订阅管理', children: (
@@ -578,6 +696,19 @@ export default function ReqProxy({ api }) {
           {subs.length
             ? <Table rowKey="id" columns={subColumns} dataSource={subs} pagination={false} />
             : <Empty description="尚无订阅。添加一个 v2rayN 订阅地址，或到「节点池」手动导入。" />}
+        </Space>
+      ),
+    },
+    {
+      key: 'pgroups', label: `代理分组（${proxyGroups.length}）`, children: (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Space wrap>
+            {guard(<Button type="primary" icon={<PlusOutlined />} disabled={busy} onClick={() => { pgForm.resetFields(); setPgModal({ mode: 'add' }); }}>新建分组</Button>)}
+            <Text type="secondary">手动添加的节点可选分组；订阅自动建专属分组（1:1）。区域化后 CN 区分组只服务中国区账号的槽位。</Text>
+          </Space>
+          {proxyGroups.length
+            ? <Table rowKey="id" columns={pgColumns} dataSource={proxyGroups} pagination={false} />
+            : <Empty description="尚无代理分组。添加订阅时选区域会自动创建专属分组。" />}
         </Space>
       ),
     },
@@ -682,6 +813,19 @@ export default function ReqProxy({ api }) {
           <Form.Item name="url" label="订阅地址" rules={[{ required: true, message: '必填' }]}>
             <Input placeholder="https://example.com/api/v1/client/subscribe?token=..." />
           </Form.Item>
+          <Form.Item
+            name="region" label="区域" initialValue={subModal?.mode === 'add' ? undefined : subModal?.sub?.region}
+            rules={[{ required: subModal?.mode === 'add', message: '必选' }]}
+            extra="订阅拉到的节点将独立成为一个代理分组（1:1）：CN 区节点只服务中国区账号，国际区节点只服务国际区账号。"
+          >
+            <Select
+              placeholder="选择区域"
+              options={[
+                { value: 'cn', label: 'CN 区（服务中国区账号）' },
+                { value: 'global', label: '国际区（服务国际区账号）' },
+              ]}
+            />
+          </Form.Item>
           <Space size={12}>
             <Form.Item name="auto_refresh" label="自动刷新" valuePropName="checked" initialValue={true}>
               <Switch />
@@ -737,9 +881,41 @@ export default function ReqProxy({ api }) {
       <Modal open={importOpen} title="批量导入节点" onCancel={() => setImportOpen(false)} onOk={doImport} okText="导入">
         <Space direction="vertical" size={8} style={{ width: '100%' }}>
           <Text type="secondary">每行一条：share-link / socks5:// / http:// 或 host:port:user:pass；也可粘贴整段 Base64。</Text>
+          <Select
+            style={{ width: '100%' }} value={importGroup} onChange={setImportGroup}
+            placeholder="归入代理分组（可选：未分组节点对两类区域账号都可用）"
+            allowClear
+            options={[
+              ...proxyGroups.filter(g => !g.sub_id).map(g => ({ value: g.id, label: `${g.name}（${g.region === 'cn' ? 'CN' : '国际'}区）` })),
+            ]}
+          />
           <Input.TextArea rows={8} value={importText} onChange={e => setImportText(e.target.value)}
             placeholder={'vmess://eyJ2IjoiMiIsInBzIjoi6aaW5a2mMDEiLCJhZGQiOiJ4eC5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6InV1aWQiLCJuZXQiOiJ3cyJ9\ntrojan://pass@xx.example.com:443#东京01'} />
         </Space>
+      </Modal>
+
+      {/* 代理分组编辑弹窗 */}
+      <Modal
+        open={!!pgModal} title={pgModal?.mode === 'add' ? '新建代理分组' : '编辑代理分组'}
+        onCancel={() => setPgModal(null)} onOk={saveProxyGroup} okText={pgModal?.mode === 'add' ? '创建' : '保存'}
+      >
+        <Form form={pgForm} layout="vertical">
+          <Form.Item name="name" label="分组名" rules={[{ required: true, message: '必填' }]}>
+            <Input placeholder="例如 CN-手动、全球家宽" maxLength={32} />
+          </Form.Item>
+          <Form.Item
+            name="region" label="区域" initialValue="cn"
+            rules={[{ required: true, message: '必选' }]}
+            extra="改区域会即时影响该组节点的服务范围：区域违规的槽位自动换指向（端口不变）。"
+          >
+            <Select
+              options={[
+                { value: 'cn', label: 'CN 区（只服务中国区账号）' },
+                { value: 'global', label: '国际区（只服务国际区账号）' },
+              ]}
+            />
+          </Form.Item>
+        </Form>
       </Modal>
     </Space>
   );

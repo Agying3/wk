@@ -174,13 +174,15 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
 
   // 分组选项：加载失败（老后端没有分组端点）时**保持选择器占位并禁用**，
   // 不隐藏——控件闪现/消失比禁用更让人不安。行为退回"新账号进 default"。
+  // 区域约束：自动加号拉的都是中国区账号 → 只列 cn/all 分组（后端同样校验）。
   const [groupsFailed, setGroupsFailed] = useState(false);
   useEffect(() => {
     let alive = true;
     api('/admin/groups')
       .then(body => {
         if (!alive) return;
-        const names = (body.groups || []).map(g => g.name);
+        const all = body.groups || [];
+        const names = all.filter(g => !g.region || g.region === 'all' || g.region === 'cn').map(g => g.name);
         setGroupOptions(names);
         setSelectedGroups(current => (
           current.every(g => names.includes(g)) ? current : current.filter(g => names.includes(g)).length ? current.filter(g => names.includes(g)) : ['default']

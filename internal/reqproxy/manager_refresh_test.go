@@ -27,7 +27,7 @@ func TestRefreshFailKeepsManualNodes(t *testing.T) {
 	m := newTestManager(t)
 
 	// 导入 manual 节点（走 ImportManualNodes → rebuildPool 正常路径）
-	if _, err := m.ImportManualNodes("1.2.3.4:8080:user:pass"); err != nil {
+	if _, err := m.ImportManualNodes("1.2.3.4:8080:user:pass", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(m.NodesSnapshot()); got != 1 {
@@ -55,7 +55,7 @@ func TestRefreshFailKeepsManualNodes(t *testing.T) {
 // TestRefreshSuccessKeepsManual 订阅刷新成功：订阅节点进池，manual 节点保留。
 func TestRefreshSuccessKeepsManual(t *testing.T) {
 	m := newTestManager(t)
-	if _, err := m.ImportManualNodes("1.2.3.4:8080:user:pass"); err != nil {
+	if _, err := m.ImportManualNodes("1.2.3.4:8080:user:pass", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -89,7 +89,7 @@ func TestRefreshSuccessKeepsManual(t *testing.T) {
 // unhealthy 只影响分配（Candidates 过滤），不删 ManualNodes 记录。
 func TestManualNodeNotAutoDeleted(t *testing.T) {
 	m := newTestManager(t)
-	if _, err := m.ImportManualNodes("1.2.3.4:8080:user:pass"); err != nil {
+	if _, err := m.ImportManualNodes("1.2.3.4:8080:user:pass", ""); err != nil {
 		t.Fatal(err)
 	}
 	nodeID := m.NodesSnapshot()[0].ID
@@ -120,7 +120,7 @@ func TestNoSubscriptionManualNodesSurviveRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m1.ImportManualNodes("1.2.3.4:8080:user:pass"); err != nil {
+	if _, err := m1.ImportManualNodes("1.2.3.4:8080:user:pass", ""); err != nil {
 		t.Fatal(err)
 	}
 	m1.Close()
