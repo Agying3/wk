@@ -199,6 +199,11 @@ type watcherState struct {
 	// 数据源——比活动日志强：结构化（项目/码/价格/成功/花费/时长分开
 	// 字段）、持久化（重启不丢）。
 	Events []watchEvent `json:"events,omitempty"`
+	// TargetUID 当前收割目标（锁定收割模式）：命中一个低价码事件后
+	// 锁定它，每轮继续用它加号，直到可取库存 < 每轮目标 / 码消失 /
+	// 涨价超上限 / 多次失败判差评（冷却）才切换下一个。持久化——
+	// 重启/暂停不丢目标，额度充值后接着收割同一个码。
+	TargetUID string `json:"target_uid,omitempty"`
 }
 
 // watchEvent 一次值班触发的完整生命周期记录（成果面板数据源）。
@@ -231,6 +236,7 @@ func (s *watcherState) clone() watcherState {
 		LastTick:        s.LastTick,
 		UpdatedAt:       s.UpdatedAt,
 		Events:          append([]watchEvent(nil), s.Events...),
+		TargetUID:       s.TargetUID,
 	}
 	for k, v := range s.PerUID {
 		c := *v
@@ -491,6 +497,8 @@ type WatchStatus struct {
 	Events []WatchEventStatus `json:"events"`
 	// Today 今日汇总（本地时区 0 点起算）。
 	Today WatchDaySummary `json:"today"`
+	// TargetUID 当前收割目标（锁定收割：每轮优先用它加号直到吃干/差评）。
+	TargetUID string `json:"target_uid"`
 }
 
 // WatchEventStatus 单条触发事件（GET /watch 回显，成果面板行）。
@@ -536,6 +544,7 @@ func (w *UIDWatcher) Status() WatchStatus {
 		Running:         w.running,
 		LastTick:        w.state.LastTick,
 		Logs:            append([]string(nil), w.logs...),
+		TargetUID:       w.state.TargetUID,
 	}
 	// 事件流水倒序（最新在前，面板第一屏就是最近的成果）。
 	st.Events = make([]WatchEventStatus, 0, len(w.state.Events))
@@ -700,6 +709,73 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 			w.syncSnapshot(f.proj, f.items, skip)
 		}
 	}
+
+	// ---- 锁定收割（用户语义：命中低价码后持续用它，直到吃干/差评） ----
+	// 目标码还活着且达标 → 每轮继续收割它（不重新比价；比价只在选新
+	// 目标时发生）。目标失效（库存不足/消失/涨价/停用/冷却）→ 清目标，
+	// 本轮走正常候选流程选下一个。
+	if target := w.stateSnapshot().TargetUID; target != "" {
+		targetStillValid := false
+		var targetCand candidate
+		var targetProj WatchProject
+		for _, f := range fetched {
+			for _, it := range f.items {
+				if it.UID != target {
+					continue
+				}
+				targetProj = f.proj
+				targetCand = candidate{proj: f.proj, uid: it.UID, price: it.Price, stock: it.Stock}
+				if !f.proj.Enabled {
+					w.log("收割目标 %s 所在项目已停用，切换下一个", target)
+				} else if it.Price > f.proj.MaxPrice {
+					w.log("收割目标 %s 涨价 ¥%.2f 超上限 ¥%.2f，切换下一个", target, it.Price, f.proj.MaxPrice)
+				} else if it.Stock < cfg.want() {
+					w.log("收割目标 %s 可取库存 %d < 每轮目标 %d，已吃干，切换下一个", target, it.Stock, cfg.want())
+				} else {
+					targetStillValid = true
+				}
+				break
+			}
+			if targetStillValid || targetCand.uid != "" {
+				break
+			}
+		}
+		if targetStillValid {
+			// 其余候选（本轮判定出的事件）在收割期间**基线不同步**——
+			// 事件不吞，等目标吃干后轮到它们。目标码本身不在候选里
+			//（它的事件在锁定那轮已消化）。
+			candSkip := make(map[string]bool, len(candidates))
+			for _, c := range candidates {
+				candSkip[c.uid] = true
+			}
+			// 额度/互斥检查与候选派活同规则。
+			snap := w.stateSnapshot()
+			cost := round2(targetCand.price * float64(cfg.want()))
+			if snap.BudgetRemaining < cost {
+				w.setPaused(fmt.Sprintf("额度耗尽（剩 ¥%.2f，收割 %s 需 ¥%.2f）——充值后继续收割同一目标",
+					snap.BudgetRemaining, target, cost))
+				syncAll(candSkip) // 暂停期间候选事件保留（目标由 TargetUID 锁定，不靠基线）
+				return
+			}
+			if w.en.Status().Running {
+				w.log("有手动加号任务在跑，跳过本轮收割（%s，下轮继续）", target)
+				syncAll(candSkip)
+				return
+			}
+			syncAll(candSkip)
+			w.executeTrigger(ctx, cfg, targetProj, target, targetCand.price,
+				fmt.Sprintf("持续收割 ¥%.2f（余 %d）", targetCand.price, targetCand.stock))
+			w.clearTransientPause()
+			return
+		}
+		// 目标失效：清掉（下一逻辑选新目标）。冷却由 markBadUID 负责，
+		// 这里只处理"吃干/涨价/消失/停用"。
+		w.mu.Lock()
+		w.state.TargetUID = ""
+		w.mu.Unlock()
+		w.persist()
+	}
+
 	if len(candidates) == 0 {
 		syncAll(nil) // 无事件：观测值正常入账
 		w.clearTransientPause()
@@ -750,8 +826,20 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 		// 反过来会留下 nil 基线 → 下轮误判"新码"重复触发。
 		delete(queued, c.uid)
 		syncAll(queued)
-		w.executeTrigger(ctx, cfg, c.proj, c.uid, c.price, c.ev)
+		// 锁定收割：本轮派活的候选成为收割目标——下一轮优先继续用它
+		//（不重新比价），直到吃干/涨价/差评冷却才切换。
+		w.mu.Lock()
+		w.state.TargetUID = c.uid
+		w.mu.Unlock()
+		ok := w.executeTrigger(ctx, cfg, c.proj, c.uid, c.price, c.ev)
 		dispatched++
+		if ok > 0 {
+			// 成功收割：锁定目标，本轮到此为止——后续候选等目标
+			// 吃干再轮到它们（用户语义："一直用这个加号直到吃干"）。
+			break
+		}
+		// 差码（0 成功）已被 markBadUID 冷却并清目标 → 本轮立即试
+		// 下一个候选（"多次失败达到阈值才切换到下一个"）。
 	}
 	if dispatched > 0 {
 		w.clearTransientPause()
@@ -820,7 +908,8 @@ func (w *UIDWatcher) syncSnapshot(p WatchProject, items []haozhumah5.UIDItem, sk
 }
 
 // executeTrigger 派活：加入账户 → 临时切换取号参数 → 跑一轮 → 记账 → 恢复。
-func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p WatchProject, uid string, price float64, ev string) {
+// 返回本轮成功加号数（收割循环据此决定锁定目标还是切下一个）。
+func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p WatchProject, uid string, price float64, ev string) int {
 	want := cfg.want()
 	start := time.Now()
 	w.log("触发：%s %s（项目 %s）——加 %d 个号，预算 ¥%.2f", uid, ev, p.Sid, want, round2(price*float64(want)))
@@ -828,7 +917,7 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	// 1) 确保码已加入账户（官方 API 只认已加入的；幂等）。
 	if err := w.h5.AddUID(ctx, uid); err != nil {
 		w.log("加入对接码 %s 失败：%v（本轮放弃）", uid, err)
-		return
+		return 0
 	}
 	w.mu.Lock()
 	w.state.TriggerTotal++ // 触发即计数（全失败的轮也算触发过）
@@ -869,7 +958,7 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	})
 	if err != nil {
 		w.log("启动加号失败：%v（本轮放弃）", err)
-		return
+		return 0
 	}
 	// 等待任务完成：轮询 Status。AutoEnroller 没有完成回调（run 在内部
 	// goroutine 里跑），这里用轮询 + ctx 感知（粒度 2s，任务通常分钟级）。
@@ -887,7 +976,7 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 				// 还在跑：用当前成功数记账（保守），标记状态。
 				w.charge(uid, price, st.OK, st.StopReason)
 				w.recordEvent(p, uid, ev, price, want, start, st.OK, st.StopReason)
-				return
+				return st.OK
 			}
 			break
 		case <-time.After(2 * time.Second):
@@ -903,6 +992,7 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 	if st.OK == 0 {
 		w.markBadUID(ctx, uid, st.StopReason)
 	}
+	return st.OK
 }
 
 // recordEvent 事件流水入账（成果面板数据源）。cost 从当前预算口径
@@ -932,11 +1022,15 @@ func (w *UIDWatcher) recordEvent(p WatchProject, uid, ev string, price float64, 
 }
 
 // markBadUID 差码善后：冷却 24h + 从账户移除（幂等，失败不阻塞）。
+// 若差码正是当前收割目标 → 一并清掉目标（收割切换的失败阈值路径）。
 func (w *UIDWatcher) markBadUID(ctx context.Context, uid, stopReason string) {
 	until := time.Now().Add(watchCooldown).Format(time.RFC3339)
 	w.mu.Lock()
 	if st := w.state.PerUID[uid]; st != nil {
 		st.CooldownUntil = until
+	}
+	if w.state.TargetUID == uid {
+		w.state.TargetUID = ""
 	}
 	w.mu.Unlock()
 	w.persist()

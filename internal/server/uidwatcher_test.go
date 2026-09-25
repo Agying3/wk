@@ -194,26 +194,33 @@ func TestWatcherNewUIDTriggersAndCharges(t *testing.T) {
 }
 
 // TestWatcherNoSelfTrigger 自身消耗不算补货：触发消耗的号在市场侧扣
-// 库存（真实 H5 行为），下轮观察 = 基线 → 不再触发。
+// 库存（真实 H5 行为）。锁定收割模式下目标码每轮继续收割（新语义），
+// 但吃干（stock < want）后放行——本测试验证"自身消耗制造的假回升
+// 不会发生 + 吃干即停"。
 func TestWatcherNoSelfTrigger(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
-	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 5)}})
+	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|2"})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 1)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
 	}
-	go e.w.Run(context.Background())
-
-	// 第一轮触发后记账。
-	waitFor(t, 10*time.Second, func() bool { return e.w.Status().TriggerTotal >= 1 }, "第一轮触发")
+	// 第一轮收割 + 记账。
+	e.w.tick(context.Background(), e.w.cfg)
 	waitFor(t, 10*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "第一轮成功")
-	// 市场侧如实扣减（真实 H5：号被取走，可取库存 -1）。
+	// 市场侧如实扣减（真实 H5：号被取走，可取库存 -1）：2→1，还 ≥
+	// want 1 → 第二轮继续收割同一码。
 	e.fh.consume("52283-CHEAP", 1)
-	// 手动跑几轮（不等 ticker）：观察 = 基线，不应再触发。
-	for i := 0; i < 3; i++ {
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 10*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 2 }, "锁定目标应继续收割")
+	// 再扣到 0（< want 1）→ 吃干放行，之后不再触发。
+	e.fh.consume("52283-CHEAP", 1)
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 5*time.Second, func() bool { return e.w.Status().TargetUID == "" }, "吃干后应清目标")
+	before := e.w.Status().TriggerTotal
+	for i := 0; i < 2; i++ {
 		e.w.tick(context.Background(), e.w.cfg)
 	}
-	if st := e.w.Status(); st.TriggerTotal != 1 {
-		t.Fatalf("自身消耗/无变化不应再触发，实际触发 %d 次", st.TriggerTotal)
+	if st := e.w.Status(); st.TriggerTotal != before {
+		t.Fatalf("吃干后不应再触发，实际 %d → %d", before, st.TriggerTotal)
 	}
 }
 
@@ -432,15 +439,15 @@ func TestWatcherHotEnable(t *testing.T) {
 
 // TestWatcherHotDisable 开启 → 关闭：循环停摆（不再 tick），再开恢复。
 func TestWatcherHotDisable(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
+	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|1"})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
 	}
 	e.w.Start()
-	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 5)}})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 1)}})
 	waitFor(t, 10*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "第一轮成功")
 	// 关闭：之后手动 tick 也不该派活（enabled=false 直接跳过）。
-	e.w.Reconfigure(WatchConfig{Enabled: false, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 5)}})
+	e.w.Reconfigure(WatchConfig{Enabled: false, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 1)}})
 	waitFor(t, 5*time.Second, func() bool {
 		st := e.w.Status()
 		for _, l := range st.Logs {
@@ -469,10 +476,10 @@ func TestWatcherUnavailable(t *testing.T) {
 }
 
 // TestWatcherDeadUIDRevives dead 码（上游删除）重新出现且达标 → 触发
-// "重新上架"，且不会连续触发。
+// "重新上架"；锁定收割模式下目标消失即清目标，回来时重新锁定。
 func TestWatcherDeadUIDRevives(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-GONE": "0.88|23"})
-	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 5)}})
+	e := newWatchEnv(t, map[string]string{"52283-GONE": "0.88|2"})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 1)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -481,90 +488,124 @@ func TestWatcherDeadUIDRevives(t *testing.T) {
 	waitFor(t, 10*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "第一轮成功")
 	e.fh.consume("52283-GONE", 1)
 
-	// 上游删了它 → dead。
+	// 上游删了它 → dead → 收割目标随之清空。
 	e.fh.mu.lock()
 	e.fh.uidTable = map[string]string{}
 	e.fh.mu.unlock()
 	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 5*time.Second, func() bool { return e.w.Status().TargetUID == "" }, "目标消失应清目标")
 
-	// 重新上架且达标 → "重新上架"触发（第二次）。
+	// 重新上架且达标 → "重新上架"触发（第二次）并重新锁定。
 	e.fh.mu.lock()
-	e.fh.uidTable = map[string]string{"52283-GONE": "0.88|25"}
+	e.fh.uidTable = map[string]string{"52283-GONE": "0.88|1"}
 	e.fh.mu.unlock()
 	e.w.tick(context.Background(), e.w.cfg)
 	if st := e.w.Status(); st.TriggerTotal != 2 {
 		t.Fatalf("重新上架应触发第二次，实际 %d 次", st.TriggerTotal)
 	}
-	// 第二轮成功后同样扣市场库存。
+	// 第二轮成功后扣市场库存到 0 → 吃干，不再触发。
 	waitFor(t, 10*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 2 }, "第二轮成功")
 	e.fh.consume("52283-GONE", 1)
-	// 再跑一轮：观察 = 基线，不再触发。
 	e.w.tick(context.Background(), e.w.cfg)
-	if st := e.w.Status(); st.TriggerTotal != 2 {
-		t.Fatalf("基线重建后不应再触发，实际 %d 次", st.TriggerTotal)
+	waitFor(t, 5*time.Second, func() bool { return e.w.Status().TargetUID == "" }, "吃干后应清目标")
+	before := e.w.Status().TriggerTotal
+	e.w.tick(context.Background(), e.w.cfg)
+	if st := e.w.Status(); st.TriggerTotal != before {
+		t.Fatalf("吃干后不应再触发，实际 %d → %d", before, st.TriggerTotal)
 	}
 }
 
 // TestWatcherMultipleCandidatesQueued 同一轮多个候选（新码 3 个）：
 // 按价格升序逐个派活，都在本轮消化（≤ 单轮上限）；不吞事件——上限
 // 之外的候选留到下轮，基线不同步。
+// TestWatcherMultipleCandidatesQueued 锁定收割下的多候选：选最便宜
+// 的锁定，吃干它，下一轮自动切到次便宜的——每轮只收割一个目标。
 func TestWatcherMultipleCandidatesQueued(t *testing.T) {
 	e := newWatchEnv(t, map[string]string{
-		"52283-A": "0.50|10",
-		"52283-B": "0.30|10",
-		"52283-C": "0.40|10",
+		"52283-A": "0.50|1",
+		"52283-B": "0.30|1",
+		"52283-C": "0.40|1",
 	})
-	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 1)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
 	}
+	// 第一轮：三个新码候选 → 锁定最便宜的 B，只收割 B。
 	e.w.tick(context.Background(), e.w.cfg)
-	// 单轮上限 3：三个候选全部按价派活（0.30 → 0.40 → 0.50）。
-	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 3 }, "三个候选都应加号成功")
-	st := e.w.Status()
-	if st.TriggerTotal != 3 {
-		t.Fatalf("应触发 3 次，实际 %d", st.TriggerTotal)
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "应收割 B")
+	if st := e.w.Status(); st.TargetUID != "52283-B" {
+		t.Fatalf("应锁定最便宜的 B，实际 %q", st.TargetUID)
 	}
+	if st := e.w.Status(); st.TriggerTotal != 1 {
+		t.Fatalf("锁定模式下每轮只派一个，实际 %d 次", st.TriggerTotal)
+	}
+	// B 市场库存 1→0（扣自身消耗）→ 第二轮吃干，切到次便宜的 C。
+	// （吃干与任务收尾可能撞轮：目标清空后若手动收尾还没结束，候选
+	// 流程会让路——用 waitFor + 补 tick 兜住。）
+	e.fh.consume("52283-B", 1)
+	shiftTo := func(wantUID string, wantEnrolled int, desc string) {
+		waitFor(t, 20*time.Second, func() bool {
+			st := e.w.Status()
+			if st.TargetUID == wantUID && st.EnrolledTotal >= wantEnrolled {
+				return true
+			}
+			e.w.tick(context.Background(), e.w.cfg)
+			return false
+		}, desc)
+	}
+	shiftTo("52283-C", 2, "B 吃干后应切 C")
+	// C 吃干 → 切 A。
+	e.fh.consume("52283-C", 1)
+	shiftTo("52283-A", 3, "C 吃干后应切 A")
+	e.fh.consume("52283-A", 1)
+	waitFor(t, 10*time.Second, func() bool {
+		if st := e.w.Status(); st.TargetUID == "" {
+			return true
+		}
+		e.w.tick(context.Background(), e.w.cfg)
+		return false
+	}, "全部吃干后应清目标")
+	st := e.w.Status()
 	if st.BudgetRemaining != round2(10-0.3-0.4-0.5) {
 		t.Fatalf("额度 = %.2f，want 8.80", st.BudgetRemaining)
 	}
-	// 每次成功都扣市场库存（fake 侧如实模拟）——这里补扣 3 个。
-	e.fh.consume("52283-A", 1)
-	e.fh.consume("52283-B", 1)
-	e.fh.consume("52283-C", 1)
-	// 下轮：观察 = 基线，不再触发。
-	e.w.tick(context.Background(), e.w.cfg)
-	if st := e.w.Status(); st.TriggerTotal != 3 {
-		t.Fatalf("全部消化后不应再触发，实际 %d", st.TriggerTotal)
-	}
 }
 
-// TestWatcherCandidateOverflowKeepsEvent 候选超过单轮上限：本轮只消化
-// 3 个（最便宜的），其余**不吞**——下轮继续触发。
+// TestWatcherCandidateOverflowKeepsEvent 候选多但本轮只锁定一个：
+// 其余候选的事件**不吞**（基线不同步），目标吃干后下轮继续按价轮到。
 func TestWatcherCandidateOverflowKeepsEvent(t *testing.T) {
 	e := newWatchEnv(t, map[string]string{
-		"52283-A": "0.10|10",
-		"52283-B": "0.20|10",
-		"52283-C": "0.30|10",
-		"52283-D": "0.40|10",
-		"52283-E": "0.50|10",
+		"52283-A": "0.10|1",
+		"52283-B": "0.20|1",
+		"52283-C": "0.30|1",
+		"52283-D": "0.40|1",
+		"52283-E": "0.50|1",
 	})
-	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 1)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
 	}
+	// 第一轮：锁定 A。
 	e.w.tick(context.Background(), e.w.cfg)
-	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 3 }, "单轮上限 3 个应先消化")
-	// 市场扣库存（前 3 个：A B C）。
-	e.fh.consume("52283-A", 1)
-	e.fh.consume("52283-B", 1)
-	e.fh.consume("52283-C", 1)
-	// 第 4 轮：D、E 的事件还在（基线没同步），继续按价派活。
-	e.w.tick(context.Background(), e.w.cfg)
-	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 5 }, "剩余候选下轮应继续消化")
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "第一轮应收割 A")
+	if st := e.w.Status(); st.TriggerTotal != 1 || st.TargetUID != "52283-A" {
+		t.Fatalf("应只锁定 A：触发 %d 目标 %q", st.TriggerTotal, st.TargetUID)
+	}
+	// A 吃干 → 后续每轮按价切一个：B、C、D、E 逐个来（撞任务收尾时
+	// 补 tick 兜住）。
+	for _, uid := range []string{"52283-A", "52283-B", "52283-C", "52283-D"} {
+		e.fh.consume(uid, 1)
+	}
+	waitFor(t, 60*time.Second, func() bool {
+		if e.w.Status().EnrolledTotal >= 5 {
+			return true
+		}
+		e.w.tick(context.Background(), e.w.cfg)
+		return false
+	}, "五个候选应逐轮全部消化")
 	st := e.w.Status()
 	if st.TriggerTotal != 5 {
-		t.Fatalf("两轮应共触发 5 次，实际 %d", st.TriggerTotal)
+		t.Fatalf("五轮应共触发 5 次，实际 %d", st.TriggerTotal)
 	}
 }
 
@@ -677,6 +718,74 @@ func TestWatcherEventsRecorded(t *testing.T) {
 		raw, err := readFileStr(filepath.Join(e.tmp, "watcher-state.json"))
 		return err == nil && strings.Contains(raw, `"events"`) && strings.Contains(raw, "52283-CHEAP")
 	}, "事件应持久化到状态文件")
+}
+
+// TestWatcherHarvestLock 锁定收割：命中便宜码后连续多轮用它加号，
+// 直到可取库存 < 每轮目标才放它走。
+func TestWatcherHarvestLock(t *testing.T) {
+	// 便宜码 A（0.30）和贵码 B（0.50）同时出现；库存 3。
+	e := newWatchEnv(t, map[string]string{
+		"52283-A": "0.30|3",
+		"52283-B": "0.50|3",
+	})
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 1)}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	// 第一轮：选最便宜的 A，A 成为收割目标。
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "第一轮应选 A 加号")
+	if st := e.w.Status(); st.TargetUID != "52283-A" {
+		t.Fatalf("收割目标应为 A，实际 %q", st.TargetUID)
+	}
+	// 第二轮：市场侧 A 库存 3→2（扣自己消耗）；A 仍 ≥ 目标 1 → 继续
+	// 收割 A（即使 B 也在，不重新比价）。
+	e.fh.consume("52283-A", 1)
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 2 }, "第二轮应继续收割 A")
+	if st := e.w.Status(); st.TargetUID != "52283-A" {
+		t.Fatalf("收割目标应仍为 A，实际 %q", st.TargetUID)
+	}
+	// 第三轮：A 还剩 1（≥ 目标 1）→ 还收割 A。
+	e.fh.consume("52283-A", 1)
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 3 }, "第三轮应继续收割 A")
+	// 第四轮前 A 扣到自己消耗后 = 0（< 目标 1）→ 吃干放行。
+	e.fh.consume("52283-A", 1)
+	e.w.tick(context.Background(), e.w.cfg)
+	waitFor(t, 5*time.Second, func() bool { return e.w.Status().TargetUID == "" || e.w.Status().TargetUID == "52283-B" }, "A 吃干后应清目标/切 B")
+	// B 成为新目标并收割（若目标流转到 B）。
+	if st := e.w.Status(); st.TargetUID == "52283-B" {
+		waitFor(t, 15*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 4 }, "应切换收割 B")
+	}
+}
+
+// TestWatcherHarvestSwitchOnBadUID 差码失败阈值：0 成功 → 冷却 →
+// 同一轮立即切换下一个候选（不等下一轮）。
+func TestWatcherHarvestSwitchOnBadUID(t *testing.T) {
+	// A 更便宜但是差码（收不到短信）；B 贵一点但好。
+	e := newWatchEnv(t, map[string]string{
+		"52283-A": "0.30|3",
+		"52283-B": "0.50|3",
+	})
+	e.fz.msgResp.Store(`{"code":"0","msg":"ok","sms":""}`) // 全收不到
+	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 1)}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.w.tick(context.Background(), e.w.cfg)
+	// 第一轮：A（最便宜）0 成功 → 冷却 → 目标清空，**同一轮**试 B。
+	waitFor(t, 40*time.Second, func() bool { return e.w.Status().TriggerTotal >= 2 }, "差码当轮应切换 B")
+	if st := e.w.Status(); st.TargetUID != "52283-B" {
+		t.Fatalf("差码后目标应切到 B，实际 %q", st.TargetUID)
+	}
+	// B 也全失败 → 同样冷却清目标（两个候选都消化完）。
+	waitFor(t, 40*time.Second, func() bool { return e.w.Status().TargetUID == "" }, "B 失败后目标应清空")
+	// 冷却中的 A、B 下一轮不再触发。
+	e.w.tick(context.Background(), e.w.cfg)
+	if st := e.w.Status(); st.TriggerTotal != 2 {
+		t.Fatalf("冷却中的码不应再触发，实际 %d 次", st.TriggerTotal)
+	}
 }
 
 // TestWatcherStateFileShape 状态文件结构（字段名/类型约定：前端与排查依赖）。
