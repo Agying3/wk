@@ -156,8 +156,11 @@ func (s *Store) SetProxyBindings(group string, pgIDs []string) error {
 		clean = append(clean, id)
 	}
 	sort.Strings(clean)
-	if len(clean) == 0 && !s.hasBindingLocked(group) {
-		return nil // 无变化：不写文件
+	// 显式清空（传入非 nil 空列表 / 有内容的空结果）要落盘：保留空列表
+	// 让"管理员清空过绑定"与"从未绑定"可区分（后者会被 default 种子重新
+	// 写入）。nil 入参（调用方未提供）且键不存在时才视为无变化。
+	if len(clean) == 0 && !s.hasBindingLocked(group) && pgIDs == nil {
+		return nil
 	}
 	s.pgBindings[group] = clean
 	s.dirtyBind = true
@@ -171,6 +174,14 @@ func (s *Store) ProxyBindingsOf(group string) []string {
 	out := append([]string(nil), s.pgBindings[group]...)
 	sort.Strings(out)
 	return out
+}
+
+// HasProxyBindings 报告账号分组是否有绑定记录（即便列表已被清空）。
+// 用于区分"从未绑定"（可种子默认绑定）与"管理员显式清空"（不再种子）。
+func (s *Store) HasProxyBindings(group string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hasBindingLocked(group)
 }
 
 // SnapshotProxyBindings 导出全量绑定（管理页/测试用）。

@@ -15,10 +15,11 @@ import (
 	"time"
 )
 
-// validProxyGroupRegion 代理分组区域只允许 cn|global（all 是账号分组的
-// 迁移默认态，代理分组必须明确区域）。
+// validProxyGroupRegion 代理分组区域允许 cn|global|all：
+//   - cn/global：分组节点只服务对应区域的账号槽位（结构性隔离）；
+//   - all：不限制区域，对两类账号槽位都可见（默认分组即 all）。
 func validProxyGroupRegion(r string) bool {
-	return r == "cn" || r == "global"
+	return r == "cn" || r == "global" || r == RegionAll
 }
 
 // CreateProxyGroup 新建手动代理分组。
@@ -31,7 +32,7 @@ func (m *Manager) CreateProxyGroup(name, region string) (ProxyGroup, error) {
 		return ProxyGroup{}, fmt.Errorf("分组名过长（最多 32 字符）")
 	}
 	if !validProxyGroupRegion(region) {
-		return ProxyGroup{}, fmt.Errorf("代理分组区域必须是 cn 或 global")
+		return ProxyGroup{}, fmt.Errorf("代理分组区域必须是 cn、global 或 all")
 	}
 	g := ProxyGroup{ID: newID("pg"), Name: name, Region: region, CreatedAt: time.Now()}
 	m.store.Update(func(st *State) {
@@ -41,7 +42,8 @@ func (m *Manager) CreateProxyGroup(name, region string) (ProxyGroup, error) {
 	return g, nil
 }
 
-// RenameProxyGroup 改名（订阅专属组不可改名——名随订阅）。
+// RenameProxyGroup 改名（订阅专属组不可改名——名随订阅；默认分组是
+// 系统内置标识，不可改名）。
 func (m *Manager) RenameProxyGroup(id, name string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -53,6 +55,10 @@ func (m *Manager) RenameProxyGroup(id, name string) error {
 			if st.ProxyGroups[i].ID == id {
 				if st.ProxyGroups[i].SubID != "" {
 					err = fmt.Errorf("订阅专属分组不可改名（名称跟随订阅）")
+					return
+				}
+				if id == DefaultProxyGroupID {
+					err = fmt.Errorf("默认分组不可改名")
 					return
 				}
 				st.ProxyGroups[i].Name = name
@@ -70,8 +76,11 @@ func (m *Manager) RenameProxyGroup(id, name string) error {
 // 区域变更后调用 SweepRegionViolations 修正违规槽位（由 server 层触发，
 // 这里不自动——server 要先做账号分组绑定方向的合规校验）。
 func (m *Manager) SetProxyGroupRegion(id, region string) error {
+	if id == DefaultProxyGroupID {
+		return fmt.Errorf("默认分组区域固定为 all，不可修改")
+	}
 	if !validProxyGroupRegion(region) {
-		return fmt.Errorf("代理分组区域必须是 cn 或 global")
+		return fmt.Errorf("代理分组区域必须是 cn、global 或 all")
 	}
 	var err error
 	m.store.Update(func(st *State) {
@@ -99,8 +108,12 @@ func (m *Manager) SetProxyGroupRegion(id, region string) error {
 	return nil
 }
 
-// DeleteProxyGroup 删除手动分组（订阅专属组必须删订阅）。返回受影响的手动节点数。
+// DeleteProxyGroup 删除手动分组（订阅专属组必须删订阅；默认分组不可删）。
+// 返回受影响的手动节点数。组内手动节点回落到默认分组（不再允许未分组）。
 func (m *Manager) DeleteProxyGroup(id string) (int, error) {
+	if id == DefaultProxyGroupID {
+		return 0, fmt.Errorf("默认分组不可删除")
+	}
 	affected := 0
 	var err error
 	m.store.Update(func(st *State) {
@@ -120,10 +133,10 @@ func (m *Manager) DeleteProxyGroup(id string) (int, error) {
 			return
 		}
 		st.ProxyGroups = append(st.ProxyGroups[:idx], st.ProxyGroups[idx+1:]...)
-		// 组内手动节点归未分组。
+		// 组内手动节点回落到默认分组（未分组不再是合法持久态）。
 		for i := range st.ManualNodes {
 			if st.ManualNodes[i].GroupID == id {
-				st.ManualNodes[i].GroupID = ""
+				st.ManualNodes[i].GroupID = DefaultProxyGroupID
 				affected++
 			}
 		}
@@ -133,23 +146,65 @@ func (m *Manager) DeleteProxyGroup(id string) (int, error) {
 	}
 	m.rebuildPool()
 	m.SweepRegionViolations()
-	m.emit("info", fmt.Sprintf("代理分组 %s 已删除（%d 个手动节点归未分组）", id, affected))
+	m.emit("info", fmt.Sprintf("代理分组 %s 已删除（%d 个手动节点回落默认分组）", id, affected))
 	return affected, nil
 }
 
-// SetManualNodeGroup 手动节点挪组（空 groupID = 取消分组）。
-func (m *Manager) SetManualNodeGroup(nodeID, groupID string) error {
+// SetManualNodesGroup 批量挪组：一次 Update 改完所有节点，一次 rebuild +
+// Sweep（对比逐节点调用 = N 次全池重建）。groupID 空 = 挪回默认分组。
+// 返回实际挪动的节点数；nodeIDs 里的订阅节点/不存在节点跳过（不报错，
+// 前端勾选可能混入）。
+func (m *Manager) SetManualNodesGroup(nodeIDs []string, groupID string) (int, error) {
+	if groupID == "" {
+		groupID = DefaultProxyGroupID
+	}
 	var err error
+	moved := 0
 	m.store.Update(func(st *State) {
-		if groupID != "" && st.ProxyGroupByID(groupID) == nil {
+		if st.ProxyGroupByID(groupID) == nil {
 			err = fmt.Errorf("代理分组 %s 不存在", groupID)
 			return
 		}
-		if groupID != "" {
-			if g := st.ProxyGroupByID(groupID); g != nil && g.SubID != "" {
-				err = fmt.Errorf("订阅专属分组的成员由订阅决定，不能手动加入")
-				return
+		if g := st.ProxyGroupByID(groupID); g != nil && g.SubID != "" {
+			err = fmt.Errorf("订阅专属分组的成员由订阅决定，不能手动加入")
+			return
+		}
+		want := map[string]bool{}
+		for _, id := range nodeIDs {
+			want[id] = true
+		}
+		for i := range st.ManualNodes {
+			if want[st.ManualNodes[i].ID] && st.ManualNodes[i].GroupID != groupID {
+				st.ManualNodes[i].GroupID = groupID
+				moved++
 			}
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	if moved > 0 {
+		m.rebuildPool()
+		m.SweepRegionViolations()
+	}
+	return moved, nil
+}
+
+// SetManualNodeGroup 手动节点挪组。groupID 空 = 挪回默认分组
+// （未分组不再是合法状态；默认分组 all 区，行为等同旧版"不分组"）。
+func (m *Manager) SetManualNodeGroup(nodeID, groupID string) error {
+	var err error
+	m.store.Update(func(st *State) {
+		if groupID == "" {
+			groupID = DefaultProxyGroupID
+		}
+		if st.ProxyGroupByID(groupID) == nil {
+			err = fmt.Errorf("代理分组 %s 不存在", groupID)
+			return
+		}
+		if g := st.ProxyGroupByID(groupID); g != nil && g.SubID != "" {
+			err = fmt.Errorf("订阅专属分组的成员由订阅决定，不能手动加入")
+			return
 		}
 		for i := range st.ManualNodes {
 			if st.ManualNodes[i].ID == nodeID {

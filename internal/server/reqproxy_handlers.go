@@ -149,8 +149,8 @@ func (h *Handler) reqproxySubsPost(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name 和 url 必填"})
 		return
 	}
-	if req.Region != groups.RegionCN && req.Region != groups.RegionGlobal {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "新建订阅必须指定区域（cn 或 global）：订阅节点将归入对应区域的专属代理分组"})
+	if req.Region != groups.RegionCN && req.Region != groups.RegionGlobal && req.Region != groups.RegionAll {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "新建订阅必须指定区域（cn、global 或 all）：订阅节点将归入对应区域的专属代理分组（all = 不限制区域）"})
 		return
 	}
 	if req.Interval == "" {
@@ -194,8 +194,8 @@ func (h *Handler) reqproxySubPutDelete(w http.ResponseWriter, r *http.Request) {
 		// 区域变更：专属分组区域同步 + 反向绑定校验。
 		if req.Region != nil && *req.Region != "" {
 			region := *req.Region
-			if region != groups.RegionCN && region != groups.RegionGlobal {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "订阅区域必须是 cn 或 global"})
+			if region != groups.RegionCN && region != groups.RegionGlobal && region != groups.RegionAll {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "订阅区域必须是 cn、global 或 all"})
 				return
 			}
 			// 找到该订阅的专属分组 ID 做反向校验。

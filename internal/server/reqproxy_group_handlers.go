@@ -18,7 +18,7 @@ import (
 )
 
 // errInvalidRegion 区域取值不合法。
-var errInvalidRegion = errors.New("代理分组区域必须是 cn 或 global")
+var errInvalidRegion = errors.New("代理分组区域必须是 cn、global 或 all")
 
 // regionConflictError 区域变更/绑定与既有引用冲突（带名单的可读错误）。
 type regionConflictError struct {
@@ -87,6 +87,7 @@ func (h *Handler) reqproxyGroupsGet(w http.ResponseWriter, r *http.Request) {
 			"id": g.ID, "name": g.Name, "region": g.Region,
 			"nodes":      nodeCount[g.ID],
 			"created_at": g.CreatedAt,
+			"is_default": g.ID == reqproxy.DefaultProxyGroupID,
 		}
 		if g.SubID != "" {
 			item["sub_id"] = g.SubID
@@ -185,8 +186,9 @@ func (h *Handler) reqproxyGroupPutDelete(w http.ResponseWriter, r *http.Request)
 
 // checkProxyGroupRegionChange 代理分组区域变更的反向校验：
 // 绑定了它的账号分组必须为 all 或同区，否则拒绝（并给出名单）。
+// 代理分组改 all 天然兼容所有账号分组（RegionCompatible 对 all 恒真）。
 func (h *Handler) checkProxyGroupRegionChange(pgID, newRegion string) error {
-	if newRegion != groups.RegionCN && newRegion != groups.RegionGlobal {
+	if newRegion != groups.RegionCN && newRegion != groups.RegionGlobal && newRegion != groups.RegionAll {
 		return errInvalidRegion
 	}
 	if h.cfg.Groups == nil {
@@ -212,6 +214,40 @@ func (h *Handler) checkProxyGroupRegionChange(pgID, newRegion string) error {
 		return &regionConflictError{groupKind: "账号分组", groups: bad, target: newRegion}
 	}
 	return nil
+}
+
+// reqproxyNodesGroupBatch 批量挪组（一次 rebuild；前端勾选多节点用）。
+func (h *Handler) reqproxyNodesGroupBatch(w http.ResponseWriter, r *http.Request) {
+	if !h.reqproxyEnabled(w) {
+		return
+	}
+	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", "PUT")
+		returnJSONErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		NodeIDs []string `json:"node_ids"`
+		GroupID string   `json:"group_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+		returnJSONErr(w, http.StatusBadRequest, "请求格式不正确")
+		return
+	}
+	if len(req.NodeIDs) == 0 {
+		returnJSONErr(w, http.StatusBadRequest, "node_ids 不能为空")
+		return
+	}
+	if len(req.NodeIDs) > 1000 {
+		returnJSONErr(w, http.StatusBadRequest, "单次最多挪动 1000 个节点")
+		return
+	}
+	moved, err := h.cfg.ReqProxy.SetManualNodesGroup(req.NodeIDs, req.GroupID)
+	if err != nil {
+		returnJSONErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "moved": moved})
 }
 
 // reqproxyNodeGroup 手动节点挪组。

@@ -55,10 +55,14 @@ func (m *Manager) HealthOf(nodeID string) NodeHealth {
 	return out
 }
 
-// ImportManualNodes 手动批量导入节点到指定代理分组（空 = 未分组）。
+// ImportManualNodes 手动批量导入节点到指定代理分组。
+// groupID 空 = 归入默认分组（未分组不再是合法状态）。
 // 返回成功条数。
 func (m *Manager) ImportManualNodes(text, groupID string) (int, error) {
-	if groupID != "" {
+	if groupID == "" {
+		groupID = DefaultProxyGroupID
+	}
+	{
 		var g *ProxyGroup
 		m.store.View(func(st *State) { g = st.ProxyGroupByID(groupID) })
 		if g == nil {

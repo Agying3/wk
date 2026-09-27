@@ -43,15 +43,31 @@ type Subscription struct {
 	GroupID string `json:"group_id,omitempty"`
 }
 
+// DefaultProxyGroupID 系统内置默认代理分组的固定 ID。
+// 与账号分组的 default 一样恒存在、不可改名/删除/改区域（区域固定 all）；
+// 账号分组 default 的初始绑定即指向它。用固定 ID（不走 newID）保证
+// 跨重启/多实例引用稳定。
+const DefaultProxyGroupID = "pg_default"
+
+// DefaultProxyGroupName 默认代理分组展示名。
+const DefaultProxyGroupName = "默认分组"
+
+// RegionAll 区域通配值（与 groups.RegionAll 对应；reqproxy 不依赖
+// groups 包，这里只用字符串字面量语义：分组区域 all 的节点对 cn/global
+// 两类账号槽位都可见）。
+const RegionAll = "all"
+
 // ProxyGroup 代理分组。
 //
+//   - 默认组（ID == DefaultProxyGroupID）：系统内置，区域固定 all，
+//     不可改名/删除/改区域；手动节点不选组时归入它。
 //   - 订阅专属组（SubID 非空）：订阅创建时自动生成、删除订阅时连带删除，
 //     不允许通过通用分组接口删除/改名。
-//   - 手动组（SubID 空）：管理员建/改名/删除；手动导入的节点可归入任意
-//     手动组（也可不分组）。
+//   - 手动组（其余）：管理员建/改名/删除；手动导入的节点可归入任意
+//     手动组或默认组。
 //
-// Region ∈ cn|global：分组的区域决定了它的节点能服务哪个区域的账号槽位
-// （结构性隔离，与账号分组绑定无关）。
+// Region ∈ cn|global|all：分组的区域决定了它的节点能服务哪个区域的账号
+// 槽位（结构性隔离，与账号分组绑定无关）；all = 对两区域账号都可见。
 type ProxyGroup struct {
 	ID        string    `json:"id"`   // pg_xxxx
 	Name      string    `json:"name"` // 展示名（可重复，ID 才是键）
@@ -66,8 +82,23 @@ type ManualNode struct {
 	Name      string `json:"name"`
 	Raw       string `json:"raw"`        // 原始 share-link / socks5:// / host:port:user:pass
 	RegionTag string `json:"region_tag"` // 可选显式地区（HK/JP/...）；空 = 按名称识别
-	// GroupID 所属代理分组（空 = 未分组：对两区域可见，与旧版行为一致）。
+	// GroupID 所属代理分组。空仅在加载旧状态时短暂出现——Normalize 会
+	// 把未分组的手动节点统一迁移进默认分组（DefaultProxyGroupID），
+	// 常态下所有手动节点都有分组。
 	GroupID string `json:"group_id,omitempty"`
+}
+
+// IsDefaultProxyGroup 判断分组是否为系统内置默认组。
+func (g *ProxyGroup) IsDefaultProxyGroup() bool { return g.ID == DefaultProxyGroupID }
+
+// DefaultProxyGroup 构造内置默认代理分组（region=all，两区可见）。
+func DefaultProxyGroup() ProxyGroup {
+	return ProxyGroup{
+		ID:        DefaultProxyGroupID,
+		Name:      DefaultProxyGroupName,
+		Region:    RegionAll,
+		CreatedAt: time.Now(),
+	}
 }
 
 // Rules 筛选规则（全池生效）。
@@ -201,7 +232,7 @@ func DefaultState() *State {
 		Enabled:       false,
 		Subscriptions: []Subscription{},
 		ManualNodes:   []ManualNode{},
-		ProxyGroups:   []ProxyGroup{},
+		ProxyGroups:   []ProxyGroup{DefaultProxyGroup()},
 		Rules: Rules{
 			IncludeKeywords: []string{},
 			ExcludeKeywords: []string{},
@@ -254,6 +285,21 @@ func (s *State) Normalize() {
 	if s.ProxyGroups == nil {
 		s.ProxyGroups = []ProxyGroup{}
 	}
+	// 默认代理分组兜底：恒存在、属性恒定（缺失或被旧数据改坏即重建/
+	// 归位）。放在订阅清理之后，避免被后面的 out 切片操作丢掉。
+	defaultIdx := -1
+	for i, g := range s.ProxyGroups {
+		if g.ID == DefaultProxyGroupID {
+			defaultIdx = i
+			break
+		}
+	}
+	if defaultIdx < 0 {
+		s.ProxyGroups = append([]ProxyGroup{DefaultProxyGroup()}, s.ProxyGroups...)
+	} else if s.ProxyGroups[defaultIdx].Region != RegionAll || s.ProxyGroups[defaultIdx].SubID != "" {
+		s.ProxyGroups[defaultIdx].Region = RegionAll
+		s.ProxyGroups[defaultIdx].SubID = ""
+	}
 	// 订阅↔分组一致性兜底：SubID 关联的订阅已不存在时，把悬空的专属组
 	// 降级为手动组？不——直接删掉。理由：专属组的节点全部来自该订阅，
 	// 订阅没了节点也即将出池，留着只会是悬空引用（绑定侧由 server 清理）。
@@ -268,6 +314,23 @@ func (s *State) Normalize() {
 		}
 	}
 	s.ProxyGroups = out
+	// 默认组不携带 SubID，上面的过滤天然保留它；但显式再兜底一次，
+	// 防御 future 改动把它错标成订阅组后被清掉。
+	if s.ProxyGroupByID(DefaultProxyGroupID) == nil {
+		s.ProxyGroups = append(s.ProxyGroups, DefaultProxyGroup())
+	}
+	// 存量未分组手动节点迁移：旧版本允许 GroupID 为空（对两区域可见），
+	// 引入默认分组后空值不再合法——统一归入默认分组，保持两区可见的
+	// 行为不变（默认组 region=all）。幂等：已是默认组或其它组的节点不动。
+	groupExists := map[string]bool{DefaultProxyGroupID: true}
+	for _, g := range s.ProxyGroups {
+		groupExists[g.ID] = true
+	}
+	for i := range s.ManualNodes {
+		if s.ManualNodes[i].GroupID == "" || !groupExists[s.ManualNodes[i].GroupID] {
+			s.ManualNodes[i].GroupID = DefaultProxyGroupID
+		}
+	}
 	if s.Rules.IncludeKeywords == nil {
 		s.Rules.IncludeKeywords = []string{}
 	}

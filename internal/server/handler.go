@@ -314,6 +314,19 @@ func NewHandler(cfg Config) *Handler {
 	// Groups 或 ReqProxy 未启用时不注入（Pool.groupResolver=nil = 不限制）。
 	if cfg.ReqProxy != nil && cfg.Groups != nil {
 		cfg.ReqProxy.SetGroupResolver(proxyGroupResolver{h: h})
+		// 默认绑定种子：default 账号分组首次没有代理绑定时自动绑定到
+		// 默认代理分组（pg_default）。仅在该键不存在时写入——管理员
+		// 之后可改可清空（清空 = 回到"不限制"），种子不再复活。
+		if binds := cfg.Groups.ProxyBindingsOf(groups.DefaultGroup); len(binds) == 0 {
+			// 区分"键不存在"与"键存在但为空列表"：后者是管理员显式
+			// 清空过的，尊重之。SnapshotProxyBindings 里两者都表现为
+			// 空，这里直接看原始存储。
+			if !cfg.Groups.HasProxyBindings(groups.DefaultGroup) {
+				if err := cfg.Groups.SetProxyBindings(groups.DefaultGroup, []string{reqproxy.DefaultProxyGroupID}); err == nil {
+					log.Printf("[groups] default 账号分组初始绑定到默认代理分组 %s（可在管理页修改）", reqproxy.DefaultProxyGroupID)
+				}
+			}
+		}
 	}
 	h.featuresMu.Lock()
 	h.sanitizeHooks.setSanitize = cfg.SetSanitizeFingerprints
@@ -394,6 +407,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("PUT /admin/reqproxy/groups/{id}", h.withFrontend(h.reqproxyGroupPutDelete))
 	h.mux.HandleFunc("DELETE /admin/reqproxy/groups/{id}", h.withFrontend(h.reqproxyGroupPutDelete))
 	h.mux.HandleFunc("PUT /admin/reqproxy/nodes/{id}/group", h.withFrontend(h.reqproxyNodeGroup))
+	h.mux.HandleFunc("PUT /admin/reqproxy/nodes/group", h.withFrontend(h.reqproxyNodesGroupBatch))
 	h.mux.HandleFunc("GET /admin/reqproxy/nodes", h.withFrontend(h.reqproxyNodesGet))
 	h.mux.HandleFunc("POST /admin/reqproxy/nodes/import", h.withFrontend(h.reqproxyNodesImport))
 	h.mux.HandleFunc("DELETE /admin/reqproxy/nodes/{id}", h.withFrontend(h.reqproxyNodeDelete))

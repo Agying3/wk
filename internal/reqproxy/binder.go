@@ -49,9 +49,9 @@ type Pool struct {
 	loads   map[string]int64   // node_id → 累计请求数（保留：API/审计用，不再是均衡主信号）
 	// groupResolver 账号 → 允许的代理分组（nil = 全部；server 注入）。
 	groupResolver GroupResolver
-	// groupRegions groupID → 区域（cn|global），从 state 的代理分组构建，
-	// rebuildGroupIndexLocked 刷新。未分组节点不在此索引——按"两区域都
-	// 可见"处理（D3：归组才隔离）。
+	// groupRegions groupID → 区域（cn|global|all），从 state 的代理分组
+	// 构建，rebuildGroupIndexLocked 刷新。未分组节点不在此索引——按
+	// "两区域都可见"处理（D3：归组才隔离；all 组同样两区可见）。
 	groupRegions map[string]string
 	// 三层滑动窗口（近 6 分钟速率，均衡主信号）：
 	//   nodeWin 节点级——替换累计值的历史包袱（昨天热今天闲不再被惩罚）
@@ -120,8 +120,9 @@ func (p *Pool) rebuildGroupIndexLocked() {
 }
 
 // nodeServesRegionLocked 节点（按其分组）能否服务指定账号区域的槽位。
-// 未分组节点对两区域都可见（与旧版一致）；归组节点只能服务同区槽位——
-// 这是结构性隔离，与账号分组绑定无关。
+// 未分组节点对两区域都可见（与旧版一致）；归组节点按分组区域判定：
+// cn/global 只服务同区槽位（结构性隔离），all 对两区都可见。
+// 与账号分组绑定无关。
 func (p *Pool) nodeServesRegionLocked(node Node, region string) bool {
 	if node.GroupID == "" {
 		return true
@@ -132,7 +133,7 @@ func (p *Pool) nodeServesRegionLocked(node Node, region string) bool {
 		// 把节点出池。宁可短暂放行也不能把全池打死。
 		return true
 	}
-	return gr == region
+	return gr == RegionAll || gr == region
 }
 
 // nodeAllowedGroup 节点是否在账号允许的代理分组集合内。

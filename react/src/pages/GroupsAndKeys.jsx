@@ -235,12 +235,15 @@ export default function GroupsAndKeysPage({ api }) {
     },
   ];
 
-  // 代理分组绑定选项（区域兼容过滤：账号分组为 all 时都可，否则同区）。
+  // 代理分组绑定选项（区域兼容过滤）。
+  // 账号分组为 all → 任何代理分组都可绑；cn/global → 只能绑同区或
+  // 不限区域（all）的代理分组（all 代理分组对两类账号都可用）。
+  const pgRegionShort = r => (r === 'cn' ? 'CN' : r === 'global' ? '国际' : '不限');
   const bindOptions = record => proxyGroups
-    .filter(pg => !record.region || record.region === 'all' || pg.region === record.region)
+    .filter(pg => !record.region || record.region === 'all' || pg.region === 'all' || pg.region === record.region)
     .map(pg => ({
       value: pg.id,
-      label: `${pg.name}（${pg.region === 'cn' ? 'CN' : '国际'}区 · ${pg.nodes} 节点${pg.sub_id ? ' · 订阅专属' : ''}）`,
+      label: `${pg.name}（${pgRegionShort(pg.region)} · ${pg.nodes} 节点${pg.is_default ? ' · 默认' : ''}${pg.sub_id ? ' · 订阅专属' : ''}）`,
     }));
 
   return (
@@ -341,7 +344,7 @@ export default function GroupsAndKeysPage({ api }) {
             <Form form={bindForm} layout="vertical">
               <Form.Item
                 name="proxy_groups" label="允许的代理分组（多选）"
-                extra="留空 = 不限制（该分组账号可用全部节点）。绑定的分组全部生效后，账号只能走这些分组里的节点；与其他分组的绑定取并集。"
+                extra="留空 = 不限制（该分组账号可用全部节点）。绑定的分组全部生效后，账号只能走这些分组里的节点；与其他分组的绑定取并集。默认分组（不限区域）可随时绑定/解绑。"
               >
                 <Select mode="multiple" placeholder="不限制" options={bindOptions(groups.find(g => g.name === bindModal?.name) || { region: 'all' })} />
               </Form.Item>
