@@ -336,6 +336,20 @@ Disabled ←────┘ (session 死亡，永久)
 `GET /requests?limit=50` 可查询最近记录，控制台也会展示同一份数据。
 控制台“请求日志”菜单支持按模型、端点、账号、错误、流式/同步/透传和成功状态筛选，并可展开查看缓存 token、工具调用与完整错误详情。
 
+仪表盘的缓存率、平均首 token 与 token 卡片共用窗口汇总，分别按 `sum(cache_read_tokens) / sum(input_tokens)`
+和 `ttfb_millis_sum / ttfb_samples` 计算。手动刷新重新计算时间起止点；请求日志筛选只接受最新查询的响应。
+汇总查询失败或后端不提供汇总时，窗口统计明确显示不可用，不退回累计值或当前页合计；
+后端汇总失败返回 `request_summary_unavailable`（HTTP 500）。
+
+`GET /requests?since=...&until=...&include=summary` 汇总窗口内所有匹配的**已保留日志**，不受 `limit` 限制。
+`summary.coverage` 返回全库现存日志的时间边界、请求起止点和保留限制。窗口起点早于现存日志时，
+控制台会提示覆盖范围；该提示不把新建服务没有历史记录误判为已经删除数据。删除的历史不会自动恢复，
+7 天或 30 天窗口也不能绕过条数保留上限。
+
+窗口汇总另含 `credits_upstream`、`credits_estimated`、`credit_upstream_requests`、`credit_estimated_requests`
+和 `credit_unknown_requests`。控制台显示上游值与估算值的合计、来源拆分及未知覆盖率，未知请求不视为零成本。
+`cache_write_tokens` 仍兼容上游未命中/创建字段，页面将其标为“未命中 / 创建输入”，不据此承诺后续缓存复用。
+
 stdout 同时保留一行便于排查的表格日志：
 
 ```

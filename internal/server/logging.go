@@ -103,19 +103,35 @@ type RequestLogFilter struct {
 
 // RequestSummary is the aggregate of every request log matching a filter.
 type RequestSummary struct {
-	Requests         int64   `json:"requests"`
-	Successes        int64   `json:"successes"`
-	Failures         int64   `json:"failures"`
-	InputTokens      int64   `json:"input_tokens"`
-	OutputTokens     int64   `json:"output_tokens"`
-	TotalTokens      int64   `json:"total_tokens"`
-	CacheReadTokens  int64   `json:"cache_read_tokens"`
-	CacheWriteTokens int64   `json:"cache_write_tokens"`
-	ToolCalls        int64   `json:"tool_calls"`
-	TTFBMillisSum    int64   `json:"ttfb_millis_sum"`
-	TTFBSamples      int64   `json:"ttfb_samples"`
-	LatencyMillisSum int64   `json:"latency_millis_sum"`
-	CreditsConsumed  float64 `json:"credits_consumed"`
+	Requests                int64               `json:"requests"`
+	Successes               int64               `json:"successes"`
+	Failures                int64               `json:"failures"`
+	InputTokens             int64               `json:"input_tokens"`
+	OutputTokens            int64               `json:"output_tokens"`
+	TotalTokens             int64               `json:"total_tokens"`
+	CacheReadTokens         int64               `json:"cache_read_tokens"`
+	CacheWriteTokens        int64               `json:"cache_write_tokens"`
+	ToolCalls               int64               `json:"tool_calls"`
+	TTFBMillisSum           int64               `json:"ttfb_millis_sum"`
+	TTFBSamples             int64               `json:"ttfb_samples"`
+	LatencyMillisSum        int64               `json:"latency_millis_sum"`
+	CreditsConsumed         float64             `json:"credits_consumed"`
+	CreditsUpstream         float64             `json:"credits_upstream"`
+	CreditsEstimated        float64             `json:"credits_estimated"`
+	CreditUpstreamRequests  int64               `json:"credit_upstream_requests"`
+	CreditEstimatedRequests int64               `json:"credit_estimated_requests"`
+	CreditUnknownRequests   int64               `json:"credit_unknown_requests"`
+	Coverage                *RequestLogCoverage `json:"coverage,omitempty"`
+}
+
+type RequestLogCoverage struct {
+	EarliestRetainedAt   int64 `json:"earliest_retained_at"`
+	LatestRetainedAt     int64 `json:"latest_retained_at"`
+	RequestedSince       int64 `json:"requested_since"`
+	RequestedUntil       int64 `json:"requested_until"`
+	RetentionRows        int   `json:"retention_rows"`
+	RetentionSeconds     int64 `json:"retention_seconds"`
+	StartsBeforeRetained bool  `json:"starts_before_retained"`
 }
 
 // CreditMetricsStore persists credit totals alongside aggregate metrics.

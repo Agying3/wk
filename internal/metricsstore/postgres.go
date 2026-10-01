@@ -369,24 +369,7 @@ func (s *PostgresStore) QueryRequests(filter RequestFilter) ([]RequestRecord, er
 func (s *PostgresStore) SummarizeRequests(filter RequestFilter) (RequestSummary, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	where, args := requestFilterWhere(filter, "$")
-	row := s.db.QueryRow(`SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END), 0),
-		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0),
-		COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(tool_calls), 0),
-		COALESCE(SUM(ttfb_millis), 0), COALESCE(SUM(CASE WHEN ttfb_millis > 0 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(latency_millis), 0), COALESCE(SUM(credits_consumed), 0)
-		FROM request_logs`+where, args...)
-	var summary RequestSummary
-	if err := row.Scan(&summary.Requests, &summary.Successes, &summary.Failures,
-		&summary.InputTokens, &summary.OutputTokens, &summary.TotalTokens,
-		&summary.CacheReadTokens, &summary.CacheWriteTokens, &summary.ToolCalls,
-		&summary.TTFBMillisSum, &summary.TTFBSamples, &summary.LatencyMillisSum,
-		&summary.CreditsConsumed); err != nil {
-		return RequestSummary{}, err
-	}
-	return summary, nil
+	return summarizeRequests(s.db, filter, "$", s.RetentionPolicy())
 }
 
 func (s *PostgresStore) Snapshot() (Snapshot, error) {

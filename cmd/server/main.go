@@ -130,13 +130,25 @@ func (m metricsAdapter) SummarizeRequests(filter server.RequestLogFilter) (serve
 	if err != nil {
 		return server.RequestSummary{}, err
 	}
-	return server.RequestSummary{
+	result := server.RequestSummary{
 		Requests: summary.Requests, Successes: summary.Successes, Failures: summary.Failures,
 		InputTokens: summary.InputTokens, OutputTokens: summary.OutputTokens, TotalTokens: summary.TotalTokens,
 		CacheReadTokens: summary.CacheReadTokens, CacheWriteTokens: summary.CacheWriteTokens,
 		ToolCalls: summary.ToolCalls, TTFBMillisSum: summary.TTFBMillisSum, TTFBSamples: summary.TTFBSamples,
 		LatencyMillisSum: summary.LatencyMillisSum, CreditsConsumed: summary.CreditsConsumed,
-	}, nil
+		CreditsUpstream: summary.CreditsUpstream, CreditsEstimated: summary.CreditsEstimated,
+		CreditUpstreamRequests: summary.CreditUpstreamRequests, CreditEstimatedRequests: summary.CreditEstimatedRequests,
+		CreditUnknownRequests: summary.CreditUnknownRequests,
+	}
+	if c := summary.Coverage; c != nil {
+		result.Coverage = &server.RequestLogCoverage{
+			EarliestRetainedAt: c.EarliestRetainedAt, LatestRetainedAt: c.LatestRetainedAt,
+			RequestedSince: c.RequestedSince, RequestedUntil: c.RequestedUntil,
+			RetentionRows: c.RetentionRows, RetentionSeconds: c.RetentionSeconds,
+			StartsBeforeRetained: c.StartsBeforeRetained,
+		}
+	}
+	return result, nil
 }
 
 func requestLogFilter(filter server.RequestLogFilter) metricsstore.RequestFilter {

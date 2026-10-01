@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 // React 19 兼容补丁（官方）：antd v5 只声明支持 React 16-18；19 移除了
 // 旧版 render/事件模拟路径后，Modal/Drawer 的关闭动画会偶发卡死——遮罩
@@ -25,6 +25,8 @@ import RequestLogsPage from './pages/RequestLogs';
 import AccountSettingsPage from './pages/AccountSettings';
 import AccountListPage from './pages/AccountList';
 import GrowthTasksPage from './pages/GrowthTasks';
+import RequestSummaryNotice from './components/RequestSummaryNotice';
+import { buildRequestQuery, hasRequestSummary, statisticsFromSummary } from './lib/requestStatistics';
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
@@ -99,6 +101,10 @@ function Console() {
   // 拉取时把 since 传给 /requests（带 include=summary），统计走全量聚合。
   const [dashboardWindow, setDashboardWindow] = useState('24h');
   const [dashboardSummary, setDashboardSummary] = useState(null);
+  const [dashboardScope, setDashboardScope] = useState(null);
+  const [dashboardError, setDashboardError] = useState(null);
+  const [dashboardLoading, setDashboardLoading] = useState(false);
+  const [dashboardUntil, setDashboardUntil] = useState(null);
   const [config, setConfig] = useState({
     checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn',
     features: null, billing: null, upstream: null, max_request_body: null,
@@ -120,7 +126,7 @@ function Console() {
   const requestSerial = useRef(0);
 
   const headers = useMemo(() => (apiKey ? { Authorization: `Bearer ${apiKey}` } : {}), [apiKey]);
-  const api = async (path, options = {}) => {
+  const api = useCallback(async (path, options = {}) => {
     const response = await fetch(path, { ...options, headers: { ...headers, ...(options.headers || {}) } });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -137,10 +143,7 @@ function Console() {
       throw error;
     }
     return body;
-  };
-
-  // DASHBOARD_WINDOWS 仪表盘时间窗选项。key 同时用于 /requests?since=… 换算。
-  const windowSeconds = key => ({ '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800, '30d': 2592000 }[key] || 0);
+  }, [headers]);
 
   const refresh = async () => {
     // 锁定期间不请求任何数据：弹窗输入框与 apiKey 是同一个 state，
@@ -153,29 +156,46 @@ function Console() {
     refreshController.current?.abort();
     const controller = new AbortController();
     refreshController.current = controller;
+    setDashboardLoading(true);
     // 仪表盘按所选时间窗拉请求日志（since 秒级时间戳），并请求全量聚合
     // summary —— 指标卡显示的是窗口内全部请求，不受 limit 截断。
-    const since = windowSeconds(dashboardWindow);
-    const requestQuery = `/requests?limit=200${since ? `&since=${Math.floor(Date.now() / 1000) - since}` : ''}&include=summary`;
+    const range = buildRequestQuery({ windowKey: dashboardWindow }, { limit: 200 });
+    const requestQuery = `/requests?${range.query}`;
     try {
       const [status, modelList, requestList] = await Promise.all([
         api('/status', { signal: controller.signal }),
         api('/v1/models', { signal: controller.signal }),
-        api(requestQuery, { signal: controller.signal }).catch(() => ({ data: [] })),
+        api(requestQuery, { signal: controller.signal }).catch(error => {
+          if (error.name === 'AbortError') throw error;
+          return { data: [], summaryError: error };
+        }),
       ]);
       if (serial !== refreshSerial.current) return;
       setData(status);
       setModels(modelList.data || []);
       setRequestLogs(requestList.data || []);
-      setDashboardSummary(requestList.summary || null);
+      const summary = hasRequestSummary(requestList.summary) ? requestList.summary : null;
+      setDashboardSummary(summary);
+      setDashboardScope(dashboardWindow);
+      setDashboardError(summary ? null : requestList.summaryError?.message || '当前服务未提供该窗口的汇总，统计暂不可用。');
+      setDashboardUntil(summary ? range.until : null);
+      setDashboardLoading(false);
       setSelectedModel(current => current || modelList.data?.[0]?.id || '');
-      const metrics = status.metrics || {};
-      const inputTokens = Number(metrics.input_tokens || 0);
-      const cacheRate = inputTokens ? (Number(metrics.cache_read_tokens || 0) / inputTokens) * 100 : 0;
-      setMetricSamples(current => [...current, { at: Date.now(), cacheRate, avgTTFB: Number(metrics.avg_ttfb_ms || 0) }].slice(-24));
-      setLocked(false);
+      const stats = statisticsFromSummary(summary);
+      if (stats) {
+        setMetricSamples(current => [...current, { at: Date.now(), cacheRate: stats.cacheRate,
+          cacheScope: dashboardWindow, avgTTFB: stats.avgTtfb > 0 ? stats.avgTtfb : null }].slice(-24));
+      }
+      setLocked(requestList.summaryError?.status === 401);
     } catch (error) {
       if (error.name === 'AbortError') return;
+      if (serial !== refreshSerial.current) return;
+      setDashboardSummary(null);
+      setDashboardScope(dashboardWindow);
+      setDashboardError(error.message || '统计加载失败，请刷新重试。');
+      setDashboardUntil(null);
+      setDashboardLoading(false);
+      setRequestLogs([]);
       // 鉴权失效判定只看 HTTP 状态码：后端的 401 是确定信号，而错误文案
       // 随端点变化（/status 是 "missing or invalid API key"，/admin/config
       // 是 "admin credential required"），靠正则匹配文案曾导致会话过期后
@@ -220,7 +240,11 @@ function Console() {
     if (locked) return;
     refresh();
     const timer = setInterval(refresh, 30000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      ++refreshSerial.current;
+      refreshController.current?.abort();
+    };
   }, [apiKey, dashboardWindow, locked]);
 
   useEffect(() => {
@@ -638,35 +662,20 @@ function Console() {
   // （账号列表已拆到 #/pool 独立页面 AccountList，这里的筛选逻辑随迁。）
 
 
-  // 指标口径：仪表盘的请求/token/积分统计按所选时间窗取值（来自
-  // /requests?include=summary 的全量聚合，不受 limit 截断）。老后端没有
-  // summary 字段时退回 /status 的累计指标（自进程/库启动以来的总数），
-  // 此时标注"累计"以免口径混淆。缓存命中率与平均首 token 仍来自
-  // /status metrics——它们是比率/均值，窗口化需要逐行聚合，留作后续扩展。
-  const metrics = data.metrics || {};
-  const cacheHitRate = Number(metrics.input_tokens || 0)
-    ? (Number(metrics.cache_read_tokens || 0) / Number(metrics.input_tokens || 1)) * 100
-    : 0;
-  const windowed = dashboardSummary && Number(dashboardSummary.requests) > 0;
-  const windowLabel = windowed ? { '1h': '（近 1 小时）', '6h': '（近 6 小时）', '24h': '（近 24 小时）', '7d': '（近 7 天）', '30d': '（近 30 天）' }[dashboardWindow] : '（累计）';
-  const statSource = windowed ? {
-    requests: dashboardSummary.requests,
-    successes: dashboardSummary.successes,
-    failures: dashboardSummary.failures,
-    input_tokens: dashboardSummary.input_tokens,
-    output_tokens: dashboardSummary.output_tokens,
-    total_tokens: dashboardSummary.total_tokens,
-    cache_read_tokens: dashboardSummary.cache_read_tokens,
-    cache_write_tokens: dashboardSummary.cache_write_tokens,
-    tool_calls: dashboardSummary.tool_calls,
-    credits_consumed: dashboardSummary.credits_consumed,
-  } : metrics;
+  // All window metrics, including TTFB, come from the same summary. A failed
+  // query is unavailable, never a switch to cumulative /status metrics.
+  const summaryForWindow = dashboardScope === dashboardWindow && !dashboardError ? dashboardSummary : null;
+  const windowStats = statisticsFromSummary(summaryForWindow);
+  const windowLabel = { '1h': '（近 1 小时）', '6h': '（近 6 小时）', '24h': '（近 24 小时）', '7d': '（近 7 天）', '30d': '（近 30 天）' }[dashboardWindow] || '';
+  const statSource = summaryForWindow || {};
+  const windowSamples = metricSamples.filter(sample => sample.cacheScope === dashboardWindow);
+  const dashboardLogs = dashboardScope === dashboardWindow ? requestLogs : [];
   const statCards = [
     ['请求总数' + windowLabel, statSource.requests, '#7aa2ff'], ['成功请求', statSource.successes, '#52c41a'],
     ['失败请求', statSource.failures, '#ff7875'], ['输入 token', statSource.input_tokens, '#69c0ff'],
     ['输出 token', statSource.output_tokens, '#b37feb'], ['总 token', statSource.total_tokens, '#9254de'],
-    ['缓存读取', statSource.cache_read_tokens, '#36cfc9'], ['缓存创建', statSource.cache_write_tokens, '#13c2c2'],
-    ['工具调用', statSource.tool_calls, '#ffc53d'], ['积分消耗', statSource.credits_consumed, '#fa8c16', fmtCredits],
+    ['缓存读取', statSource.cache_read_tokens, '#36cfc9'], ['未命中 / 创建输入', statSource.cache_write_tokens, '#13c2c2'],
+    ['工具调用', statSource.tool_calls, '#ffc53d'], ['已知积分消耗', windowStats?.credits, '#fa8c16', fmtCredits],
     // 剩余总余额：全池账号可用积分之和（非时间窗指标，实时快照）。
     ['剩余总余额', (data.accounts || []).reduce((sum, account) => sum + Number(account.credits || 0), 0), '#1677ff', fmtCredits],
   ];
@@ -1033,26 +1042,33 @@ function Console() {
                     />
                   </Space>
                 </div>
+                {dashboardScope === dashboardWindow && dashboardError && (
+                  <Alert type="error" showIcon message="该窗口统计暂不可用" description={dashboardError} style={{ marginBottom: 12 }} />
+                )}
+                {(dashboardLoading || (dashboardScope === dashboardWindow && dashboardUntil)) && (
+                  <Paragraph type="secondary">{dashboardLoading ? '正在更新统计… ' : ''}{dashboardScope === dashboardWindow && dashboardUntil ? `统计截至 ${new Date(dashboardUntil * 1000).toLocaleString()}` : ''}</Paragraph>
+                )}
+                <RequestSummaryNotice summary={summaryForWindow} />
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(170px,1fr))', gap: 16, marginBottom: 20 }}>
-                  {statCards.map(([label, value, color, formatter]) => <Card key={label}><Statistic title={label} value={formatter ? formatter(value) : fmt(value)} valueStyle={{ color }} /></Card>)}
+                  {statCards.map(([label, value, color, formatter]) => <Card key={label}><Statistic title={label} value={value == null ? '-' : formatter ? formatter(value) : fmt(value)} valueStyle={{ color }} /></Card>)}
                 </div>
-                <Card className="trend-card" title="性能趋势" extra={<Text type="secondary">最近 {metricSamples.length} 次刷新</Text>}>
+                <Card className="trend-card" title="性能趋势" extra={<Text type="secondary">该窗口最近 {windowSamples.length} 次刷新</Text>}>
                   <div className="trend-grid">
                     <div className="trend-layout">
                       <div>
                         <Text type="secondary">缓存命中率</Text>
-                        <div className="trend-value">{cacheHitRate.toFixed(1)}%</div>
+                        <div className="trend-value">{windowStats ? `${windowStats.cacheRate.toFixed(1)}%` : '-'}{windowLabel}</div>
                         <Text type="secondary">缓存读取 token / 输入 token</Text>
                       </div>
-                      <Sparkline values={metricSamples.map(sample => sample.cacheRate)} ariaLabel="缓存命中率趋势" />
+                      <Sparkline values={windowStats ? windowSamples.map(sample => sample.cacheRate) : []} ariaLabel="缓存命中率趋势" />
                     </div>
                     <div className="trend-layout">
                       <div>
                         <Text type="secondary">平均首 token</Text>
-                        <div className="trend-value">{Number(metrics.avg_ttfb_ms || 0) ? `${(Number(metrics.avg_ttfb_ms) / 1000).toFixed(2)}s` : '-'}</div>
-                        <Text type="secondary">仅统计流式请求</Text>
+                        <div className="trend-value">{windowStats?.avgTtfb ? `${(windowStats.avgTtfb / 1000).toFixed(2)}s` : '-'}{windowLabel}</div>
+                        <Text type="secondary">已记录首 token 的请求</Text>
                       </div>
-                      <Sparkline values={metricSamples.map(sample => sample.avgTTFB)} color="#12a594" ariaLabel="平均首 token 趋势" />
+                      <Sparkline values={windowStats ? windowSamples.filter(sample => sample.avgTTFB != null).map(sample => sample.avgTTFB) : []} color="#12a594" ariaLabel="平均首 token 趋势" />
                     </div>
                   </div>
                 </Card>
@@ -1060,13 +1076,13 @@ function Console() {
                   title="最近请求"
                   extra={(
                     <Space>
-                      <Text type="secondary">{requestLogs.length} 条</Text>
+                      <Text type="secondary">{dashboardLogs.length} 条</Text>
                       <Button size="small" type="link" onClick={() => setActiveSection('requests')}>查看全部与筛选</Button>
                     </Space>
                   )}
                   style={{ marginTop: 20 }}
                 >
-                  <Table rowKey="id" columns={requestColumns} dataSource={requestLogs} pagination={{ pageSize: 10 }} scroll={{ x: 1480 }} locale={{ emptyText: '暂无请求记录' }} />
+                  <Table rowKey="id" columns={requestColumns} dataSource={dashboardLogs} pagination={{ pageSize: 10 }} scroll={{ x: 1480 }} locale={{ emptyText: '暂无请求记录' }} />
                 </Card>
               </>
             )}

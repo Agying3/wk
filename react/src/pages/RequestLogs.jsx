@@ -1,16 +1,17 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Button, Card, Empty, Input, InputNumber, Select, Space, Statistic, Table, Tag, Typography,
+  Alert, Button, Card, Empty, Input, InputNumber, Select, Space, Statistic, Table, Tag, Typography,
 } from 'antd';
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons';
+import RequestSummaryNotice from '../components/RequestSummaryNotice';
+import { createLatestRequestLoader, requestFilterKey, statisticsFromSummary } from '../lib/requestStatistics';
 
 const { Text } = Typography;
 const fmt = value => Number(value || 0).toLocaleString();
 const fmtCredits = value => Number(value || 0).toFixed(4);
 const fmtMillis = value => (Number(value) > 0 ? `${(Number(value) / 1000).toFixed(2)}s` : '-');
 
-// WINDOW_PRESETS 快捷时间窗。absolute 标记的"全部"不传 since，由后端
-// 返回库内所有日志（request_logs 上限 10000 条，本身有界）。
+// 时间边界在每次查询时计算，表格和汇总共用该次查询的快照。
 const WINDOW_PRESETS = [
   { key: '1h', label: '近 1 小时', hours: 1 },
   { key: '6h', label: '近 6 小时', hours: 6 },
@@ -30,8 +31,8 @@ const WINDOW_PRESETS = [
  *  - 顶部统计卡来自 include=summary 的全量聚合（不受 limit 截断），
  *    看的是"窗口内总共发生了什么"，而表格只是窗口内最新的一页。
  *
- * 兼容性：老版本后端没有 since/model 等参数与 summary 字段——筛选参数
- * 会被忽略、summary 缺失，页面退化为"最近日志 + 浏览器端过滤"，不报错。
+ * 后端缺少 summary 时明确显示统计不可用，保留明细兜底过滤，
+ * 不把当前页的合计当成窗口汇总。
  */
 export default function RequestLogs({ api, models, accounts }) {
   // —— 筛选状态（全部是受控组件，URL 不回写，避免筛选词泄进历史记录）——
@@ -44,60 +45,31 @@ export default function RequestLogs({ api, models, accounts }) {
   const [ttfbMin, setTtfbMin] = useState(null); // 毫秒
   const [ttfbMax, setTtfbMax] = useState(null);
   const [idSearch, setIdSearch] = useState('');
-  const [logs, setLogs] = useState([]);
-  const [summary, setSummary] = useState(null);
-  const [loading, setLoading] = useState(false);
-
-  // knownRoutes / knownModels / knownAccounts 从数据里推导选项，避免手写
-  // 白名单漂移；模型目录由父组件传入（/v1/models），比日志里的更全。
-  const knownRoutes = useMemo(() => [...new Set(logs.map(r => r.route).filter(Boolean))].sort(), [logs]);
-
-  const query = useMemo(() => {
-    const params = new URLSearchParams();
-    params.set('limit', '500');
-    const preset = WINDOW_PRESETS.find(w => w.key === windowKey);
-    if (preset) {
-      params.set('since', Math.floor(Date.now() / 1000) - preset.hours * 3600);
-    }
-    if (modelFilter !== 'all') params.set('model', modelFilter);
-    if (routeFilter !== 'all') params.set('route', routeFilter);
-    if (accountFilter !== 'all') params.set('account', accountFilter);
-    if (regionFilter !== 'all') params.set('region', regionFilter);
-    if (statusFilter === 'success') params.set('success', '1');
-    else if (statusFilter === 'failed') params.set('success', '0');
-    else if (statusFilter !== 'all') params.set('status', statusFilter);
-    if (ttfbMin) params.set('ttfb_min', String(Math.round(ttfbMin)));
-    if (ttfbMax) params.set('ttfb_max', String(Math.round(ttfbMax)));
-    const id = idSearch.trim();
-    if (id) params.set('id', id);
-    params.set('include', 'summary');
-    return params.toString();
-  }, [windowKey, modelFilter, routeFilter, accountFilter, regionFilter, statusFilter, ttfbMin, ttfbMax, idSearch]);
-
-  const load = async () => {
-    setLoading(true);
-    try {
-      const body = await api(`/requests?${query}`);
-      setLogs(body.data || []);
-      setSummary(body.summary || null);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // 筛选变化即重新查询；时间窗用的是查询时刻的绝对值，刷新页面会重新计算。
+  const [result, setResult] = useState(null);
+  const loaderRef = useRef(null);
+  if (!loaderRef.current) loaderRef.current = createLatestRequestLoader(setResult);
+  const filters = useMemo(() => ({ windowKey, modelFilter, statusFilter, routeFilter,
+    accountFilter, regionFilter, ttfbMin, ttfbMax, idSearch }),
+  [windowKey, modelFilter, statusFilter, routeFilter, accountFilter, regionFilter, ttfbMin, ttfbMax, idSearch]);
+  const load = useCallback(() => loaderRef.current.load(api, filters), [api, filters]);
   useEffect(() => {
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query]);
+    return () => loaderRef.current.cancel();
+  }, [load]);
+  const current = result?.filterKey === requestFilterKey(filters);
+  const logs = current ? result.logs : [];
+  const summary = current ? result.summary : null;
+  const loading = !current || result.loading;
+  const error = current ? result.error : null;
+  const knownRoutes = useMemo(() => [...new Set(logs.map(r => r.route).filter(Boolean))].sort(), [logs]);
 
   // 浏览器端只做兜底过滤：老后端不认识筛选参数时（全部记录返回），
   // 至少保证视图口径一致；新后端返回的本来就是过滤后的结果。
   const visibleLogs = useMemo(() => {
-    const preset = WINDOW_PRESETS.find(w => w.key === windowKey);
-    const sinceSec = preset ? Math.floor(Date.now() / 1000) - preset.hours * 3600 : 0;
     return logs.filter(record => {
-      if (preset && Number(record.created_at || 0) < sinceSec) return false;
+      const createdAt = Number(record.created_at || 0);
+      if (result?.since && createdAt < result.since) return false;
+      if (result?.until && createdAt > result.until) return false;
       if (modelFilter !== 'all' && record.model !== modelFilter) return false;
       if (routeFilter !== 'all' && record.route !== routeFilter) return false;
       if (accountFilter !== 'all' && record.account_uid !== accountFilter) return false;
@@ -107,41 +79,15 @@ export default function RequestLogs({ api, models, accounts }) {
       if (statusFilter === 'failed' && success) return false;
       if (statusFilter !== 'all' && statusFilter !== 'success' && statusFilter !== 'failed' && String(record.status) !== statusFilter) return false;
       const ttfb = Number(record.ttfb_millis || 0);
-      if (ttfbMin && ttfb < ttfbMin) return false;
-      if (ttfbMax && ttfb > ttfbMax) return false;
+      if (result?.filters.ttfbMin && ttfb < result.filters.ttfbMin) return false;
+      if (result?.filters.ttfbMax && ttfb > result.filters.ttfbMax) return false;
       const id = idSearch.trim();
       if (id && record.id !== id) return false;
       return true;
     });
-  }, [logs, windowKey, modelFilter, routeFilter, accountFilter, regionFilter, statusFilter, ttfbMin, ttfbMax, idSearch]);
+  }, [logs, result?.since, result?.until, result?.filters.ttfbMin, result?.filters.ttfbMax, modelFilter, routeFilter, accountFilter, regionFilter, statusFilter, idSearch]);
 
-  // 汇总统计：优先后端 summary（全量聚合，不受 limit 截断）；
-  // 后端不支持时退回当前页数据的本地聚合（口径标注"当前页"）。
-  const stats = useMemo(() => {
-    if (summary && Number(summary.requests) > 0) {
-      return {
-        source: 'agg',
-        requests: summary.requests, successes: summary.successes, failures: summary.failures,
-        inputTokens: summary.input_tokens, outputTokens: summary.output_tokens,
-        totalTokens: summary.total_tokens, credits: summary.credits_consumed,
-        avgTtfb: summary.ttfb_samples > 0 ? summary.ttfb_millis_sum / summary.ttfb_samples : 0,
-        avgLatency: summary.requests > 0 ? summary.latency_millis_sum / summary.requests : 0,
-      };
-    }
-    const requests = visibleLogs.length;
-    const successes = visibleLogs.filter(r => r.status >= 200 && r.status < 300).length;
-    const ttfbSamples = visibleLogs.filter(r => Number(r.ttfb_millis || 0) > 0);
-    return {
-      source: 'page',
-      requests, successes, failures: requests - successes,
-      inputTokens: visibleLogs.reduce((s, r) => s + Number(r.input_tokens || 0), 0),
-      outputTokens: visibleLogs.reduce((s, r) => s + Number(r.output_tokens || 0), 0),
-      totalTokens: visibleLogs.reduce((s, r) => s + Number(r.total_tokens || 0), 0),
-      credits: visibleLogs.reduce((s, r) => s + Number(r.credits_consumed || 0), 0),
-      avgTtfb: ttfbSamples.length ? ttfbSamples.reduce((s, r) => s + Number(r.ttfb_millis || 0), 0) / ttfbSamples.length : 0,
-      avgLatency: requests ? visibleLogs.reduce((s, r) => s + Number(r.latency_millis || 0), 0) / requests : 0,
-    };
-  }, [summary, visibleLogs]);
+  const stats = statisticsFromSummary(summary);
 
   const modelOptions = useMemo(() => {
     const ids = new Set(models.map(m => m.id));
@@ -194,17 +140,20 @@ export default function RequestLogs({ api, models, accounts }) {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      {error && <Alert type="error" showIcon message="该窗口统计暂不可用" description={error} />}
+      {loading && <Text type="secondary">正在加载当前筛选的统计…</Text>}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: 12 }}>
-        <Card><Statistic title="请求数" value={fmt(stats.requests)} suffix={stats.source === 'page' ? '（当前页）' : ''} /></Card>
-        <Card><Statistic title="成功 / 失败" value={`${fmt(stats.successes)} / ${fmt(stats.failures)}`} valueStyle={{ color: stats.failures > 0 ? '#cf1322' : '#389e0d' }} /></Card>
-        <Card><Statistic title="输入 / 输出 token" value={`${fmt(stats.inputTokens)} / ${fmt(stats.outputTokens)}`} /></Card>
-        <Card><Statistic title="总 token" value={fmt(stats.totalTokens)} /></Card>
-        <Card><Statistic title="积分消耗" value={fmtCredits(stats.credits)} valueStyle={{ color: '#d46b08' }} /></Card>
-        <Card><Statistic title="平均首 token" value={stats.avgTtfb ? `${(stats.avgTtfb / 1000).toFixed(2)}s` : '-'} /></Card>
-        <Card><Statistic title="平均耗时" value={stats.avgLatency ? `${(stats.avgLatency / 1000).toFixed(2)}s` : '-'} /></Card>
+        <Card><Statistic title="请求数" value={stats ? fmt(stats.requests) : '-'} /></Card>
+        <Card><Statistic title="成功 / 失败" value={stats ? `${fmt(stats.successes)} / ${fmt(stats.failures)}` : '-'} valueStyle={{ color: stats?.failures > 0 ? '#cf1322' : '#389e0d' }} /></Card>
+        <Card><Statistic title="输入 / 输出 token" value={stats ? `${fmt(stats.inputTokens)} / ${fmt(stats.outputTokens)}` : '-'} /></Card>
+        <Card><Statistic title="总 token" value={stats ? fmt(stats.totalTokens) : '-'} /></Card>
+        <Card><Statistic title="已知积分消耗" value={stats ? fmtCredits(stats.credits) : '-'} valueStyle={{ color: '#d46b08' }} /></Card>
+        <Card><Statistic title="平均首 token" value={stats?.avgTtfb ? `${(stats.avgTtfb / 1000).toFixed(2)}s` : '-'} /></Card>
+        <Card><Statistic title="平均耗时" value={stats?.avgLatency ? `${(stats.avgLatency / 1000).toFixed(2)}s` : '-'} /></Card>
       </div>
+      <RequestSummaryNotice summary={summary} />
 
-      <Card title="筛选" extra={<Text type="secondary">统计基于时间窗内全部匹配记录；表格最多展示 500 条</Text>}>
+      <Card title="筛选" extra={<Text type="secondary">汇总基于窗口内已保留记录；表格最多展示 500 条</Text>}>
         <Space wrap style={{ width: '100%' }}>
           <Select value={windowKey} onChange={setWindowKey} style={{ width: 130 }} options={WINDOW_PRESETS.map(w => ({ value: w.key, label: w.label }))} />
           <Select value={modelFilter} onChange={setModelFilter} style={{ minWidth: 200 }} showSearch options={modelOptions} />
@@ -257,7 +206,7 @@ export default function RequestLogs({ api, models, accounts }) {
                 expandedRowRender: record => (
                   <Space direction="vertical" size={4}>
                     <Text type="secondary">请求 ID：{record.id || '-'}</Text>
-                    <Text type="secondary">请求上限：{record.requested_output_tokens ? fmt(record.requested_output_tokens) : '未设置'}；缓存读取：{fmt(record.cache_read_tokens)}；缓存创建：{fmt(record.cache_write_tokens)}；工具调用：{fmt(record.tool_calls)}</Text>
+                    <Text type="secondary">请求上限：{record.requested_output_tokens ? fmt(record.requested_output_tokens) : '未设置'}；缓存读取：{fmt(record.cache_read_tokens)}；未命中 / 创建输入：{fmt(record.cache_write_tokens)}；工具调用：{fmt(record.tool_calls)}</Text>
                     <Text type="secondary">模式：{record.passthrough ? '透传' : record.mode}；耗时：{fmtMillis(record.ttfb_millis)}（首字）/ {fmtMillis(record.latency_millis)}（总）</Text>
                     {(record.error_code || record.error_message) && <Text type="danger">{record.error_code || 'error'}：{record.error_message || '无错误详情'}</Text>}
                   </Space>

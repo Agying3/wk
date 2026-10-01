@@ -101,8 +101,8 @@ type RequestFilter struct {
 	Route         string
 	AccountUID    string
 	Region        string
-	Status        int    // 精确状态码；0 = 不过滤
-	Success       *bool  // nil = 不过滤；true = 2xx；false = 非 2xx
+	Status        int   // 精确状态码；0 = 不过滤
+	Success       *bool // nil = 不过滤；true = 2xx；false = 非 2xx
 	ErrorCode     string
 	ID            string
 	TTFBMinMillis int64 // 首字时间下限（含）；ttfb_millis=0 的行会被 min>0 排除
@@ -113,19 +113,38 @@ type RequestFilter struct {
 // row query it is not capped by Limit, so a windowed dashboard can show exact
 // totals even when the matching rows far exceed the page size.
 type RequestSummary struct {
-	Requests         int64   `json:"requests"`
-	Successes        int64   `json:"successes"`
-	Failures         int64   `json:"failures"`
-	InputTokens      int64   `json:"input_tokens"`
-	OutputTokens     int64   `json:"output_tokens"`
-	TotalTokens      int64   `json:"total_tokens"`
-	CacheReadTokens  int64   `json:"cache_read_tokens"`
-	CacheWriteTokens int64   `json:"cache_write_tokens"`
-	ToolCalls        int64   `json:"tool_calls"`
-	TTFBMillisSum    int64   `json:"ttfb_millis_sum"`
-	TTFBSamples      int64   `json:"ttfb_samples"`
-	LatencyMillisSum int64   `json:"latency_millis_sum"`
-	CreditsConsumed  float64 `json:"credits_consumed"`
+	Requests                int64               `json:"requests"`
+	Successes               int64               `json:"successes"`
+	Failures                int64               `json:"failures"`
+	InputTokens             int64               `json:"input_tokens"`
+	OutputTokens            int64               `json:"output_tokens"`
+	TotalTokens             int64               `json:"total_tokens"`
+	CacheReadTokens         int64               `json:"cache_read_tokens"`
+	CacheWriteTokens        int64               `json:"cache_write_tokens"`
+	ToolCalls               int64               `json:"tool_calls"`
+	TTFBMillisSum           int64               `json:"ttfb_millis_sum"`
+	TTFBSamples             int64               `json:"ttfb_samples"`
+	LatencyMillisSum        int64               `json:"latency_millis_sum"`
+	CreditsConsumed         float64             `json:"credits_consumed"`
+	CreditsUpstream         float64             `json:"credits_upstream"`
+	CreditsEstimated        float64             `json:"credits_estimated"`
+	CreditUpstreamRequests  int64               `json:"credit_upstream_requests"`
+	CreditEstimatedRequests int64               `json:"credit_estimated_requests"`
+	CreditUnknownRequests   int64               `json:"credit_unknown_requests"`
+	Coverage                *RequestLogCoverage `json:"coverage,omitempty"`
+}
+
+// RequestLogCoverage describes global retained history, not the first matching
+// model/account row. StartsBeforeRetained reports an unavailable range; it
+// does not claim that a newly installed service has deleted older requests.
+type RequestLogCoverage struct {
+	EarliestRetainedAt   int64 `json:"earliest_retained_at"`
+	LatestRetainedAt     int64 `json:"latest_retained_at"`
+	RequestedSince       int64 `json:"requested_since"`
+	RequestedUntil       int64 `json:"requested_until"`
+	RetentionRows        int   `json:"retention_rows"`
+	RetentionSeconds     int64 `json:"retention_seconds"`
+	StartsBeforeRetained bool  `json:"starts_before_retained"`
 }
 
 // maxRequestLogs 是 Retention.MaxRows 为零（不限条数）时的兜底上限。
@@ -562,24 +581,7 @@ func (s *Store) QueryRequests(filter RequestFilter) ([]RequestRecord, error) {
 func (s *Store) SummarizeRequests(filter RequestFilter) (RequestSummary, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	where, args := requestFilterWhere(filter, "?")
-	row := s.db.QueryRow(`SELECT COUNT(*),
-		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END), 0),
-		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0),
-		COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(tool_calls), 0),
-		COALESCE(SUM(ttfb_millis), 0), COALESCE(SUM(CASE WHEN ttfb_millis > 0 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(latency_millis), 0), COALESCE(SUM(credits_consumed), 0)
-		FROM request_logs`+where, args...)
-	var summary RequestSummary
-	if err := row.Scan(&summary.Requests, &summary.Successes, &summary.Failures,
-		&summary.InputTokens, &summary.OutputTokens, &summary.TotalTokens,
-		&summary.CacheReadTokens, &summary.CacheWriteTokens, &summary.ToolCalls,
-		&summary.TTFBMillisSum, &summary.TTFBSamples, &summary.LatencyMillisSum,
-		&summary.CreditsConsumed); err != nil {
-		return RequestSummary{}, err
-	}
-	return summary, nil
+	return summarizeRequests(s.db, filter, "?", s.RetentionPolicy())
 }
 
 // requestFilterWhere builds the shared SQL WHERE clause and bound arguments
@@ -681,4 +683,3 @@ func boolInt(value bool) int {
 	}
 	return 0
 }
-

@@ -3569,9 +3569,14 @@ func (h *Handler) requests(w http.ResponseWriter, r *http.Request) {
 		// include=summary 时附带全量聚合（不受 limit 截断），仪表盘的
 		// 时间窗统计靠它显示精确总数。
 		if strings.Contains(r.URL.Query().Get("include"), "summary") {
-			if summary, err := queryStore.SummarizeRequests(filter); err == nil {
-				body["summary"] = summary
+			summary, err := queryStore.SummarizeRequests(filter)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": map[string]string{
+					"code": "request_summary_unavailable", "message": "request summary is temporarily unavailable",
+				}})
+				return
 			}
+			body["summary"] = summary
 		}
 		writeJSON(w, http.StatusOK, body)
 		return
