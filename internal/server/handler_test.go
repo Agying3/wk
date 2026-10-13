@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/cacheroute"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -500,7 +501,7 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 	// 先把会话预绑定到 bad（模拟历史粘性），bad 失败、good 成功 → 绑定应切到 good。
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz == "Bearer at-bad" {
-			return 500, `{"code":500}`, false
+			return 402, `{"msg":"余额不足"}`, false
 		}
 		return 200, sseOK, true
 	})
@@ -510,8 +511,8 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 		Session:      sess,
 		SoftCooldown: time.Minute,
 	})
-	// 预绑定：sess.Bind("conv-1", "bad")，然后请求体带同 conversation_id。
-	sess.Bind("conv-1", "bad")
+	// 预绑定：sess.Bind(testScopedChatKey("conv-1","glm-5.2"), "bad")，然后请求体带同 conversation_id。
+	sess.Bind(testScopedChatKey("conv-1", "glm-5.2"), "bad")
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -537,7 +538,7 @@ func TestChatStickySuccessKeepsBinding(t *testing.T) {
 		return 200, sseOK, true
 	})
 	h := newTestHandler(t, Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
-	sess.Bind("conv-1", "good")
+	sess.Bind(testScopedChatKey("conv-1", "glm-5.2"), "good")
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -549,9 +550,9 @@ func TestChatStickySuccessKeepsBinding(t *testing.T) {
 	}
 }
 
-// TestChatStickyFullFallsBackToRotation 端到端验证 C3 语义：粘性号满载不可用时，
-// 请求在同一轮内解绑并回落普通轮换选中健康账号，绑定收敛到最终成功号——而非空耗一轮。
-func TestChatStickyFullFallsBackToRotation(t *testing.T) {
+// Temporary saturation permits an availability fallback without reassigning
+// the session's healthy primary.
+func TestChatStickyFullBorrowsWithoutRebinding(t *testing.T) {
 	st := newBindStore()
 	sess := session.New(session.Config{
 		TTL:       time.Minute,
@@ -562,7 +563,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	// bad 占满唯一在途名额：PickByUID 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
+	// Hold the only slot while the request consumes its bounded wait budget.
 	p.SetMaxInFlight(1)
 	p.Acquire("bad")
 
@@ -574,8 +575,9 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		Upstream:     up,
 		Session:      sess,
 		SoftCooldown: time.Minute,
+		CacheRouting: cacheroute.Config{WaitTimeout: 20 * time.Millisecond, MaxCacheLoss: .1},
 	})
-	sess.Bind("conv-1", "bad")
+	sess.Bind(testScopedChatKey("conv-1", "glm-5.2"), "bad")
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -583,8 +585,8 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	// 满载粘性号被解绑，绑定收敛到最终成功号 good。
-	if uid, ok := st.onlyUID(); !ok || uid != "good" {
-		t.Fatalf("sticky binding should fall back to good, got %s ok=%v (binds=%v)", uid, ok, st.bindsSnapshot())
+	if uid, ok := st.onlyUID(); !ok || uid != "bad" {
+		t.Fatalf("temporary borrowing must keep primary bad, got %s ok=%v (binds=%v)", uid, ok, st.bindsSnapshot())
 	}
 	p.Release("bad")
 }

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/cacheroute"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/haozhumah5"
@@ -35,11 +36,13 @@ import (
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/smslogin"
+	"workbuddy2api/internal/traffic"
 	"workbuddy2api/internal/upstream"
 )
 
 // Config handler 依赖。
 type Config struct {
+	Traffic          *traffic.Tracker
 	Pool             *pool.Pool
 	Upstream         *upstream.Client
 	APIKey           string // 管理员密钥（空 = 无管理员密钥；多密钥体系下的全权限密钥）
@@ -140,7 +143,8 @@ type Config struct {
 	}
 	MaxRotate int // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
-	Session *session.Router
+	Session      *session.Router
+	CacheRouting cacheroute.Config
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
@@ -190,6 +194,7 @@ type ResponseStore interface {
 
 // Handler 主路由。
 type Handler struct {
+	cacheRouter     *cacheroute.Router
 	cfg             Config
 	mux             *http.ServeMux
 	sessionsMu      sync.Mutex
@@ -292,6 +297,29 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
+	if h.cfg.Traffic == nil {
+		h.cfg.Traffic = traffic.New(nil)
+	}
+	if cfg.Session != nil && !cfg.CacheRouting.Disabled {
+		var err error
+		h.cacheRouter, err = cacheroute.New(cfg.CacheRouting)
+		if err != nil {
+			log.Printf("cache routing disabled: %v", err)
+		}
+	}
+	if cfg.Pool != nil && h.cacheRouter != nil {
+		c := h.cacheRouter.Config()
+		cfg.Pool.ConfigureAdmission(pool.AdmissionConfig{
+			Enabled:              !c.Shadow && !c.ProtectionDisabled,
+			FairQueue:            !c.Shadow && !c.FairQueueDisabled,
+			LeaseMin:             c.LeaseMin,
+			LeaseMax:             c.LeaseMax,
+			ReservedSlots:        c.ReservedSlots,
+			QueueAging:           c.QueueAging,
+			MaxSessions:          c.MaxEntries,
+			MaxPendingPerSession: c.MaxPendingPerSession,
+		})
+	}
 	h.growthLedger = newGrowthLedger(cfg.GrowthLedgerPath, cfg.GrowthLedgerStore)
 	// 运行时特性开关/费率从启动配置拷贝一份；WebUI 保存时经 updateFeatures
 	// 同时改这里和 upstream Client（见 saveAdminConfig）。sanitizeHooks 为 nil
@@ -342,6 +370,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /stats", h.withAuth(h.stats))
+	h.mux.HandleFunc("GET /admin/traffic", h.withFrontend(h.trafficStats))
 	h.mux.HandleFunc("GET /requests", h.withAuth(h.requests))
 	h.mux.HandleFunc("GET /v1/requests", h.withAuth(h.requests))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -728,6 +757,7 @@ type requestScope struct {
 	kind     string // "admin" | "group"
 	group    string // group 密钥的绑定分组（"" = 不限，但 kind=group 时恒非空）
 	keyID    string // 密钥 id（日志归因用）
+	keyName  string // Safe display name; never the Bearer credential.
 	adminKey bool   // true = 命中 config 全局 APIKey
 }
 
@@ -761,9 +791,9 @@ func (h *Handler) resolveScope(r *http.Request) (requestScope, bool) {
 			if k.Group == "" {
 				// 不绑分组的密钥按管理员语义（全池可用）。创建入口
 				// 不再产生这种密钥，但旧数据/手改文件可能存在。
-				return requestScope{kind: "admin", keyID: k.ID}, true
+				return requestScope{kind: "admin", keyID: k.ID, keyName: k.Name}, true
 			}
-			return requestScope{kind: "group", group: k.Group, keyID: k.ID}, true
+			return requestScope{kind: "group", group: k.Group, keyID: k.ID, keyName: k.Name}, true
 		}
 	}
 	return requestScope{}, false
@@ -790,7 +820,12 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), scopeKey{}, scope)))
+		r = r.WithContext(context.WithValue(r.Context(), scopeKey{}, scope))
+		if r.Method == http.MethodPost && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/chat/completions" || r.URL.Path == "/v1/responses" || r.URL.Path == "/responses") {
+			h.observeClientRequest(next, w, r)
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -4492,22 +4527,38 @@ func responseUsage(raw any) any {
 	}
 	copyNumber("input_tokens", "prompt_tokens")
 	copyNumber("output_tokens", "completion_tokens")
-	if _, exists := out["input_tokens_details"]; !exists {
-		cached := 0
+	details, _ := out["input_tokens_details"].(map[string]any)
+	if _, exists := details["cached_tokens"]; !exists {
+		cached, known := 0, false
 		for _, key := range []string{"prompt_cache_hit_tokens", "cache_read_input_tokens"} {
 			if n, ok := numberInt(u[key]); ok {
 				cached = maxInts(cached, n)
+				known = true
 			}
 		}
-		if details, ok := u["prompt_tokens_details"].(map[string]any); ok {
-			if n, ok := numberInt(details["cached_tokens"]); ok {
+		if promptDetails, ok := u["prompt_tokens_details"].(map[string]any); ok {
+			if n, ok := numberInt(promptDetails["cached_tokens"]); ok {
 				cached = maxInts(cached, n)
+				known = true
 			}
 		}
-		if cached > 0 {
-			out["input_tokens_details"] = map[string]any{"cached_tokens": cached}
+		if known {
+			copyDetails := make(map[string]any, len(details)+1)
+			for k, v := range details {
+				copyDetails[k] = v
+			}
+			copyDetails["cached_tokens"] = cached
+			out["input_tokens_details"] = copyDetails
 		}
 	}
+	if _, exists := out["total_tokens"]; !exists {
+		input, hasInput := numberInt(out["input_tokens"])
+		output, hasOutput := numberInt(out["output_tokens"])
+		if hasInput || hasOutput {
+			out["total_tokens"] = input + output
+		}
+	}
+
 	return out
 }
 
@@ -4644,7 +4695,7 @@ func (w *responsesStreamWriter) Write(p []byte) (int, error) {
 				return 0, err
 			}
 			if usage, ok := chunk["usage"].(map[string]any); ok {
-				w.usage = usage
+				w.usage = upstream.MergeUsage(w.usage, usage)
 			}
 			if choices, ok := chunk["choices"].([]any); ok && len(choices) > 0 {
 				if c, ok := choices[0].(map[string]any); ok {
@@ -4944,6 +4995,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	passthrough := h.requestPassthrough(r)
 	st := newChatStatWithOptions(time.Now(), bodyDoc, stream, h.cfg.MetricsStore, h.cfg.RequestLogStore, h.currentCreditPolicy(), passthrough, r.URL.Path)
 	st.completionStore = h.cfg.CompletionStore
+	st.trafficResult, _ = r.Context().Value(trafficResultKey{}).(*trafficResult)
 	// 影子扣减：成功请求的真实费用（upstream usage.credit 或费率估算）
 	// 实时回写账号池，weightOf 的有效余额因子据此均衡组内消耗。
 	if h.cfg.Pool != nil {
@@ -4959,62 +5011,50 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	var lastKind upstream.ErrKind
 
-	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
-	sessKey := ""
-	stickyUID := ""
-	if h.cfg.Session != nil {
-		sessKey = session.ExtractKeyFromValue(bodyDoc)
-		if sessKey != "" {
-			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
-				stickyUID = uid
-			}
-		}
+	rawKey, keySource := routingIdentity(bodyDoc, r, h.cacheRouter == nil)
+	if h.cfg.Upstream == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", "upstream client is not configured")
+		st.status = http.StatusServiceUnavailable
+		return
 	}
+	preparedBody, err := h.cfg.Upstream.PrepareChatBody(bodyDoc)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		st.status = http.StatusBadRequest
+		setRequestError(st, "invalid_request", err.Error())
+		return
+	}
+	scopeAllow := h.allowSet(scopeFromRequest(r))
+	route := h.beginChatRoute(r, rawKey, keySource, routeModel, bodyDoc, scopeAllow)
+	defer route.log(st)
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
 	defer func() {
 		if heldUID != "" {
-			h.cfg.Pool.Release(heldUID)
+			route.release(heldUID)
 		}
 	}()
 	releaseHeld := func() {
 		if heldUID != "" {
-			h.cfg.Pool.Release(heldUID)
+			route.release(heldUID)
 			heldUID = ""
 		}
 	}
-	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
+	// Failed attempts release capacity; only a genuine health transition
+	// permits migration. Busy/transport retries preserve the primary.
 	fail := func(uid string) {
+		st.finishTrafficAttempt(traffic.Counters{Completed: 1, Failures: 1, CreditUnknownRequests: 1})
 		releaseHeld()
-		if stickyUID != "" && uid == stickyUID {
-			h.cfg.Session.Unbind(sessKey)
-			stickyUID = ""
-		}
 	}
 
-	// 分组作用域：分组密钥把选号范围收窄到绑定分组的账号；管理员/会话
-	// 请求为 nil（全池）。粘性号不属于当前分组时按"粘性号不可用"处理
-	// （解绑回落），否则分组密钥会借粘性会话越权用别的分组的账号。
-	scopeAllow := h.allowSet(scopeFromRequest(r))
-
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（同时校验账号级状态和当前模型限流），否则按当前模型轮换。
-		var acct *auth.Auth
-		if stickyUID != "" && (scopeAllow == nil || scopeAllow[stickyUID]) {
-			acct = h.cfg.Pool.PickAndAcquireByUIDForModel(stickyUID, routeModel)
-			if acct == nil {
-				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
-				h.cfg.Session.Unbind(sessKey)
-				stickyUID = ""
-			}
-		} else if stickyUID != "" {
-			// 粘性号不在当前密钥的分组里 → 解绑（不是失败，是权限边界）。
-			h.cfg.Session.Unbind(sessKey)
-			stickyUID = ""
-		}
-		if acct == nil {
-			acct = h.cfg.Pool.PickAndAcquireForModelAllow(routeModel, tried, scopeAllow)
+		acct, routeErr := route.acquire(r.Context(), tried, scopeAllow)
+		if routeErr != nil {
+			writeOpenAIError(w, http.StatusRequestTimeout, "request_cancelled", routeErr.Error())
+			st.status = http.StatusRequestTimeout
+			setRequestError(st, "request_cancelled", routeErr.Error())
+			return
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -5054,7 +5094,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 时长策略按请求类型分流：流式走 Stream（默认不限总时长 + 守空闲），
 		// 非流式仍用整个请求的上限。二者语义不同，不能共用一个超时。
 		policy := h.cfg.Upstream.RequestPolicy(stream)
-		rc, status, respBody, upstreamHeaders, terr := h.cfg.Upstream.ChatStreamWithPolicyObj(r.Context(), acct, bodyDoc, policy)
+		sent := time.Now()
+		attemptCtx := h.beginTrafficAttempt(r.Context(), st, acct.UID, acct.Nickname, sent)
+		rc, status, respBody, upstreamHeaders, terr := h.cfg.Upstream.ChatStreamPreparedWithPolicy(attemptCtx, acct, preparedBody, policy)
 		upstream.CopyResponseIDHeaders(w.Header(), upstreamHeaders)
 		upstreamHeaderID := upstream.ResponseIDFromHeader(upstreamHeaders)
 		if upstreamHeaderID != "" {
@@ -5104,6 +5146,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			st.inputTokens, st.toks, st.totalTokens, st.cacheRead, st.cacheWrite, st.toolCalls = stats.UsageStats()
+			st.trafficCacheKnown = stats.CacheUsageKnown()
 			if _, ok := stats.Tokens(); !ok {
 				st.toks = -1
 			}
@@ -5122,9 +5165,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			h.cfg.Pool.NoteSuccess(acct.UID)
-			if sessKey != "" && h.cfg.Session != nil {
-				h.cfg.Session.Bind(sessKey, acct.UID)
-			}
+			route.success(st, sent, stats.CacheUsageKnown())
 			st.status = http.StatusOK
 			st.errorCode = ""
 			st.errorMessage = ""
@@ -5140,6 +5181,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		usageStats(resp, st)
+		st.trafficCacheKnown = cacheUsagePresent(resp)
 		if responseID := upstream.ResponseID(resp); responseID != "" {
 			st.id = responseID
 			if w.Header().Get("X-Request-Id") == "" {
@@ -5148,9 +5190,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, resp)
 		h.cfg.Pool.NoteSuccess(acct.UID)
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
-		}
+		route.success(st, sent, cacheUsagePresent(resp))
 		st.status = http.StatusOK
 		st.errorCode = ""
 		st.errorMessage = ""

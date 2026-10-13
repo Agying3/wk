@@ -349,7 +349,14 @@ type Pool struct {
 	idleWeightMax     float64
 
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
-	maxInFlight int
+	maxInFlight  int
+	waiters      map[string][]*slotWaiter
+	totalWaiters int
+	admission    AdmissionConfig
+	routeLeases  map[string]map[string]*routeLease
+	leaseCount   int
+	serviceTimes map[string]time.Duration
+	queueTurns   map[string]*queueTurn
 
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
@@ -627,6 +634,9 @@ func (p *Pool) Acquire(uid string) bool {
 	if !ok {
 		return false
 	}
+	if len(p.waiters[uid]) > 0 {
+		return false
+	}
 	if limit <= 0 {
 		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)
@@ -645,9 +655,9 @@ func (p *Pool) Acquire(uid string) bool {
 
 // Release 释放一个在途名额。幂等减到 0 为止（防重复释放扣成负数）。
 func (p *Pool) Release(uid string) {
-	p.mu.RLock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
-	p.mu.RUnlock()
 	if !ok {
 		return
 	}
@@ -657,6 +667,7 @@ func (p *Pool) Release(uid string) {
 			return
 		}
 		if e.inFlight.CompareAndSwap(cur, cur-1) {
+			p.notifyWaiterLocked(uid)
 			return
 		}
 	}
@@ -743,6 +754,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	for uid := range p.byUID {
 		if !seen[uid] {
 			delete(p.byUID, uid)
+			p.forgetRouteLocked(uid)
 			p.markDirtyDeleteLocked(uid)
 			changed = true
 		}
@@ -1009,6 +1021,9 @@ func (p *Pool) pickEarliestExpiryLocked(model string, tried map[string]bool, now
 // inFlightFull 报告账号是否已占满在途名额（max=0 不限 → 恒 false）。
 // 调用方需已持 p.mu（读锁或写锁均可，本方法只读 p.maxInFlight）。
 func (p *Pool) inFlightFull(e *entry) bool {
+	if len(p.waiters[e.a.UID]) > 0 {
+		return true
+	}
 	if p.maxInFlight <= 0 {
 		return false
 	}
@@ -1354,6 +1369,7 @@ func (p *Pool) Remove(uid string) (removed, busy bool) {
 		return false, true
 	}
 	delete(p.byUID, uid)
+	p.forgetRouteLocked(uid)
 	p.dirty.Store(true)
 	p.markDirtyDeleteLocked(uid) // DB 模式：删行
 	return true, false

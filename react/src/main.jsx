@@ -22,6 +22,7 @@ import GroupsAndKeysPage from './pages/GroupsAndKeys';
 import ProxyPoolPage from './pages/ProxyPool';
 import ReqProxyPage from './pages/ReqProxy';
 import RequestLogsPage from './pages/RequestLogs';
+import TrafficStatistics from './pages/TrafficStatistics';
 import AccountSettingsPage from './pages/AccountSettings';
 import AccountListPage from './pages/AccountList';
 import GrowthTasksPage from './pages/GrowthTasks';
@@ -53,7 +54,7 @@ const parseHours = value => String(value || '').split(',').map(item => item.trim
 
 // 页面标识。用 hash 路由（#/auto-enroll）而不是给每页单独打包：
 // 刷新能停在原页、地址可收藏转发，且不引入 react-router 依赖。
-const SECTIONS = ['dashboard', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'reqproxy', 'groups', 'growth', 'settings'];
+const SECTIONS = ['dashboard', 'traffic', 'pool', 'models', 'playground', 'requests', 'accounts', 'auto-enroll', 'proxy', 'reqproxy', 'groups', 'growth', 'settings'];
 
 // sectionFromHash 读取地址栏里的页面标识；非法/缺失时回落到仪表盘。
 function sectionFromHash() {
@@ -681,6 +682,7 @@ function Console() {
   ];
   const activeTab = activeSection === 'settings' ? 'admin' : activeSection;
   const pageCopy = {
+	traffic: ['流量统计', '按全站、账号、API key、账号分组、代理分组和单代理查看 RPM、并发与请求用量。'],
     dashboard: ['运营概览', '账号池、请求量和 token 用量实时汇总，数据每 30 秒自动更新。'],
     pool: ['账号列表', '账号池全量明细：状态、冷却/熔断、积分与凭证有效期，支持搜索和多维筛选。'],
     models: ['模型与请求', '查看当前可用的上游模型。'],
@@ -697,6 +699,7 @@ function Console() {
   const [pageTitle, pageDescription] = pageCopy[activeSection] || pageCopy.dashboard;
   const menuItems = [
     { key: 'dashboard', icon: <DashboardOutlined />, label: '仪表盘' },
+    { key: 'traffic', icon: <ThunderboltOutlined />, label: '流量统计' },
     { key: 'pool', icon: <TeamOutlined />, label: '账号列表' },
     { key: 'models', icon: <ApiOutlined />, label: '模型目录' },
     { key: 'playground', icon: <SendOutlined />, label: '请求测试' },
@@ -1084,9 +1087,11 @@ function Console() {
                 >
                   <Table rowKey="id" columns={requestColumns} dataSource={dashboardLogs} pagination={{ pageSize: 10 }} scroll={{ x: 1480 }} locale={{ emptyText: '暂无请求记录' }} />
                 </Card>
+                <TrafficStatistics api={api} enabled={!locked} windowKey={dashboardWindow} />
               </>
             )}
             {activeSection === 'requests' && <RequestLogsPage api={api} models={models} accounts={data.accounts || []} />}
+            {activeSection === 'traffic' && <TrafficStatistics api={api} enabled={!locked} />}
             {activeSection === 'pool' && <AccountListPage api={api} data={data} refresh={refresh} refreshCredits={refreshCredits} creditRefreshing={creditRefreshing} />}
             {activeSection === 'accounts' && <AccountSettingsPage api={api} refresh={refresh} region={config.region} />}
             {activeSection === 'auto-enroll' && (

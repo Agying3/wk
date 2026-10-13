@@ -2,7 +2,7 @@
 //
 // 设计参考 antigravityProxyGo internal/session（fast-path RLock / 双段分配 / TTL / 持久化），
 // 但改为纯内存 + redisstore 异步镜像：
-//   - 命中走 RLock 快查（绝大多数请求已绑定）；
+//   - 绑定查找、续期与更新在同一锁内完成，并使用版本号保护请求完成时的更新；
 //   - 未命中/失效走写锁 re-check 后分配，避免同 key 并发重复分配（TOCTOU 防护）；
 //   - 分配优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
 //   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
@@ -22,10 +22,6 @@ import (
 	"workbuddy2api/internal/redisstore"
 )
 
-// maxStickyKeyLen 限制入站会话键参与哈希的字节数。键会被归一化成固定长度，
-// 所以这个上限只是省掉无谓的哈希开销，不承担内存保护职责。
-const maxStickyKeyLen = 512
-
 // defaultMaxEntries 绑定表容量上限。TTL 单独并不能把表大小封顶：在一个 TTL 窗口内
 // 灌入大量互不相同的 key，每条都是"未过期"的，表会一直涨。
 const defaultMaxEntries = 10000
@@ -34,15 +30,19 @@ const defaultMaxEntries = 10000
 type entry struct {
 	uid        string
 	lastActive time.Time
+	version    uint64
 }
 
-// Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
+// Config 路由依赖；Available 返回未占满在途的可用账号，Healthy 校验绑定时忽略暂时满载。
 // 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
 type Config struct {
 	TTL        time.Duration
 	GCInterval time.Duration
 	Store      redisstore.Store
 	Available  func() []string
+	// Healthy ignores temporary capacity exhaustion. If nil, Available is used
+	// for compatibility with callers that do not expose account health.
+	Healthy func() []string
 	// Salt 给会话键的 HMAC 加盐。没有盐时 hashIndex 是公开可算的，
 	// 知道账号列表的人就能反推任意 key 会落到哪个 uid，从而抢占别人的会话槽位。
 	// 每个部署生成一次并保持不变；换盐会让所有会话重新分配。
@@ -57,6 +57,7 @@ type Router struct {
 	entries map[string]entry
 	cfg     Config
 	stop    chan struct{}
+	version uint64
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -91,9 +92,6 @@ func New(cfg Config) *Router {
 func (r *Router) normalizeKey(raw string) string {
 	if raw == "" {
 		return ""
-	}
-	if len(raw) > maxStickyKeyLen {
-		raw = raw[:maxStickyKeyLen]
 	}
 	mac := hmac.New(sha256.New, r.cfg.Salt)
 	mac.Write([]byte(raw))
@@ -172,7 +170,8 @@ func (r *Router) LoadFromStore() {
 		if _, exists := r.entries[key]; exists {
 			continue
 		}
-		r.entries[key] = entry{uid: uid, lastActive: now}
+		r.version++
+		r.entries[key] = entry{uid: uid, lastActive: now, version: r.version}
 		loaded++
 	}
 	r.mu.Unlock()
@@ -188,110 +187,199 @@ func (r *Router) LoadFromStore() {
 // LoadFromStore）拿到的都是已归一化的键，**不要**再归一化一次——对归一化结果
 // 再做一次 HMAC 会得到另一个值，快路径写进去的键下次就查不到了，粘性会话会
 // 在"看起来正常路由"的同时每请求重新分配。
+// Lease identifies one generation of a binding. Completion of an older
+// request must never replace or renew a newer generation.
+type Lease struct {
+	UID     string
+	Version uint64
+	Hash    string
+}
+
 func (r *Router) Resolve(key string) (string, bool) {
-	key = r.normalizeKey(key)
+	e, ok := r.ResolveLease(key, nil, "")
+	return e.UID, ok
+}
+
+// LookupLease reads an existing identity without allocation or renewal. It is
+// used to carry legacy explicit bindings into the namespaced routing scheme;
+// the caller must validate account health and authorization before reuse.
+func (r *Router) LookupLease(raw string) (Lease, bool) {
+	key := r.normalizeKey(raw)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.entries[key]
+	if !ok || expired(e, time.Now(), r.cfg.TTL) {
+		return Lease{}, false
+	}
+	return Lease{e.uid, e.version, key}, true
+}
+
+// ResolveLease keeps a healthy primary even when all its slots are occupied.
+// allow is the request's authorization/model scope; preferred is a known
+// prefix owner and is used only when creating a new binding.
+func (r *Router) ResolveLease(raw string, allow map[string]bool, preferred string) (Lease, bool) {
+	key := r.normalizeKey(raw)
 	if key == "" {
-		return "", false
+		return Lease{}, false
+	}
+	healthyFn := r.cfg.Healthy
+	if healthyFn == nil {
+		healthyFn = r.cfg.Available
+	}
+	var healthyUIDs []string
+	if healthyFn != nil {
+		healthyUIDs = healthyFn()
+	}
+	return r.ResolveLeaseWithCandidates(raw, allow, preferred, healthyUIDs, r.availableSlice())
+}
+
+// ResolveLeaseWithCandidates accepts a model-aware snapshot supplied by the
+// pool. Authorization filtering remains mandatory even for restored bindings.
+func (r *Router) ResolveLeaseWithCandidates(raw string, allow map[string]bool, preferred string, healthyUIDs, availableUIDs []string) (Lease, bool) {
+	key := r.normalizeKey(raw)
+	if key == "" {
+		return Lease{}, false
+	}
+	healthy := map[string]bool{}
+	for _, uid := range healthyUIDs {
+		if allow == nil || allow[uid] {
+			healthy[uid] = true
+		}
 	}
 	now := time.Now()
-	available := r.availableSet()
-
-	// ── Fast path: RLock 快查 ──────────────────────────────
-	r.mu.RLock()
-	e, found := r.entries[key]
-	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
-			r.touch(key, e.uid, now)
-			return e.uid, true
-		}
-		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
-	}
-
-	// ── Slow path: 写锁 re-check 后分配 ────────────────────
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	// re-check：并发同 key 可能已被其他 goroutine 分配好。
-	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
-			r.entries[key] = entry{uid: e2.uid, lastActive: now}
-			return e2.uid, true
+	if e, ok := r.entries[key]; ok && !expired(e, now, r.cfg.TTL) && healthy[e.uid] {
+		e.lastActive = now
+		r.entries[key] = e
+		r.cfg.Store.SetBind(key, e.uid, r.cfg.TTL)
+		return Lease{e.uid, e.version, key}, true
+	}
+	if len(healthy) == 0 {
+		return Lease{}, false
+	}
+	uid := preferred
+	if !healthy[uid] {
+		uids := make([]string, 0, len(healthy))
+		for _, u := range availableUIDs {
+			if healthy[u] {
+				uids = append(uids, u)
+			}
 		}
-		delete(r.entries, key) // 失效：清掉再分配
-	}
-
-	uids := r.availableSlice()
-	if len(uids) == 0 {
-		return "", false
-	}
-
-	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
-	bound := map[string]bool{}
-	for _, v := range r.entries {
-		bound[v.uid] = true
-	}
-	var idle []string
-	for _, u := range uids {
-		if !bound[u] {
-			idle = append(idle, u)
+		if len(uids) == 0 {
+			for u := range healthy {
+				uids = append(uids, u)
+			}
+			sort.Strings(uids)
 		}
+		bound := map[string]bool{}
+		for _, e := range r.entries {
+			if !expired(e, now, r.cfg.TTL) {
+				bound[e.uid] = true
+			}
+		}
+		var idle []string
+		for _, u := range uids {
+			if !bound[u] {
+				idle = append(idle, u)
+			}
+		}
+		if len(idle) != 0 {
+			uids = idle
+		}
+		uid = uids[hashIndex(key, len(uids))]
 	}
-	pool2 := idle
-	if len(pool2) == 0 {
-		pool2 = uids
-	}
-	uid := pool2[hashIndex(key, len(pool2))]
-
-	// 写入前先保证表不超上限：TTL 只能在 GC 周期内清理过期项，
-	// 无法阻止"一个 TTL 窗口内灌入大量不同 key"造成的无界增长。
 	r.evictLocked(now)
-	prev, existed := r.entries[key]
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	if existed && prev.uid != uid {
-		r.cfg.Store.DelBind(key)
-	}
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
-	return uid, true
+	e := r.setLocked(key, uid, now)
+	return Lease{e.uid, e.version, key}, true
 }
 
-// touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
-func (r *Router) touch(key, uid string, now time.Time) {
-	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	r.mu.Unlock()
+func (r *Router) setLocked(key, uid string, now time.Time) entry {
+	r.version++
+	e := entry{uid: uid, lastActive: now, version: r.version}
+	r.entries[key] = e
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	return e
 }
 
-// Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
-// 供"粘性跟随最终成功号"用：请求成功返回前，把会话重绑到实际成功的账号，让多轮对话下一跳稳定
-// 收敛到"对该会话持续成功的号"（对齐 antigravity 语义）。空 key 直接返回（无会话则不绑）。
-func (r *Router) Bind(key, uid string) {
-	key = r.normalizeKey(key)
+// Bind is an administrative/unconditional assignment. Request completion
+// should use TouchIfCurrent or ReplaceIfCurrent instead.
+func (r *Router) Bind(raw, uid string) {
+	key := r.normalizeKey(raw)
 	if key == "" || uid == "" {
 		return
 	}
-	now := time.Now()
 	r.mu.Lock()
-	r.evictLocked(now)
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	defer r.mu.Unlock()
+	r.evictLocked(time.Now())
+	r.setLocked(key, uid, time.Now())
 }
 
-// Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
-func (r *Router) Unbind(key string) bool {
-	key = r.normalizeKey(key)
-	if key == "" {
-		return false
+func (r *Router) BindIfAbsent(raw, uid string) (Lease, bool) {
+	key := r.normalizeKey(raw)
+	if key == "" || uid == "" {
+		return Lease{}, false
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if e, ok := r.entries[key]; ok && !expired(e, now, r.cfg.TTL) {
+		return Lease{e.uid, e.version, key}, false
+	}
+	r.evictLocked(now)
+	e := r.setLocked(key, uid, now)
+	return Lease{e.uid, e.version, key}, true
+}
+
+func (r *Router) ReplaceIfCurrent(raw string, old Lease, uid string) (Lease, bool) {
+	key := r.normalizeKey(raw)
+	if key == "" || uid == "" {
+		return Lease{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.entries[key]
+	if !ok || e.uid != old.UID || e.version != old.Version || expired(e, time.Now(), r.cfg.TTL) {
+		return Lease{}, false
+	}
+	e = r.setLocked(key, uid, time.Now())
+	return Lease{e.uid, e.version, key}, true
+}
+
+func (r *Router) TouchIfCurrent(raw string, old Lease) bool {
+	key := r.normalizeKey(raw)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.entries[key]
+	if !ok || e.uid != old.UID || e.version != old.Version || expired(e, time.Now(), r.cfg.TTL) {
+		return false
+	}
+	e.lastActive = time.Now()
+	r.entries[key] = e
+	r.cfg.Store.SetBind(key, e.uid, r.cfg.TTL)
+	return true
+}
+
+func (r *Router) UnbindIfCurrent(raw string, old Lease) bool {
+	key := r.normalizeKey(raw)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.entries[key]
+	if !ok || e.uid != old.UID || e.version != old.Version {
+		return false
+	}
+	delete(r.entries, key)
+	r.cfg.Store.DelBind(key)
+	return true
+}
+
+func (r *Router) Unbind(raw string) bool {
+	key := r.normalizeKey(raw)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	_, found := r.entries[key]
 	if found {
 		delete(r.entries, key)
-	}
-	r.mu.Unlock()
-	if found {
 		r.cfg.Store.DelBind(key)
 	}
 	return found
@@ -316,10 +404,10 @@ func (r *Router) gcOnce(now time.Time) int {
 	for _, key := range expiredKeys {
 		delete(r.entries, key)
 	}
-	r.mu.Unlock()
 	for _, key := range expiredKeys {
 		r.cfg.Store.DelBind(key)
 	}
+	r.mu.Unlock()
 	return len(expiredKeys)
 }
 

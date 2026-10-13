@@ -130,7 +130,7 @@ func AggregateWithID(r io.Reader, fallbackID string) (map[string]any, error) {
 						created = v
 					}
 					if u, ok := chunk["usage"].(map[string]any); ok {
-						usage = u
+						usage = MergeUsage(usage, u)
 					}
 					if ch, ok := chunk["choices"].([]any); ok {
 						for _, ci := range ch {

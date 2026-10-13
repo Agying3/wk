@@ -5,6 +5,7 @@
 package upstream
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -68,11 +69,30 @@ func authOptOf(a *auth.Auth) *authOpt {
 // proxyClientFor 返回该账号应使用的 http.Client（直连时为 c.HTTP 原样）。
 // 走代理时基于 c.HTTP 复制并替换 Transport——保留 Timeout 等策略。
 func (c *Client) proxyClientFor(a *auth.Auth) (*http.Client, error) {
+	return c.proxyClientForContext(context.Background(), a)
+}
+
+type proxyObserverKey struct{}
+
+// WithProxyObserver observes only the model request carrying this context,
+// after proxy selection. Maintenance calls never inherit the observer.
+func WithProxyObserver(ctx context.Context, observe func(*url.URL)) context.Context {
+	return context.WithValue(ctx, proxyObserverKey{}, observe)
+}
+
+func (c *Client) proxyClientForContext(ctx context.Context, a *auth.Auth) (*http.Client, error) {
+	observe, _ := ctx.Value(proxyObserverKey{}).(func(*url.URL))
 	if c.DialProxy == nil {
+		if observe != nil {
+			observe(nil)
+		}
 		return c.HTTP, nil
 	}
 	ao := authOptOf(a)
 	if ao == nil {
+		if observe != nil {
+			observe(nil)
+		}
 		return c.HTTP, nil
 	}
 	proxy, err := c.DialProxy(ao.uid, ao.region)
@@ -80,6 +100,9 @@ func (c *Client) proxyClientFor(a *auth.Auth) (*http.Client, error) {
 		// D4：无可用节点，调用方必须让请求失败。
 		// 包一层哨兵：账号侧可以识别出"这是代理池的错"，不惩罚账号。
 		return nil, fmt.Errorf("%w: %w", ErrNoProxyNode, err)
+	}
+	if observe != nil {
+		observe(proxy)
 	}
 	if proxy == nil {
 		return c.HTTP, nil // 直连

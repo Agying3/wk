@@ -276,6 +276,17 @@ func (c *Client) prepareBodyFromObj(obj map[string]any) ([]byte, error) {
 	return PrepareBodyFromMap(obj, c.sanitizeEnabled(), c.effortsSnapshot())
 }
 
+// PrepareChatBody normalizes the document once, before cache routing, and
+// returns the exact bytes reused for every account attempt.
+func (c *Client) PrepareChatBody(obj map[string]any) ([]byte, error) {
+	return c.prepareBodyFromObj(obj)
+}
+
+// ChatStreamPreparedWithPolicy accepts only output from PrepareChatBody.
+func (c *Client) ChatStreamPreparedWithPolicy(ctx context.Context, a *auth.Auth, body []byte, policy StreamPolicy) (io.ReadCloser, int, []byte, http.Header, error) {
+	return c.chatStreamPrepared(ctx, a, body, policy)
+}
+
 // sanitizeEnabled 读取脱敏开关的并发安全快照。
 func (c *Client) sanitizeEnabled() bool {
 	c.flagsMu.Lock()
@@ -547,7 +558,7 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 	// 会把长流式回答再次掐断，那就白改了。
 	// reqproxy（账号级统一路由）：先经钩子取该账号的 client（代理 Transport 或直连原样），
 	// 再清零 Timeout。D4：钩子报错（无可用节点）直接失败，不回退直连。
-	baseCli, err := c.proxyClientFor(a)
+	baseCli, err := c.proxyClientForContext(ctx, a)
 	if err != nil {
 		cancel()
 		return nil, 0, nil, nil, err

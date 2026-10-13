@@ -59,6 +59,25 @@
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0
   },
+  "cache_routing": {
+    "enabled": true,
+    "shadow": false,
+    "wait_timeout": "5s",
+    "max_pending_per_account": 8,
+    "max_pending_total": 64,
+    "max_candidates": 3,
+    "max_cache_loss": 0.1,
+    "prefix_ttl": "30m",
+    "max_prefix_entries": 2048,
+    "initial_prefill_tokens_per_second": 5000,
+    "session_protection": true,
+    "fair_queue": true,
+    "active_lease_min": "5s",
+    "active_lease_max": "15s",
+    "reserved_slots": 1,
+    "queue_aging": "2s",
+    "max_pending_per_session": 4
+  },
   "session_sticky": {
     "enabled": true,
     "ttl": "30m",

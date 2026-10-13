@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/cacheroute"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/haozhumah5"
@@ -30,6 +31,7 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/smslogin"
 	"workbuddy2api/internal/statestore"
+	"workbuddy2api/internal/traffic"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -273,6 +275,22 @@ func main() {
 	if metricsDB != nil {
 		defer metricsDB.Close()
 	}
+	var trafficStore traffic.Store
+	if db, ok := metricsDB.(interface{ OpenTrafficStore() (traffic.Store, error) }); ok {
+		trafficStore, err = db.OpenTrafficStore()
+		if err != nil {
+			trafficStore = nil
+			log.Printf("traffic database unavailable: %v; using in-memory traffic", err)
+		}
+	}
+	trafficTracker := traffic.New(trafficStore)
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := trafficTracker.Flush(flushCtx); err != nil {
+			log.Printf("traffic final flush: %v", err)
+		}
+	}()
 	var persistentMetrics server.MetricsStore
 	var requestLogs server.RequestLogStore
 	var completions server.CompletionStore
@@ -312,6 +330,7 @@ func main() {
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
+	var routeSalt []byte
 	redisMode := "noop"
 	if _, ok := store.(redisstore.Noop); !ok {
 		redisMode = "upstash"
@@ -334,11 +353,13 @@ func main() {
 					"Sticky bindings will NOT survive restart — set session_sticky.salt to a fixed hex value to keep them.")
 			}
 		}
+		routeSalt = append([]byte(nil), salt...)
 		sessRouter = session.New(session.Config{
 			TTL:        cfg.SessionTTL,
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
 			Available:  p.AvailableUIDs,
+			Healthy:    p.HealthyUIDs,
 			Salt:       salt,
 			MaxEntries: cfg.SessionSticky.MaxEntries,
 		})
@@ -450,6 +471,7 @@ func main() {
 		SMSLogin: smsManager,
 		// 请求代理模块（实际请求账号的代理池）：nil = 直连（零回归）。
 		ReqProxy: reqProxyMgr,
+		Traffic:  trafficTracker,
 		// 豪猪自动加号（可选）：取号→直登→落盘全自动。与手动发码共用代理池；
 		// AutoEnroll 在 NewHandler 内部组装（persist 回调指向 handler）。
 		HaozhumaClient: newHaozhumaClient(cfg),
@@ -481,6 +503,21 @@ func main() {
 		SchoolNow:   sch.RunSchoolNow,
 		ScheduleEnabled: struct{ AutoenrollGrowthTasks bool }{
 			AutoenrollGrowthTasks: cfg.ScheduleEnabled.AutoenrollGrowthTasks,
+		},
+		CacheRouting: cacheroute.Config{
+			Disabled: !cfg.CacheRouting.Enabled, Shadow: cfg.CacheRouting.Shadow, Salt: routeSalt,
+			WaitTimeout: cfg.CacheWaitTimeout, MaxPending: cfg.CacheRouting.MaxPending,
+			MaxPendingTotal: cfg.CacheRouting.MaxPendingTotal,
+			MaxCandidates:   cfg.CacheRouting.MaxCandidates, MaxCacheLoss: cfg.CacheRouting.MaxCacheLoss,
+			TTL: cfg.CachePrefixTTL, MaxEntries: cfg.CacheRouting.MaxEntries,
+			InitialPrefillTPS:    cfg.CacheRouting.InitialPrefillTPS,
+			ProtectionDisabled:   !cfg.CacheRouting.SessionProtection,
+			FairQueueDisabled:    !cfg.CacheRouting.FairQueue,
+			LeaseMin:             cfg.ActiveLeaseMin,
+			LeaseMax:             cfg.ActiveLeaseMax,
+			ReservedSlots:        cfg.CacheRouting.ReservedSlots,
+			QueueAging:           cfg.QueueAging,
+			MaxPendingPerSession: cfg.CacheRouting.MaxPendingPerSession,
 		},
 		Session:         sessRouter,
 		StickyCount:     sessCount,
@@ -550,6 +587,7 @@ func main() {
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go trafficTracker.Run(ctx)
 	defer stop()
 	// 补释放上次进程非正常结束时遗留的号码。放在开始服务之前：容器重启是
 	// SIGKILL，收尾代码不会执行，号会一直占着豪猪的取号额度，导致之后每次
@@ -608,8 +646,10 @@ func main() {
 		// active streaming responses.
 		IdleTimeout: 120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
+		defer close(shutdownDone)
 		p.Flush() // 信号触发：先落盘再做优雅停机
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -622,6 +662,9 @@ func main() {
 	h.ResumeGrowthJobsAfterRestart()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
+	}
+	if ctx.Err() != nil {
+		<-shutdownDone
 	}
 	log.Printf("bye")
 }

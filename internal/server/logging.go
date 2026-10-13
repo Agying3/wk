@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"workbuddy2api/internal/traffic"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -147,6 +148,12 @@ type CompletionStore interface {
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
+	trafficResult         *trafficResult
+	trafficAttempt        *traffic.Lease
+	trafficProxy          *traffic.Lease
+	trafficAttemptStart   time.Time
+	trafficProxyStart     time.Time
+	trafficCacheKnown     bool
 	id                    string
 	start                 time.Time
 	route                 string
@@ -264,6 +271,7 @@ func (s *chatStat) done() {
 			s.creditSource = "unknown"
 		}
 	}
+	s.finishTraffic(status, elapsed)
 	// 影子扣减：成功请求且费用已知时喂给选号均衡（负反馈）。失败请求不扣
 	// ——上游对失败请求也不收费；unknown 也跳过，宁可不均衡也不错扣。
 	if s.spendHook != nil && success && s.creditSource != "unknown" && s.uid != "" {
@@ -399,6 +407,7 @@ func metricsSnapshot() map[string]any {
 // 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
+	cacheKnown  bool
 	br          *bufio.Reader
 	start       time.Time
 	ttfb        time.Duration
@@ -492,18 +501,28 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if usage.empty() {
 		return
 	}
-	s.hasUsage = true
-	s.tokens = maxInts(usage.CompletionTokens, usage.OutputTokens)
-	s.inputTokens = maxInts(usage.PromptTokens, usage.InputTokens)
-	total := usage.TotalTokens
-	if total == 0 && (s.inputTokens > 0 || s.tokens > 0) {
-		total = s.inputTokens + s.tokens
+	if usage.hasInput || usage.hasOutput || usage.hasTotal {
+		s.hasUsage = true
 	}
-	s.totalTokens = total
-	cacheRead := maxInts(usage.PromptCacheHitTokens, usage.CacheReadInputTokens, usage.PromptTokensDetails.CachedTokens, usage.InputTokensDetails.CachedTokens)
-	cacheWrite := maxInts(usage.PromptCacheMissTokens, usage.CacheCreationInputTokens, usage.InputTokensDetails.CacheCreationInputTokens, usage.InputTokensDetails.CacheWriteTokens)
-	s.cacheRead = cacheRead
-	s.cacheWrite = cacheWrite
+	if usage.hasOutput {
+		s.tokens = maxInts(usage.CompletionTokens, usage.OutputTokens)
+	}
+	if usage.hasInput {
+		s.inputTokens = maxInts(usage.PromptTokens, usage.InputTokens)
+	}
+	if usage.hasTotal {
+		s.totalTokens = usage.TotalTokens
+	} else if usage.hasInput || usage.hasOutput {
+		s.totalTokens = s.inputTokens + s.tokens
+	}
+	if usage.hasRead {
+		s.cacheKnown = true
+		s.cacheRead = maxInts(usage.PromptCacheHitTokens, usage.CacheReadInputTokens, usage.PromptTokensDetails.CachedTokens, usage.InputTokensDetails.CachedTokens)
+	}
+	if usage.hasWrite {
+		s.cacheWrite = maxInts(usage.PromptCacheMissTokens, usage.CacheCreationInputTokens, usage.InputTokensDetails.CacheCreationInputTokens, usage.InputTokensDetails.CacheWriteTokens)
+	}
+
 }
 
 // sseStatsChunk 是统计层对单帧 SSE payload 的 typed 解码目标。只列统计
@@ -531,11 +550,12 @@ type sseStatsChunk struct {
 // sseStatsUsage 覆盖上游/兼容层用过的全部 token 计数字段命名。
 // nested details 与平级字段并存时取 max（对齐旧 map 实现的 maxInts 口径）。
 type sseStatsUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	InputTokens      int `json:"input_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	OutputTokens     int `json:"output_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	hasInput, hasOutput, hasTotal, hasRead, hasWrite bool
+	PromptTokens                                     int `json:"prompt_tokens"`
+	InputTokens                                      int `json:"input_tokens"`
+	CompletionTokens                                 int `json:"completion_tokens"`
+	OutputTokens                                     int `json:"output_tokens"`
+	TotalTokens                                      int `json:"total_tokens"`
 
 	PromptCacheHitTokens     int `json:"prompt_cache_hit_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
@@ -574,6 +594,68 @@ type sseStatsUsage struct {
 	CostCreditsC     *float64 `json:"costCredits"`
 	BillableCreditsC *float64 `json:"billableCredits"`
 	CreditCostC      *float64 `json:"creditCost"`
+}
+
+// Presence is separate from numeric value: zero is a valid cache observation.
+func (u *sseStatsUsage) UnmarshalJSON(data []byte) error {
+	type plain sseStatsUsage
+	var value plain
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*u = sseStatsUsage(value)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	has := func(keys ...string) bool {
+		for _, k := range keys {
+			if v := raw[k]; len(v) > 0 && string(v) != "null" {
+				return true
+			}
+		}
+		return false
+	}
+	nested := func(key string, keys ...string) bool {
+		var details map[string]json.RawMessage
+		if json.Unmarshal(raw[key], &details) != nil {
+			return false
+		}
+		for _, k := range keys {
+			if v := details[k]; len(v) > 0 && string(v) != "null" {
+				return true
+			}
+		}
+		return false
+	}
+	u.hasInput = has("prompt_tokens", "input_tokens")
+	u.hasOutput = has("completion_tokens", "output_tokens")
+	u.hasTotal = has("total_tokens")
+	u.hasRead = has("prompt_cache_hit_tokens", "cache_read_input_tokens") || nested("prompt_tokens_details", "cached_tokens") || nested("input_tokens_details", "cached_tokens")
+	u.hasWrite = has("prompt_cache_miss_tokens", "cache_creation_input_tokens") || nested("input_tokens_details", "cache_creation_input_tokens", "cache_write_tokens")
+	return nil
+}
+
+func (s *chatStatsReader) CacheUsageKnown() bool { return s.cacheKnown }
+
+func cacheUsagePresent(resp map[string]any) bool {
+	u, ok := resp["usage"].(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, k := range []string{"prompt_cache_hit_tokens", "cache_read_input_tokens"} {
+		if _, ok := usageInt(u[k]); ok {
+			return true
+		}
+	}
+	for _, k := range []string{"prompt_tokens_details", "input_tokens_details"} {
+		if d, ok := u[k].(map[string]any); ok {
+			if _, ok := usageInt(d["cached_tokens"]); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (u sseStatsUsage) empty() bool {

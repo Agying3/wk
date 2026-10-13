@@ -237,6 +237,31 @@ type Config struct {
 		MaxEntries int `json:"max_entries"`
 	} `json:"session_sticky"`
 
+	CacheRouting struct {
+		Enabled              bool    `json:"enabled"`
+		Shadow               bool    `json:"shadow"`
+		WaitTimeout          string  `json:"wait_timeout"`
+		MaxPending           int     `json:"max_pending_per_account"`
+		MaxPendingTotal      int     `json:"max_pending_total"`
+		MaxCandidates        int     `json:"max_candidates"`
+		MaxCacheLoss         float64 `json:"max_cache_loss"`
+		TTL                  string  `json:"prefix_ttl"`
+		MaxEntries           int     `json:"max_prefix_entries"`
+		InitialPrefillTPS    float64 `json:"initial_prefill_tokens_per_second"`
+		SessionProtection    bool    `json:"session_protection"`
+		FairQueue            bool    `json:"fair_queue"`
+		LeaseMin             string  `json:"active_lease_min"`
+		LeaseMax             string  `json:"active_lease_max"`
+		ReservedSlots        int     `json:"reserved_slots"`
+		QueueAging           string  `json:"queue_aging"`
+		MaxPendingPerSession int     `json:"max_pending_per_session"`
+	} `json:"cache_routing"`
+	CacheWaitTimeout time.Duration `json:"-"`
+	CachePrefixTTL   time.Duration `json:"-"`
+	ActiveLeaseMin   time.Duration `json:"-"`
+	ActiveLeaseMax   time.Duration `json:"-"`
+	QueueAging       time.Duration `json:"-"`
+
 	// 解析后
 	SoftRateDur          time.Duration `json:"-"`
 	BreakerCooldownDur   time.Duration `json:"-"`
@@ -305,6 +330,22 @@ func Default() *Config {
 	c.Pool.BreakerCooldownMax = "6h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
+	c.CacheRouting.Enabled = true
+	c.CacheRouting.WaitTimeout = "5s"
+	c.CacheRouting.MaxPending = 8
+	c.CacheRouting.MaxPendingTotal = 64
+	c.CacheRouting.MaxCandidates = 3
+	c.CacheRouting.MaxCacheLoss = .1
+	c.CacheRouting.TTL = "30m"
+	c.CacheRouting.MaxEntries = 2048
+	c.CacheRouting.InitialPrefillTPS = 5000
+	c.CacheRouting.SessionProtection = true
+	c.CacheRouting.FairQueue = true
+	c.CacheRouting.LeaseMin = "5s"
+	c.CacheRouting.LeaseMax = "15s"
+	c.CacheRouting.ReservedSlots = 1
+	c.CacheRouting.QueueAging = "2s"
+	c.CacheRouting.MaxPendingPerSession = 4
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -496,6 +537,33 @@ func (c *Config) normalize() error {
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
 	}
+	if c.CacheWaitTimeout, err = time.ParseDuration(c.CacheRouting.WaitTimeout); err != nil || c.CacheWaitTimeout <= 0 {
+		return fmt.Errorf("cache_routing.wait_timeout must be a positive duration")
+	}
+	if c.CachePrefixTTL, err = time.ParseDuration(c.CacheRouting.TTL); err != nil || c.CachePrefixTTL <= 0 {
+		return fmt.Errorf("cache_routing.prefix_ttl must be a positive duration")
+	}
+	if c.ActiveLeaseMin, err = time.ParseDuration(c.CacheRouting.LeaseMin); err != nil || c.ActiveLeaseMin <= 0 {
+		return fmt.Errorf("cache_routing.active_lease_min must be positive")
+	}
+	if c.ActiveLeaseMax, err = time.ParseDuration(c.CacheRouting.LeaseMax); err != nil || c.ActiveLeaseMax < c.ActiveLeaseMin || c.ActiveLeaseMax > time.Minute {
+		return fmt.Errorf("cache_routing.active_lease_max must be >= min and <= 1m")
+	}
+	if c.QueueAging, err = time.ParseDuration(c.CacheRouting.QueueAging); err != nil || c.QueueAging <= 0 {
+		return fmt.Errorf("cache_routing.queue_aging must be positive")
+	}
+	if c.CacheRouting.ReservedSlots < 1 || c.CacheRouting.ReservedSlots > 16 {
+		return fmt.Errorf("cache_routing.reserved_slots must be in [1,16]")
+	}
+	if c.CacheRouting.MaxPendingPerSession < 1 || c.CacheRouting.MaxPendingPerSession > 64 {
+		return fmt.Errorf("cache_routing.max_pending_per_session must be in [1,64]")
+	}
+	if c.CacheRouting.MaxPending <= 0 || c.CacheRouting.MaxPendingTotal <= 0 || c.CacheRouting.MaxCandidates <= 0 || c.CacheRouting.MaxCandidates > 16 || c.CacheRouting.MaxEntries <= 0 || c.CacheRouting.MaxEntries > 100000 {
+		return fmt.Errorf("cache_routing: positive queue/index limits required; max_candidates <= 16 and max_prefix_entries <= 100000")
+	}
+	if math.IsNaN(c.CacheRouting.MaxCacheLoss) || c.CacheRouting.MaxCacheLoss < 0 || c.CacheRouting.MaxCacheLoss > 1 || math.IsNaN(c.CacheRouting.InitialPrefillTPS) || math.IsInf(c.CacheRouting.InitialPrefillTPS, 0) || c.CacheRouting.InitialPrefillTPS <= 0 {
+		return fmt.Errorf("cache_routing: max_cache_loss must be in [0,1] and initial_prefill_tokens_per_second must be positive")
+	}
 	if strings.TrimSpace(c.SMS.Proxy.Cooldown) == "" {
 		c.SMS.Proxy.Cooldown = "30m"
 	}
@@ -647,11 +715,11 @@ func (c *Config) normalize() error {
 // 与 server.WatchConfig 字段一致但独立声明：cmd/server 不 import
 // internal/server（保持 main 的依赖面干净），main 加载后翻译过去。
 type WatchJSON struct {
-	Enabled         bool             `json:"enabled"`
-	IntervalSeconds int              `json:"interval_seconds"`
-	WantPerTrigger  int              `json:"want_per_trigger"`
-	Workers         int              `json:"workers"`
-	Groups          []string         `json:"groups"`
+	Enabled         bool               `json:"enabled"`
+	IntervalSeconds int                `json:"interval_seconds"`
+	WantPerTrigger  int                `json:"want_per_trigger"`
+	Workers         int                `json:"workers"`
+	Groups          []string           `json:"groups"`
 	Projects        []WatchProjectJSON `json:"projects"`
 }
 
