@@ -35,10 +35,10 @@ type Config struct {
 	RequestLogRetentionDays int `json:"request_log_retention_days"`
 	RequestLogRetentionRows int `json:"request_log_retention_rows"`
 
-	// MaxRequestBodyMiB 请求体大小上限（MiB），默认 8。只作用于
+	// MaxRequestBodyMB 请求体大小上限（MB），默认 8。只作用于
 	// /v1/chat/completions 与 /v1/responses 的请求体（会全量读进内存）。
-	// WebUI 可改（即时生效）；范围 1-64。
-	MaxRequestBodyMiB int `json:"max_request_body_mib"`
+	// WebUI 可改（即时生效）；范围 1-128。
+	MaxRequestBodyMB int `json:"max_request_body_mb"`
 
 	// Pprof pprof 性能分析端点（net/http/pprof）。
 	Pprof struct {
@@ -322,8 +322,8 @@ func Default() *Config {
 	c.Features.Passthrough = false
 	c.Features.CodexCompat = false
 	c.Features.ResponsesAPI = true
-	// 请求体上限默认 8 MiB（与历史硬编码一致）。0 = 默认，见 normalize。
-	c.MaxRequestBodyMiB = 8
+	// 请求体上限默认 8 MB（与历史硬编码一致）。0 = 默认，见 normalize。
+	c.MaxRequestBodyMB = 8
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
@@ -367,6 +367,17 @@ func Load(path string) (*Config, error) {
 		}
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		// 兼容旧键名；升级后其数值统一按十进制 MB 使用，新键优先。
+		var bodyLimit struct {
+			MB  *int `json:"max_request_body_mb"`
+			MiB *int `json:"max_request_body_mib"`
+		}
+		if err := json.Unmarshal(raw, &bodyLimit); err != nil {
+			return nil, fmt.Errorf("parse body limit: %w", err)
+		}
+		if bodyLimit.MB == nil && bodyLimit.MiB != nil {
+			c.MaxRequestBodyMB = *bodyLimit.MiB
 		}
 		// 二次探测 schedule.*_enabled 是否显式出现：JSON bool 的零值歧义
 		// （false 既可能是"显式关闭"也可能是"没写"），Default 已把没写的
@@ -498,9 +509,13 @@ func applyEnv(c *Config) {
 			c.Features.ResponsesAPI = b
 		}
 	}
-	if v := os.Getenv("WB2A_MAX_REQUEST_BODY_MIB"); v != "" {
+	limitEnv := os.Getenv("WB2A_MAX_REQUEST_BODY_MB")
+	if limitEnv == "" {
+		limitEnv = os.Getenv("WB2A_MAX_REQUEST_BODY_MIB")
+	}
+	if v := limitEnv; v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			c.MaxRequestBodyMiB = n
+			c.MaxRequestBodyMB = n
 		}
 	}
 	if v := os.Getenv("WB2A_INPUT_CREDITS_PER_1K"); v != "" {
@@ -638,14 +653,14 @@ func (c *Config) normalize() error {
 	c.Billing.InputCreditsPer1KTokens = validCreditRate(c.Billing.InputCreditsPer1KTokens)
 	c.Billing.OutputCreditsPer1KTokens = validCreditRate(c.Billing.OutputCreditsPer1KTokens)
 	c.Billing.CachedInputCreditsPer1KTokens = validCreditRate(c.Billing.CachedInputCreditsPer1KTokens)
-	// 请求体上限：0/负数 = 未配置 → 默认 8 MiB；显式配置时必须在 1-64。
+	// 请求体上限：0/负数 = 未配置 → 默认 8 MB；显式配置时必须在 1-128。
 	// 上限不能开放到任意大：请求体会全量读进内存，无界上限等于自拒式
 	// 内存耗尽（32 位平台上 int 溢出也会在这里被范围检查拦下）。
-	if c.MaxRequestBodyMiB == 0 {
-		c.MaxRequestBodyMiB = 8
+	if c.MaxRequestBodyMB == 0 {
+		c.MaxRequestBodyMB = 8
 	}
-	if c.MaxRequestBodyMiB < 1 || c.MaxRequestBodyMiB > 64 {
-		return fmt.Errorf("max_request_body_mib must be 1-64, got %d", c.MaxRequestBodyMiB)
+	if c.MaxRequestBodyMB < 1 || c.MaxRequestBodyMB > 128 {
+		return fmt.Errorf("max_request_body_mb must be 1-128, got %d", c.MaxRequestBodyMB)
 	}
 	c.Region = strings.ToLower(strings.TrimSpace(c.Region))
 	if c.Region == "" {

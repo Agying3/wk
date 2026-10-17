@@ -557,8 +557,8 @@ func main() {
 			})
 		},
 		// 请求体大小上限（字节）：WebUI「请求体大小限制」卡片保存后
-		// 即时生效；默认 8 MiB（config normalize 已保证 1-64）。
-		MaxRequestBodyBytes: cfg.MaxRequestBodyMiB << 20,
+		// 即时生效；默认 8 MB（config normalize 已保证 1-128）。
+		MaxRequestBodyBytes: cfg.MaxRequestBodyMB * 1_000_000,
 		SoftCooldown:        cfg.SoftRateDur,
 	})
 

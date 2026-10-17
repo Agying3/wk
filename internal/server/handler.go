@@ -179,8 +179,8 @@ type Config struct {
 	// 但不支持 -1 关闭——WebUI 上「0」即代表关闭，落盘时再翻译回 -1）。
 	// 可选：nil 时仅落盘（重启后生效）。
 	SetUpstreamTimeouts func(requestSecs, streamTotalSecs, streamIdleSecs int)
-	// MaxRequestBodyBytes 请求体大小上限（字节）。0 = 默认 8 MiB。
-	// main 从 config.json 的 max_request_body_mib 解析（MiB → 字节）后传入；
+	// MaxRequestBodyBytes 请求体大小上限（字节）。0 = 默认 8 MB。
+	// main 从 config.json 的 max_request_body_mb 解析（MB → 字节）后传入；
 	// WebUI 保存后经 featuresMu 保护的 h.maxRequestBody 即时生效。
 	MaxRequestBodyBytes int
 }
@@ -267,15 +267,15 @@ const (
 	responseHistoryTTL      = time.Hour
 	maxResponseHistory      = 1024
 	maxResponseHistoryBytes = 64 << 20
-	// defaultMaxRequestBodyBytes 请求体大小上限的默认值（8 MiB）。运行时
+	// defaultMaxRequestBodyBytes 请求体大小上限的默认值（8 MB）。运行时
 	// 上限存在 h.maxRequestBody（WebUI 可改），这里只作为 Config 未注入 /
 	// 零值时的兜底，以及与新上限联动校验的常量基准。
-	defaultMaxRequestBodyBytes = 8 << 20
+	defaultMaxRequestBodyBytes = 8 * 1_000_000
 	// min/maxWebRequestBodyBytes 是 WebUI 修改请求体上限时的合法范围
-	//（1 MiB - 64 MiB）。上限不能开放到任意大：请求体会全量读进内存做
+	//（1 MB - 128 MB）。上限不能开放到任意大：请求体会全量读进内存做
 	// 一次 JSON 解码，无界的上限等于自拒式内存耗尽。
-	minWebRequestBodyBytes = 1 << 20
-	maxWebRequestBodyBytes = 64 << 20
+	minWebRequestBodyBytes = 1_000_000
+	maxWebRequestBodyBytes = 128 * 1_000_000
 	unlockFailureLimit     = 5
 	unlockFailureWindow    = time.Minute
 	unlockBlockDuration    = 5 * time.Minute
@@ -328,7 +328,7 @@ func NewHandler(cfg Config) *Handler {
 	h.responsesOff = cfg.DisableResponses
 	h.creditPolicy = cfg.CreditPolicy
 	// 请求体上限同样拷贝一份运行时副本：cfg 未注入（老部署/单测零值）时
-	// 用默认 8 MiB，保证零值 Config 的行为与改造前完全一致。
+	// 零值 Config 使用默认 8 MB。
 	h.maxRequestBody = cfg.MaxRequestBodyBytes
 	if h.maxRequestBody <= 0 {
 		h.maxRequestBody = defaultMaxRequestBodyBytes
@@ -1144,9 +1144,9 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		// request_log_retention 对象（与 POST 补丁形状一致）。
 		RetentionDays int `json:"request_log_retention_days"`
 		RetentionRows int `json:"request_log_retention_rows"`
-		// MaxRequestBodyMiB 请求体大小上限（MiB，WebUI 可改，运行时生效）。
-		// config.json 里是平级的 max_request_body_mib；0 = 默认 8。
-		MaxRequestBodyMiB int `json:"max_request_body_mib"`
+		// MaxRequestBodyMB 请求体大小上限（MB，WebUI 可改，运行时生效）。
+		// config.json 里是平级的 max_request_body_mb；0 = 默认 8。
+		MaxRequestBodyMB int `json:"max_request_body_mb"`
 	}
 	c.Features.ResponsesAPI = true
 	c.Upstream.TimeoutSeconds = 120
@@ -1195,10 +1195,12 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	if c.RetentionDays == 0 && c.RetentionRows == 0 {
 		c.RetentionRows = 10000
 	}
-	// 请求体上限：老配置没写（0）显示默认 8 MiB；负数无意义，同样回默认。
-	if c.MaxRequestBodyMiB <= 0 {
-		c.MaxRequestBodyMiB = defaultMaxRequestBodyBytes >> 20
+	// 请求体上限：老配置没写（0）显示默认 8 MB；负数无意义，同样回默认。
+	if c.MaxRequestBodyMB <= 0 {
+		c.MaxRequestBodyMB = defaultMaxRequestBodyBytes / 1_000_000
 	}
+	// 回显运行时的实际限制，包含环境变量和旧配置键的兼容结果。
+	c.MaxRequestBodyMB = h.currentMaxRequestBody() / 1_000_000
 	resp := struct {
 		Schedule   any `json:"schedule"`
 		Region     any `json:"region"`
@@ -1208,7 +1210,7 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		SMS        any `json:"sms"`
 		AutoEnroll any `json:"autoenroll"`
 		Retention  any `json:"request_log_retention"`
-		// MaxRequestBodyMiB 对前端组装成嵌套对象（与 POST 补丁形状一致）。
+		// MaxRequestBodyMB 对前端组装成嵌套对象（与 POST 补丁形状一致）。
 		MaxRequestBody any `json:"max_request_body"`
 	}{
 		Schedule: c.Schedule,
@@ -1241,10 +1243,10 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		AutoEnroll: h.autoenrollEcho(c.AutoEnroll),
 		Retention:  map[string]int{"days": c.RetentionDays, "rows": c.RetentionRows},
 		MaxRequestBody: map[string]int{
-			"mib":         c.MaxRequestBodyMiB,
-			"min_mib":     minWebRequestBodyBytes >> 20,
-			"max_mib":     maxWebRequestBodyBytes >> 20,
-			"default_mib": defaultMaxRequestBodyBytes >> 20,
+			"mb":         c.MaxRequestBodyMB,
+			"min_mb":     minWebRequestBodyBytes / 1_000_000,
+			"max_mb":     maxWebRequestBodyBytes / 1_000_000,
+			"default_mb": defaultMaxRequestBodyBytes / 1_000_000,
 		},
 	}
 	writeJSON(w, 200, resp)
@@ -1417,10 +1419,11 @@ type retentionPatch struct {
 }
 
 // maxRequestBodyPatch 请求体大小上限（WebUI「请求体大小限制」卡片）。
-// mib 单位是 MiB；nil = 未提供（保留 config.json 现值）。指针类型与
+// mb 单位是 MB；nil = 未提供（保留 config.json 现值）。指针类型与
 // retentionPatch 同理，区分"未提供"与"显式 0"（0 非法，校验里拒绝）。
 type maxRequestBodyPatch struct {
-	MiB *int `json:"mib"`
+	MB        *int `json:"mb"`
+	LegacyMiB *int `json:"mib"`
 }
 
 func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
@@ -1451,6 +1454,10 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
+	}
+	// 旧前端的 mib 作为键名别名保留，数值统一按 MB 解释。
+	if req.MaxRequestBody != nil && req.MaxRequestBody.MB == nil {
+		req.MaxRequestBody.MB = req.MaxRequestBody.LegacyMiB
 	}
 	checkinHours, checkinOK := normalizeScheduleHours(req.CheckinHours)
 	keepaliveHours, keepaliveOK := normalizeScheduleHours(req.KeepaliveHours)
@@ -1597,13 +1604,13 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// 请求体大小上限（MiB）：1-64。请求体会全量读进内存做一次 JSON 解码，
-	// 无界上限等于自拒式内存耗尽，所以必须封顶；下限 1 MiB 保证带图请求
+	// 请求体大小上限（MB）：1-128。请求体会全量读进内存做一次 JSON 解码，
+	// 无界上限等于自拒式内存耗尽，所以必须封顶；下限 1 MB 保证带图请求
 	// 的正常形态。0/负数/超范围一律拒绝（0 不是"不限"）。
-	if req.MaxRequestBody != nil && req.MaxRequestBody.MiB != nil {
-		mib := *req.MaxRequestBody.MiB
-		if mib < minWebRequestBodyBytes>>20 || mib > maxWebRequestBodyBytes>>20 {
-			writeJSON(w, 400, map[string]string{"error": "请求体大小限制需在 1-64 MiB 之间"})
+	if req.MaxRequestBody != nil && req.MaxRequestBody.MB != nil {
+		mb := *req.MaxRequestBody.MB
+		if mb < minWebRequestBodyBytes/1_000_000 || mb > maxWebRequestBodyBytes/1_000_000 {
+			writeJSON(w, 400, map[string]string{"error": "请求体大小限制需在 1-128 MB 之间"})
 			return
 		}
 	}
@@ -1860,9 +1867,10 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		doc["request_log_retention_days"] = days
 		doc["request_log_retention_rows"] = rows
 	}
-	// 请求体大小上限：config.json 里是平级的 max_request_body_mib。
-	if req.MaxRequestBody != nil && req.MaxRequestBody.MiB != nil {
-		doc["max_request_body_mib"] = *req.MaxRequestBody.MiB
+	// 请求体大小上限：config.json 里是平级的 max_request_body_mb。
+	if req.MaxRequestBody != nil && req.MaxRequestBody.MB != nil {
+		doc["max_request_body_mb"] = *req.MaxRequestBody.MB
+		delete(doc, "max_request_body_mib")
 	}
 
 	out, _ := json.MarshalIndent(doc, "", "  ")
@@ -2090,12 +2098,12 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	// 下一条 chat/responses 请求即按新上限判定；已在途请求不受影响。
 	// 与 features/billing/retention 不同，这里不需要外部回调——执行点
 	// （readRequestBody）就在本 handler 内。
-	if req.MaxRequestBody != nil && req.MaxRequestBody.MiB != nil {
-		mib := *req.MaxRequestBody.MiB
+	if req.MaxRequestBody != nil && req.MaxRequestBody.MB != nil {
+		mb := *req.MaxRequestBody.MB
 		h.featuresMu.Lock()
-		h.maxRequestBody = mib << 20
+		h.maxRequestBody = mb * 1_000_000
 		h.featuresMu.Unlock()
-		updated["max_request_body_mib"] = mib
+		updated["max_request_body_mb"] = mb
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "restart_required": restartRequired, "schedule": schedule, "updated": updated})
 }
@@ -3818,7 +3826,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	body, tooLarge, err := h.readRequestBody(r)
 	if tooLarge {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
-			fmt.Sprintf("request body exceeds %d MiB limit", h.currentMaxRequestBody()>>20))
+			fmt.Sprintf("request body exceeds %d MB limit", h.currentMaxRequestBody()/1_000_000))
 		return
 	}
 	if err != nil {
@@ -4968,7 +4976,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	body, tooLarge, err := h.readRequestBody(r)
 	if tooLarge {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
-			fmt.Sprintf("request body exceeds %d MiB limit", h.currentMaxRequestBody()>>20))
+			fmt.Sprintf("request body exceeds %d MB limit", h.currentMaxRequestBody()/1_000_000))
 		return
 	}
 	if err != nil {

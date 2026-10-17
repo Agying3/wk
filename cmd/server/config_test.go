@@ -415,15 +415,46 @@ func TestPprofRejectsWildcardOrMissingHost(t *testing.T) {
 	}
 }
 
-// 请求体大小上限：默认 8 MiB（与历史硬编码一致）；文件/env 可改；范围 1-64。
-func TestMaxRequestBodyMiB(t *testing.T) {
+// 请求体大小上限：默认 8 MB（与历史硬编码一致）；文件/env 可改；范围 1-128。
+func TestMaxRequestBodyLegacyAliases(t *testing.T) {
+	t.Setenv("WB2A_MAX_REQUEST_BODY_MB", "")
+	t.Setenv("WB2A_MAX_REQUEST_BODY_MIB", "")
+	path := filepath.Join(t.TempDir(), "config.json")
+	for _, tc := range []struct {
+		doc  string
+		want int
+	}{
+		{`{"api_key":"k","max_request_body_mib":32}`, 32},
+		{`{"api_key":"k","max_request_body_mib":32,"max_request_body_mb":16}`, 16},
+	} {
+		if err := os.WriteFile(path, []byte(tc.doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil || c.MaxRequestBodyMB != tc.want {
+			t.Fatalf("Load: err=%v, want %d MB", err, tc.want)
+		}
+	}
+	t.Setenv("WB2A_MAX_REQUEST_BODY_MIB", "64")
+	c, err := Load(path)
+	if err != nil || c.MaxRequestBodyMB != 64 {
+		t.Fatalf("legacy env: err=%v, want 64 MB", err)
+	}
+	t.Setenv("WB2A_MAX_REQUEST_BODY_MB", "128")
+	c, err = Load(path)
+	if err != nil || c.MaxRequestBodyMB != 128 {
+		t.Fatalf("new env priority: err=%v, want 128 MB", err)
+	}
+}
+
+func TestMaxRequestBodyMB(t *testing.T) {
 	// 默认值 = 8。
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatal(err)
 	}
-	if c.MaxRequestBodyMiB != 8 {
-		t.Errorf("default MaxRequestBodyMiB=%d want 8", c.MaxRequestBodyMiB)
+	if c.MaxRequestBodyMB != 8 {
+		t.Errorf("default MaxRequestBodyMB=%d want 8", c.MaxRequestBodyMB)
 	}
 
 	// 老配置文件没写该字段 → 保持默认 8。
@@ -436,46 +467,46 @@ func TestMaxRequestBodyMiB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.MaxRequestBodyMiB != 8 {
-		t.Errorf("unset MaxRequestBodyMiB=%d want default 8", c.MaxRequestBodyMiB)
+	if c.MaxRequestBodyMB != 8 {
+		t.Errorf("unset MaxRequestBodyMB=%d want default 8", c.MaxRequestBodyMB)
 	}
 
 	// 文件显式配置。
-	if err := os.WriteFile(fp, []byte(`{"api_key":"k","max_request_body_mib":32}`), 0o600); err != nil {
+	if err := os.WriteFile(fp, []byte(`{"api_key":"k","max_request_body_mb":32}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c, err = Load(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.MaxRequestBodyMiB != 32 {
-		t.Errorf("MaxRequestBodyMiB=%d want 32", c.MaxRequestBodyMiB)
+	if c.MaxRequestBodyMB != 32 {
+		t.Errorf("MaxRequestBodyMB=%d want 32", c.MaxRequestBodyMB)
 	}
 
 	// env 覆盖文件。
-	t.Setenv("WB2A_MAX_REQUEST_BODY_MIB", "16")
+	t.Setenv("WB2A_MAX_REQUEST_BODY_MB", "16")
 	c, err = Load(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.MaxRequestBodyMiB != 16 {
-		t.Errorf("env override MaxRequestBodyMiB=%d want 16", c.MaxRequestBodyMiB)
+	if c.MaxRequestBodyMB != 16 {
+		t.Errorf("env override MaxRequestBodyMB=%d want 16", c.MaxRequestBodyMB)
 	}
 
-	// 非法范围拒绝：0/负数（显式）/超 64。normalize 报错而不是静默回落。
-	for _, mib := range []int{-1, 65, 1000} {
+	// 非法范围拒绝：0/负数（显式）/超 128。normalize 报错而不是静默回落。
+	for _, mb := range []int{-1, 129, 1000} {
 		c := Default()
-		c.MaxRequestBodyMiB = mib
+		c.MaxRequestBodyMB = mb
 		if err := c.normalize(); err == nil {
-			t.Errorf("mib=%d accepted, want error", mib)
+			t.Errorf("mb=%d accepted, want error", mb)
 		}
 	}
-	// 全部合法边界：1 与 64。
-	for _, mib := range []int{1, 64} {
+	// 全部合法边界：1 与 128。
+	for _, mb := range []int{1, 64, 65, 128} {
 		c := Default()
-		c.MaxRequestBodyMiB = mib
+		c.MaxRequestBodyMB = mb
 		if err := c.normalize(); err != nil {
-			t.Errorf("mib=%d unexpected error: %v", mib, err)
+			t.Errorf("mb=%d unexpected error: %v", mb, err)
 		}
 	}
 }

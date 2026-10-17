@@ -485,21 +485,21 @@ function Console() {
     }
   };
 
-  // saveMaxRequestBody 保存请求体大小上限（MiB）：即时生效（下一条
+  // saveMaxRequestBody 保存请求体大小上限（MB）：即时生效（下一条
   // chat/responses 请求按新上限判定，已在途请求不受影响）。
-  const saveMaxRequestBody = async mib => {
+  const saveMaxRequestBody = async mb => {
     try {
       const result = await api('/admin/config', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           checkin_hours: config.checkin_hours || [9],
           keepalive_hours: config.keepalive_hours || [22],
-          max_request_body: { mib },
+          max_request_body: { mb },
         }),
       });
       setConfig(current => ({
         ...current,
-        max_request_body: { ...(current.max_request_body || {}), mib },
+        max_request_body: { ...(current.max_request_body || {}), mb },
       }));
       message.success('请求体大小限制已保存并即时生效');
       return result;
@@ -918,23 +918,23 @@ function Console() {
               </Paragraph>
               <Form
                 layout="inline"
-                onFinish={values => saveMaxRequestBody(Number(values.mib) || 8)}
-                initialValues={{ mib: config.max_request_body?.mib ?? 8 }}
-                key={config.max_request_body?.mib}
+                onFinish={values => saveMaxRequestBody(Number(values.mb) || 8)}
+                initialValues={{ mb: config.max_request_body?.mb ?? 8 }}
+                key={config.max_request_body?.mb}
               >
                 <Form.Item
-                  name="mib"
+                  name="mb"
                   label={(
-                    <Tooltip title="请求体上限，单位 MiB。范围 1-64，默认 8。超限请求返回 413 request_too_large。">
+                    <Tooltip title="请求体上限，单位 MB。范围 1-128，默认 8。超限请求返回 413 request_too_large。">
                       <span style={{ borderBottom: '1px dashed #bfbfbf' }}>上限</span>
                     </Tooltip>
                   )}
                 >
                   <InputNumber
-                    min={config.max_request_body?.min_mib ?? 1}
-                    max={config.max_request_body?.max_mib ?? 64}
+                    min={config.max_request_body?.min_mb ?? 1}
+                    max={config.max_request_body?.max_mb ?? 128}
                     style={{ width: 150 }}
-                    addonAfter="MiB"
+                    addonAfter="MB"
                   />
                 </Form.Item>
                 <Button type="primary" htmlType="submit">保存限制</Button>
