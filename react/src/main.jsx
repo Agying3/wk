@@ -221,6 +221,7 @@ function Console() {
         autoenroll: currentConfig.autoenroll || current.autoenroll,
         request_log_retention: currentConfig.request_log_retention || current.request_log_retention,
         max_request_body: currentConfig.max_request_body || current.max_request_body,
+        response_history: currentConfig.response_history || current.response_history,
       }));
     } catch (error) {
       if (error.name === 'AbortError') return;
@@ -506,6 +507,27 @@ function Console() {
     } catch (error) {
       message.error(error.message);
       return null;
+    }
+  };
+
+  const saveResponseHistory = async responseHistory => {
+    try {
+      const result = await api('/admin/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          checkin_hours: config.checkin_hours || [9],
+          keepalive_hours: config.keepalive_hours || [22],
+          response_history: responseHistory,
+        }),
+      });
+      setConfig(current => ({ ...current, response_history: result.updated.response_history }));
+      if (result.updated.response_history_remote_pending) {
+        message.warning('本机策略已生效，Redis 策略更新失败；请恢复 Redis 连接后重新保存');
+      } else {
+        message.success('会话历史限制已保存并即时生效');
+      }
+    } catch (error) {
+      message.error(error.message);
     }
   };
 
@@ -939,6 +961,36 @@ function Console() {
                 </Form.Item>
                 <Button type="primary" htmlType="submit">保存限制</Button>
               </Form>
+            </Card>
+          )}
+          {config.response_history && (
+            <Card title="Responses 会话历史存储">
+              <Paragraph type="secondary" style={{ margin: '0 0 12px' }}>
+                用于 previous_response_id 接续对话。保存时间、历史条数和总容量同时生效，达到任一上限会清理旧记录。
+                保存后即时生效，调小限制会立即清理；调大保存时间只影响新记录。
+                容量按历史正文的 JSON 字节数计算（1 MB = 1,000,000 字节），不包含存储引擎和程序自身的额外开销。
+                配置 Redis 时，共享历史与每个实例的内存缓存分别受此上限约束。
+              </Paragraph>
+              <Form
+                layout="inline"
+                key={JSON.stringify(config.response_history)}
+                initialValues={config.response_history}
+                onFinish={saveResponseHistory}
+              >
+                <Form.Item name="ttl_seconds" label="保存时间" rules={[{ required: true, message: '请输入保存秒数' }]}>
+                  <InputNumber min={1} max={3153600000} precision={0} style={{ width: 170 }} addonAfter="秒" />
+                </Form.Item>
+                <Form.Item name="max_entries" label="最大条数" rules={[{ required: true, message: '请输入最大条数' }]}>
+                  <InputNumber min={1} max={1000000000} precision={0} style={{ width: 180 }} addonAfter="条" />
+                </Form.Item>
+                <Form.Item name="max_storage_mb" label="总存储上限" rules={[{ required: true, message: '请输入总容量' }]}>
+                  <InputNumber min={1} max={1000000000} precision={0} style={{ width: 180 }} addonAfter="MB" />
+                </Form.Item>
+                <Button type="primary" htmlType="submit">保存会话历史设置</Button>
+              </Form>
+              <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
+                一条记录对应一轮响应及其新增输入；超过总容量的单条记录不保存。父记录过期或被淘汰后，其后续响应 ID 也无法恢复完整对话。
+              </Paragraph>
             </Card>
           )}
           {config.request_log_retention && (

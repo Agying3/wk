@@ -92,10 +92,11 @@ func normalizeURL(url, token string) string {
 
 // Upstash 真实现：redis.Client 封装。
 type Upstash struct {
-	client    *redis.Client
-	writeMu   sync.Mutex
-	versionMu sync.Mutex
-	versions  map[string]uint64
+	client     *redis.Client
+	writeMu    sync.Mutex
+	versionMu  sync.Mutex
+	versions   map[string]uint64
+	responseMu sync.Mutex
 }
 
 func bindKey(key string) string { return bindPrefix + key }
@@ -123,27 +124,6 @@ func (u *Upstash) SaveState(data []byte) {
 	u.scheduleWrite(stateKey, "SaveState", func(ctx context.Context) error {
 		return u.client.Set(ctx, stateKey, snapshot, keyTTL).Err()
 	})
-}
-
-// SaveResponse persists one Responses API turn for previous_response_id
-// continuation across process restarts and multiple replicas.
-func (u *Upstash) SaveResponse(id string, data []byte, ttl time.Duration) {
-	if ttl <= 0 {
-		ttl = keyTTL
-	}
-	snapshot := append([]byte(nil), data...)
-	key := responsePrefix + id
-	u.scheduleWrite(key, "SaveResponse "+id, func(ctx context.Context) error {
-		return u.client.Set(ctx, key, snapshot, ttl).Err()
-	})
-}
-
-// LoadResponse reads one persisted Responses API turn.
-func (u *Upstash) LoadResponse(id string) ([]byte, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
-	defer cancel()
-	value, err := u.client.Get(ctx, responsePrefix+id).Bytes()
-	return value, err == nil
 }
 
 // scheduleWrite serializes remote writes and drops an operation when a newer

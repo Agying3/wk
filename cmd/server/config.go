@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/responsehistory"
 )
 
 // Config 顶层配置。
@@ -38,7 +40,8 @@ type Config struct {
 	// MaxRequestBodyMB 请求体大小上限（MB），默认 8。只作用于
 	// /v1/chat/completions 与 /v1/responses 的请求体（会全量读进内存）。
 	// WebUI 可改（即时生效）；范围 1-128。
-	MaxRequestBodyMB int `json:"max_request_body_mb"`
+	MaxRequestBodyMB int                    `json:"max_request_body_mb"`
+	ResponseHistory  responsehistory.Policy `json:"response_history"`
 
 	// Pprof pprof 性能分析端点（net/http/pprof）。
 	Pprof struct {
@@ -324,6 +327,7 @@ func Default() *Config {
 	c.Features.ResponsesAPI = true
 	// 请求体上限默认 8 MB（与历史硬编码一致）。0 = 默认，见 normalize。
 	c.MaxRequestBodyMB = 8
+	c.ResponseHistory = responsehistory.Default()
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
@@ -661,6 +665,9 @@ func (c *Config) normalize() error {
 	}
 	if c.MaxRequestBodyMB < 1 || c.MaxRequestBodyMB > 128 {
 		return fmt.Errorf("max_request_body_mb must be 1-128, got %d", c.MaxRequestBodyMB)
+	}
+	if err := c.ResponseHistory.Validate(); err != nil {
+		return err
 	}
 	c.Region = strings.ToLower(strings.TrimSpace(c.Region))
 	if c.Region == "" {

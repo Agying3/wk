@@ -523,6 +523,7 @@ func main() {
 		StickyCount:     sessCount,
 		RedisMode:       redisMode,
 		ResponseStore:   responseStore,
+		ResponseHistory: cfg.ResponseHistory,
 		MetricsStore:    persistentMetrics,
 		RequestLogStore: requestLogs,
 		CompletionStore: completions,

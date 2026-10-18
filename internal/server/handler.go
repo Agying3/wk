@@ -33,6 +33,7 @@ import (
 	"workbuddy2api/internal/haozhumah5"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/reqproxy"
+	"workbuddy2api/internal/responsehistory"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/smslogin"
@@ -160,6 +161,7 @@ type Config struct {
 	// 头来绕开基于 IP 的解锁锁定。
 	TrustedProxies  []string
 	ResponseStore   ResponseStore
+	ResponseHistory responsehistory.Policy
 	MetricsStore    MetricsStore
 	RequestLogStore RequestLogStore
 	CompletionStore CompletionStore // optional atomic writer replacing separate metric/log writes
@@ -201,8 +203,11 @@ type Handler struct {
 	sessions        map[string]time.Time
 	configMu        sync.Mutex
 	responsesMu     sync.Mutex
-	responseHistory map[string]storedResponse
-	responseBytes   int
+	responseHistory map[string]*storedResponse
+	responseBytes   int64
+	responseOrder   responseHistoryHeap
+	responseExpiry  responseExpiryHeap
+	responsePolicy  responsehistory.Policy
 	unlockRateMu    sync.Mutex
 	unlockAttempts  map[string]unlockAttempt
 	// 全局解锁失败窗口（跨 IP），见 recordGlobalUnlockFailureLocked。
@@ -249,24 +254,15 @@ type unlockAttempt struct {
 	blockedUntil time.Time
 }
 
-type storedResponse struct {
-	messages  []map[string]any
-	parentID  string
-	routeKey  string
-	expiresAt time.Time
-	size      int
-}
-
 type storedResponseWire struct {
-	Messages []map[string]any `json:"messages"`
-	ParentID string           `json:"parent_id,omitempty"`
-	RouteKey string           `json:"route_key"`
+	Messages  []map[string]any `json:"messages"`
+	ParentID  string           `json:"parent_id,omitempty"`
+	RouteKey  string           `json:"route_key"`
+	CreatedAt int64            `json:"created_at_unix_ms,omitempty"`
+	ExpiresAt int64            `json:"expires_at_unix_ms,omitempty"`
 }
 
 const (
-	responseHistoryTTL      = time.Hour
-	maxResponseHistory      = 1024
-	maxResponseHistoryBytes = 64 << 20
 	// defaultMaxRequestBodyBytes 请求体大小上限的默认值（8 MB）。运行时
 	// 上限存在 h.maxRequestBody（WebUI 可改），这里只作为 Config 未注入 /
 	// 零值时的兜底，以及与新上限联动校验的常量基准。
@@ -296,7 +292,15 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]*storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
+	policy := cfg.ResponseHistory
+	if policy == (responsehistory.Policy{}) {
+		policy = responsehistory.Default()
+	}
+	if err := policy.Validate(); err != nil {
+		panic(err) // main validates configuration before constructing a handler.
+	}
+	h.setResponseHistoryPolicy(policy)
 	if h.cfg.Traffic == nil {
 		h.cfg.Traffic = traffic.New(nil)
 	}
@@ -1202,14 +1206,15 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	// 回显运行时的实际限制，包含环境变量和旧配置键的兼容结果。
 	c.MaxRequestBodyMB = h.currentMaxRequestBody() / 1_000_000
 	resp := struct {
-		Schedule   any `json:"schedule"`
-		Region     any `json:"region"`
-		Features   any `json:"features"`
-		Billing    any `json:"billing"`
-		Upstream   any `json:"upstream"`
-		SMS        any `json:"sms"`
-		AutoEnroll any `json:"autoenroll"`
-		Retention  any `json:"request_log_retention"`
+		Schedule        any `json:"schedule"`
+		Region          any `json:"region"`
+		Features        any `json:"features"`
+		Billing         any `json:"billing"`
+		Upstream        any `json:"upstream"`
+		SMS             any `json:"sms"`
+		AutoEnroll      any `json:"autoenroll"`
+		Retention       any `json:"request_log_retention"`
+		ResponseHistory any `json:"response_history"`
 		// MaxRequestBodyMB 对前端组装成嵌套对象（与 POST 补丁形状一致）。
 		MaxRequestBody any `json:"max_request_body"`
 	}{
@@ -1240,8 +1245,9 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 				"h5": h.h5SessionEcho(c.SMS.Haozhuma.H5Session),
 			},
 		},
-		AutoEnroll: h.autoenrollEcho(c.AutoEnroll),
-		Retention:  map[string]int{"days": c.RetentionDays, "rows": c.RetentionRows},
+		AutoEnroll:      h.autoenrollEcho(c.AutoEnroll),
+		Retention:       map[string]int{"days": c.RetentionDays, "rows": c.RetentionRows},
+		ResponseHistory: h.currentResponseHistoryPolicy(),
 		MaxRequestBody: map[string]int{
 			"mb":         c.MaxRequestBodyMB,
 			"min_mb":     minWebRequestBodyBytes / 1_000_000,
@@ -1434,26 +1440,35 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		KeepaliveHours []int `json:"keepalive_hours"`
 		// Schedule 完整排程补丁（五类任务时点 + 开关）。指针语义：nil = 未提供
 		// （保留 config.json 现值），给出数组 = 整体替换该时点集。
-		TravelHours           *[]int               `json:"travel_hours"`
-		ActivityHours         *[]int               `json:"activity_hours"`
-		BlackcatHours         *[]int               `json:"blackcat_hours"`
-		CheckinEnabled        *bool                `json:"checkin_enabled"`
-		TravelEnabled         *bool                `json:"travel_enabled"`
-		ActivityEnabled       *bool                `json:"activity_enabled"`
-		KeepaliveEnabled      *bool                `json:"keepalive_enabled"`
-		BlackcatEnabled       *bool                `json:"blackcat_enabled"`
-		AutoenrollGrowthTasks *bool                `json:"autoenroll_growth_tasks"`
-		Features              *featuresPatch       `json:"features"`
-		Billing               *billingPatch        `json:"billing"`
-		Upstream              *upstreamPatch       `json:"upstream"`
-		SMS                   *smsPatch            `json:"sms"`
-		AutoEnrollCfg         *autoEnrollPatch     `json:"autoenroll"`
-		Retention             *retentionPatch      `json:"request_log_retention"`
-		MaxRequestBody        *maxRequestBodyPatch `json:"max_request_body"`
+		TravelHours           *[]int                `json:"travel_hours"`
+		ActivityHours         *[]int                `json:"activity_hours"`
+		BlackcatHours         *[]int                `json:"blackcat_hours"`
+		CheckinEnabled        *bool                 `json:"checkin_enabled"`
+		TravelEnabled         *bool                 `json:"travel_enabled"`
+		ActivityEnabled       *bool                 `json:"activity_enabled"`
+		KeepaliveEnabled      *bool                 `json:"keepalive_enabled"`
+		BlackcatEnabled       *bool                 `json:"blackcat_enabled"`
+		AutoenrollGrowthTasks *bool                 `json:"autoenroll_growth_tasks"`
+		Features              *featuresPatch        `json:"features"`
+		Billing               *billingPatch         `json:"billing"`
+		Upstream              *upstreamPatch        `json:"upstream"`
+		SMS                   *smsPatch             `json:"sms"`
+		AutoEnrollCfg         *autoEnrollPatch      `json:"autoenroll"`
+		Retention             *retentionPatch       `json:"request_log_retention"`
+		ResponseHistory       *responseHistoryPatch `json:"response_history"`
+		MaxRequestBody        *maxRequestBodyPatch  `json:"max_request_body"`
 	}
 	if json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&req) != nil {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
+	}
+	var historyPolicy responsehistory.Policy
+	if req.ResponseHistory != nil {
+		historyPolicy = req.ResponseHistory.apply(h.currentResponseHistoryPolicy())
+		if err := historyPolicy.Validate(); err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 	// 旧前端的 mib 作为键名别名保留，数值统一按 MB 解释。
 	if req.MaxRequestBody != nil && req.MaxRequestBody.MB == nil {
@@ -1873,6 +1888,9 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		delete(doc, "max_request_body_mib")
 	}
 
+	if req.ResponseHistory != nil {
+		doc["response_history"] = historyPolicy
+	}
 	out, _ := json.MarshalIndent(doc, "", "  ")
 	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
@@ -2092,6 +2110,13 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		} else {
 			updated["request_log_retention"] = map[string]int{"days": days, "rows": rows}
 			updated["request_log_retention_restart_required"] = true
+		}
+	}
+	if req.ResponseHistory != nil {
+		remoteApplied := h.setResponseHistoryPolicy(historyPolicy)
+		updated["response_history"] = historyPolicy
+		if !remoteApplied {
+			updated["response_history_remote_pending"] = true
 		}
 	}
 	// 请求体上限即时生效：改的是 handler 自己的运行时副本（featuresMu 保护），
@@ -3972,101 +3997,16 @@ func (h *Handler) loadResponseHistory(id string) ([]map[string]any, string, bool
 			return nil, "", false
 		}
 		if routeKey == "" {
-			routeKey = record.routeKey
+			routeKey = record.RouteKey
 		}
-		turns = append(turns, record.messages)
-		id = record.parentID
+		turns = append(turns, record.Messages)
+		id = record.ParentID
 	}
 	history := make([]map[string]any, 0)
 	for i := len(turns) - 1; i >= 0; i-- {
 		history = append(history, turns[i]...)
 	}
 	return history, routeKey, true
-}
-
-func (h *Handler) loadResponseRecord(id string) (storedResponse, bool) {
-	now := time.Now()
-	h.responsesMu.Lock()
-	record, ok := h.responseHistory[id]
-	if ok && now.After(record.expiresAt) {
-		h.deleteResponseLocked(id)
-		ok = false
-	}
-	h.responsesMu.Unlock()
-	if ok {
-		return record, true
-	}
-	if h.cfg.ResponseStore == nil {
-		return storedResponse{}, false
-	}
-	raw, ok := h.cfg.ResponseStore.LoadResponse(id)
-	if !ok {
-		return storedResponse{}, false
-	}
-	var persisted storedResponseWire
-	if json.Unmarshal(raw, &persisted) != nil || len(persisted.Messages) == 0 || persisted.RouteKey == "" {
-		return storedResponse{}, false
-	}
-	record = storedResponse{
-		messages: persisted.Messages, parentID: persisted.ParentID, routeKey: persisted.RouteKey,
-		expiresAt: now.Add(responseHistoryTTL), size: len(raw),
-	}
-	h.cacheResponse(id, record)
-	return record, true
-}
-
-func (h *Handler) storeResponse(id string, messages []map[string]any, routeKey, parentID string) {
-	now := time.Now()
-	raw, _ := json.Marshal(messages)
-	h.cacheResponse(id, storedResponse{
-		messages: append([]map[string]any{}, messages...), parentID: parentID, routeKey: routeKey,
-		expiresAt: now.Add(responseHistoryTTL), size: len(raw),
-	})
-	if h.cfg.ResponseStore != nil {
-		persisted, err := json.Marshal(storedResponseWire{Messages: messages, ParentID: parentID, RouteKey: routeKey})
-		if err == nil {
-			h.cfg.ResponseStore.SaveResponse(id, persisted, responseHistoryTTL)
-		}
-	}
-}
-
-func (h *Handler) cacheResponse(id string, record storedResponse) {
-	now := time.Now()
-	h.responsesMu.Lock()
-	defer h.responsesMu.Unlock()
-	if _, exists := h.responseHistory[id]; exists {
-		h.deleteResponseLocked(id)
-	}
-	for key, record := range h.responseHistory {
-		if now.After(record.expiresAt) {
-			h.deleteResponseLocked(key)
-		}
-	}
-	for len(h.responseHistory) >= maxResponseHistory || h.responseBytes+record.size > maxResponseHistoryBytes {
-		var oldestID string
-		var oldest time.Time
-		for key, record := range h.responseHistory {
-			if oldestID == "" || record.expiresAt.Before(oldest) {
-				oldestID, oldest = key, record.expiresAt
-			}
-		}
-		if oldestID == "" {
-			break
-		}
-		h.deleteResponseLocked(oldestID)
-	}
-	if record.size > maxResponseHistoryBytes {
-		return
-	}
-	h.responseHistory[id] = record
-	h.responseBytes += record.size
-}
-
-func (h *Handler) deleteResponseLocked(id string) {
-	if record, ok := h.responseHistory[id]; ok {
-		h.responseBytes -= record.size
-		delete(h.responseHistory, id)
-	}
 }
 
 // responsesToChat 把 Responses API 请求转成 chat 请求体。返回值额外带出
