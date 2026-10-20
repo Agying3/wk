@@ -71,7 +71,7 @@ func redisHistoryPayload(t *testing.T, body string, ttl time.Duration) []byte {
 
 func TestResponseHistoryRedisSharedBudget(t *testing.T) {
 	u := newHistoryRedisTest(t)
-	p := responsehistory.Policy{TTLSeconds: 3600, MaxEntries: 2, MaxStorageMB: 1}
+	p := responsehistory.Policy{TTLSeconds: 3600, MaxEntries: 2, MaxStorageMB: 1, MaxEntryMB: 32}
 	if err := u.ConfigureResponses(p); err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +110,88 @@ func TestResponseHistoryRedisSharedBudget(t *testing.T) {
 	}
 	if n := u.client.HLen(context.Background(), responseHistoryKeys[0]).Val(); n != 1 {
 		t.Fatalf("resize left %d records", n)
+	}
+}
+
+func TestResponseHistoryRedisIndependentEntryLimit(t *testing.T) {
+	u := newHistoryRedisTest(t)
+	p := responsehistory.Default()
+	p.MaxStorageMB, p.MaxEntryMB = 8, 2
+	if err := u.ConfigureResponses(p); err != nil {
+		t.Fatal(err)
+	}
+	for id, size := range map[string]int{"small-a": 300000, "large": 1500000, "small-b": 300000} {
+		u.SaveResponse(id, redisHistoryPayload(t, strings.Repeat("x", size), time.Hour), time.Hour)
+	}
+	waitHistoryWrites(t, u)
+	ctx := context.Background()
+	before := u.client.Get(ctx, responseHistoryKeys[4]).Val()
+	u.SaveResponse("oversized", redisHistoryPayload(t, strings.Repeat("x", 2100000), time.Hour), time.Hour)
+	waitHistoryWrites(t, u)
+	if u.client.HLen(ctx, responseHistoryKeys[0]).Val() != 3 || u.client.Get(ctx, responseHistoryKeys[4]).Val() != before {
+		t.Fatal("per-entry rejection changed useful shared history")
+	}
+	other := &Upstash{client: redis.NewClient(u.client.Options())}
+	defer other.client.Close()
+	p.MaxEntryMB = 1
+	if err := other.ConfigureResponses(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := u.LoadResponse("large"); ok {
+		t.Fatal("entry limit shrink left oversized shared history")
+	}
+	var used int64
+	for _, id := range []string{"small-a", "small-b"} {
+		if _, ok := u.LoadResponse(id); !ok {
+			t.Fatal("entry limit shrink removed valid history")
+		}
+		used += u.client.HStrLen(ctx, responseHistoryKeys[0], id).Val()
+	}
+	if got := u.client.Get(ctx, responseHistoryKeys[4]).Val(); got != fmt.Sprint(used) {
+		t.Fatalf("incorrect shared byte accounting after prune: %s want %d", got, used)
+	}
+	// A stale replica's writer must obey the latest shared per-entry policy.
+	u.SaveResponse("stale-writer", redisHistoryPayload(t, strings.Repeat("x", 1100000), time.Hour), time.Hour)
+	waitHistoryWrites(t, u)
+	if _, ok := other.LoadResponse("stale-writer"); ok {
+		t.Fatal("another replica bypassed the new entry limit")
+	}
+	p.MaxEntryMB, p.MaxStorageMB = 4, 1
+	if err := other.ConfigureResponses(p); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"new-a", "new-b"} {
+		u.SaveResponse(id, redisHistoryPayload(t, strings.Repeat("x", 600000), time.Hour), time.Hour)
+		waitHistoryWrites(t, u)
+	}
+	if _, ok := other.LoadResponse("new-a"); ok {
+		t.Fatal("larger entry limit bypassed the total budget")
+	}
+	if _, ok := other.LoadResponse("new-b"); !ok {
+		t.Fatal("latest record lost under independent total budget")
+	}
+}
+
+func TestResponseHistoryRedisEntryLimitAppliesToMigration(t *testing.T) {
+	u := newHistoryRedisTest(t)
+	ctx := context.Background()
+	legacyID := fmt.Sprintf("oversized-migration-%d", time.Now().UnixNano())
+	legacyKey := responsePrefix + legacyID
+	legacy, _ := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "user", "content": strings.Repeat("x", 1100000)}}, "route_key": "route"})
+	if err := u.client.Set(ctx, legacyKey, legacy, time.Hour).Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { u.client.Del(ctx, legacyKey) })
+	p := responsehistory.Default()
+	p.MaxEntryMB = 1
+	if err := u.ConfigureResponses(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := u.LoadResponse(legacyID); ok {
+		t.Fatal("legacy migration bypassed single-entry limit")
+	}
+	if u.client.Exists(ctx, legacyKey).Val() != 0 {
+		t.Fatal("oversized legacy key was left outside the configured budget")
 	}
 }
 

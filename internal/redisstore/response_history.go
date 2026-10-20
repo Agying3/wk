@@ -33,22 +33,28 @@ local function remove(member)
   redis.call('HDEL', KEYS[4], member)
 end
 if mode == 'configure' then
-  redis.call('HSET', KEYS[6], 'ttl', ARGV[4], 'entries', ARGV[5], 'bytes', ARGV[6])
+  redis.call('HSET', KEYS[6], 'ttl', ARGV[4], 'entries', ARGV[5], 'bytes', ARGV[6], 'entry_bytes', ARGV[9] or '32000000')
 end
 local ttl = tonumber(redis.call('HGET', KEYS[6], 'ttl') or '3600000')
 local maxEntries = tonumber(redis.call('HGET', KEYS[6], 'entries') or '1024')
 local maxBytes = tonumber(redis.call('HGET', KEYS[6], 'bytes') or '64000000')
+local maxEntryBytes = tonumber(redis.call('HGET', KEYS[6], 'entry_bytes') or '32000000')
 if mode == 'configure' then
   local entries = redis.call('ZRANGE', KEYS[2], 0, -1, 'WITHSCORES')
   for i = 1, #entries, 2 do
-    local expiry = tonumber(redis.call('ZSCORE', KEYS[3], entries[i]) or '0')
-    redis.call('ZADD', KEYS[3], math.min(expiry, tonumber(entries[i+1]) + ttl), entries[i])
+    local size = tonumber(redis.call('HGET', KEYS[4], entries[i]) or '0')
+    if size > maxEntryBytes then
+      remove(entries[i])
+    else
+      local expiry = tonumber(redis.call('ZSCORE', KEYS[3], entries[i]) or '0')
+      redis.call('ZADD', KEYS[3], math.min(expiry, tonumber(entries[i+1]) + ttl), entries[i])
+    end
   end
 end
 for _, member in ipairs(redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now)) do remove(member) end
 if mode == 'save' or mode == 'migrate' then
   -- Oversized records must not evict unrelated useful history.
-  if #data <= maxBytes then
+  if #data <= maxBytes and #data <= maxEntryBytes then
     remove(id)
     local birth = tonumber(ARGV[8])
     local expiry = math.min(now + tonumber(ARGV[7]), birth + ttl)
@@ -93,7 +99,7 @@ func (u *Upstash) ConfigureResponses(p responsehistory.Policy) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := responseHistoryScript.Run(ctx, u.client, responseHistoryKeys,
-		"configure", "", "", p.TTL().Milliseconds(), p.MaxEntries, p.MaxBytes(), 0).Err(); err != nil {
+		"configure", "", "", p.TTL().Milliseconds(), p.MaxEntries, p.MaxBytes(), 0, 0, p.MaxEntryBytes()).Err(); err != nil {
 		return err
 	}
 	// Import old per-key history once during upgrade, preserving remaining TTL.

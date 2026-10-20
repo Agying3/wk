@@ -22,7 +22,7 @@ func historyMessages(text string) []map[string]any {
 func TestResponseHistoryConfigAndImmediateResize(t *testing.T) {
 	h, path := adminConfigTestEnv(t)
 	got := doAdminConfig(t, h, http.MethodGet, nil)["response_history"].(map[string]any)
-	if got["ttl_seconds"] != float64(3600) || got["max_entries"] != float64(1024) || got["max_storage_mb"] != float64(64) {
+	if got["ttl_seconds"] != float64(3600) || got["max_entries"] != float64(1024) || got["max_storage_mb"] != float64(64) || got["max_entry_mb"] != float64(32) {
 		t.Fatalf("defaults: %v", got)
 	}
 	for _, id := range []string{"a", "b", "c"} {
@@ -43,7 +43,7 @@ func TestResponseHistoryConfigAndImmediateResize(t *testing.T) {
 		"checkin_hours": []int{9}, "keepalive_hours": []int{22},
 		"response_history": map[string]any{"max_entries": 100000},
 	})
-	want := responsehistory.Policy{TTLSeconds: 604800, MaxEntries: 100000, MaxStorageMB: 256}
+	want := responsehistory.Policy{TTLSeconds: 604800, MaxEntries: 100000, MaxStorageMB: 256, MaxEntryMB: 32}
 	if p := h.currentResponseHistoryPolicy(); p != want {
 		t.Fatalf("policy=%+v want %+v", p, want)
 	}
@@ -67,6 +67,8 @@ func TestResponseHistoryRejectsInvalidConfigWithoutChanges(t *testing.T) {
 		`{"max_entries":0}`, `{"max_entries":-1}`, `{"max_entries":1000000001}`,
 		`{"max_storage_mb":0}`, `{"max_storage_mb":-1}`, `{"max_storage_mb":1000000001}`,
 		`{"max_entries":1.5}`, `{"max_storage_mb":"64"}`,
+		`{"max_entry_mb":0}`, `{"max_entry_mb":-1}`, `{"max_entry_mb":1000000001}`,
+		`{"max_entry_mb":1.5}`, `{"max_entry_mb":"32"}`,
 	} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/config", strings.NewReader(
@@ -82,7 +84,7 @@ func TestResponseHistoryRejectsInvalidConfigWithoutChanges(t *testing.T) {
 }
 
 func TestResponseHistoryLargerLimitsAndTotalBudget(t *testing.T) {
-	p := responsehistory.Policy{TTLSeconds: 604800, MaxEntries: 2048, MaxStorageMB: 2}
+	p := responsehistory.Policy{TTLSeconds: 604800, MaxEntries: 2048, MaxStorageMB: 2, MaxEntryMB: 32}
 	h := newTestHandler(t, Config{ResponseHistory: p})
 	for i := 0; i < 1100; i++ {
 		h.storeResponse(time.Unix(int64(i), 0).String(), historyMessages("hello"), "route", "")
@@ -110,6 +112,78 @@ func TestResponseHistoryLargerLimitsAndTotalBudget(t *testing.T) {
 	h.storeResponse("oversized", historyMessages(strings.Repeat("z", 1100000)), "route", "")
 	if h.responseBytes != before || h.responseHistory["large-b"] == nil {
 		t.Fatal("oversized insertion evicted useful history")
+	}
+}
+
+func TestResponseHistoryIndependentEntryLimitAndImmediateResize(t *testing.T) {
+	h, path := adminConfigTestEnv(t)
+	update := func(patch map[string]any) {
+		doAdminConfig(t, h, http.MethodPost, map[string]any{
+			"checkin_hours": []int{9}, "keepalive_hours": []int{22}, "response_history": patch,
+		})
+	}
+	update(map[string]any{"max_storage_mb": 8, "max_entry_mb": 2})
+	h.storeResponse("small-a", historyMessages(strings.Repeat("a", 300000)), "route", "")
+	h.storeResponse("large", historyMessages(strings.Repeat("b", 1500000)), "route", "")
+	h.storeResponse("small-b", historyMessages(strings.Repeat("c", 300000)), "route", "")
+	if len(h.responseHistory) != 3 {
+		t.Fatal("records below the independent entry limit were not stored")
+	}
+	before := h.responseBytes
+	h.storeResponse("too-large", historyMessages(strings.Repeat("x", 2100000)), "route", "")
+	if h.responseBytes != before || len(h.responseHistory) != 3 {
+		t.Fatal("oversized insertion evicted useful records despite a free total budget")
+	}
+	// Editing only the entry limit must preserve the independent total budget.
+	update(map[string]any{"max_entry_mb": 1})
+	if h.responseHistory["large"] != nil || h.responseHistory["small-a"] == nil || h.responseHistory["small-b"] == nil {
+		t.Fatal("shrinking entry limit did not prune exactly the oversized record")
+	}
+	var used int64
+	for _, r := range h.responseHistory {
+		used += int64(len(r.raw))
+	}
+	if used != h.responseBytes {
+		t.Fatal("entry pruning broke byte accounting")
+	}
+	var saved struct {
+		History responsehistory.Policy `json:"response_history"`
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(raw, &saved) != nil || saved.History.MaxEntryMB != 1 || saved.History.MaxStorageMB != 8 {
+		t.Fatalf("independent limits were not persisted: %+v err=%v", saved, err)
+	}
+	update(map[string]any{"max_entry_mb": 4})
+	if _, _, ok := h.loadResponseHistory("large"); ok {
+		t.Fatal("raising the entry limit revived discarded history")
+	}
+	update(map[string]any{"max_storage_mb": 1})
+	if h.currentResponseHistoryPolicy().MaxEntryMB != 4 {
+		t.Fatal("editing total budget changed entry limit")
+	}
+	h.storeResponse("new-a", historyMessages(strings.Repeat("d", 600000)), "route", "")
+	h.storeResponse("new-b", historyMessages(strings.Repeat("e", 600000)), "route", "")
+	if h.responseHistory["new-b"] == nil || h.responseHistory["new-a"] != nil || h.responseBytes > 1000000 {
+		t.Fatal("total budget was bypassed by a larger per-entry limit")
+	}
+}
+
+func TestResponseHistoryEntryBoundaryAndRemoteRefill(t *testing.T) {
+	p := responsehistory.Default()
+	p.MaxEntryMB = 1
+	h := newTestHandler(t, Config{ResponseHistory: p})
+	now := time.Now()
+	if !h.cacheResponse("fits", make([]byte, 1000000), now, now.Add(time.Hour)) {
+		t.Fatal("exact decimal MB boundary was rejected")
+	}
+	if h.cacheResponse("oversized", make([]byte, 1000001), now, now.Add(time.Hour)) || h.responseBytes != 1000000 {
+		t.Fatal("entry boundary accepted an oversized payload or evicted existing data")
+	}
+	wire := storedResponseWire{Messages: historyMessages(strings.Repeat("x", 1100000)), RouteKey: "route", CreatedAt: now.UnixMilli(), ExpiresAt: now.Add(time.Hour).UnixMilli()}
+	raw, _ := json.Marshal(wire)
+	remote := newTestHandler(t, Config{ResponseHistory: p, ResponseStore: staticHistoryStore{raw: raw}})
+	if _, _, ok := remote.loadResponseHistory("large"); ok || remote.responseBytes != 0 {
+		t.Fatal("remote refill bypassed the entry limit")
 	}
 }
 

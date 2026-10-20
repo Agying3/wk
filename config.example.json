@@ -11,7 +11,8 @@
   "response_history": {
     "ttl_seconds": 3600,
     "max_entries": 1024,
-    "max_storage_mb": 64
+    "max_storage_mb": 64,
+    "max_entry_mb": 32
   },
   "cooldown": {
     "soft_rate": "60s"

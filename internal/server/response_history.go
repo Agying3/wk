@@ -81,6 +81,7 @@ type responseHistoryPatch struct {
 	TTLSeconds   *int64 `json:"ttl_seconds"`
 	MaxEntries   *int   `json:"max_entries"`
 	MaxStorageMB *int64 `json:"max_storage_mb"`
+	MaxEntryMB   *int64 `json:"max_entry_mb"`
 }
 
 func (p responseHistoryPatch) apply(current responsehistory.Policy) responsehistory.Policy {
@@ -92,6 +93,9 @@ func (p responseHistoryPatch) apply(current responsehistory.Policy) responsehist
 	}
 	if p.MaxStorageMB != nil {
 		current.MaxStorageMB = *p.MaxStorageMB
+	}
+	if p.MaxEntryMB != nil {
+		current.MaxEntryMB = *p.MaxEntryMB
 	}
 	return current
 }
@@ -116,6 +120,11 @@ func (h *Handler) setResponseHistoryPolicy(p responsehistory.Policy) bool {
 		}
 	}
 	heap.Init(&h.responseExpiry)
+	for id, r := range h.responseHistory {
+		if int64(len(r.raw)) > p.MaxEntryBytes() {
+			h.deleteResponseLocked(id)
+		}
+	}
 	h.trimResponsesLocked(now)
 	h.responsesMu.Unlock()
 	if store, ok := h.cfg.ResponseStore.(responsePolicyStore); ok {
@@ -191,7 +200,7 @@ func (h *Handler) cacheResponse(id string, raw []byte, created, expires time.Tim
 		expires = deadline
 	}
 	// Reject a single oversized record before evicting useful existing entries.
-	if !now.Before(expires) || int64(len(raw)) > p.MaxBytes() {
+	if !now.Before(expires) || int64(len(raw)) > p.MaxBytes() || int64(len(raw)) > p.MaxEntryBytes() {
 		return false
 	}
 	h.deleteResponseLocked(id)

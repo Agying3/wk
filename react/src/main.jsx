@@ -967,6 +967,7 @@ function Console() {
             <Card title="Responses 会话历史存储">
               <Paragraph type="secondary" style={{ margin: '0 0 12px' }}>
                 用于 previous_response_id 接续对话。保存时间、历史条数和总容量同时生效，达到任一上限会清理旧记录。
+                单条历史上限独立控制每轮记录的大小，超限记录不保存。
                 保存后即时生效，调小限制会立即清理；调大保存时间只影响新记录。
                 容量按历史正文的 JSON 字节数计算（1 MB = 1,000,000 字节），不包含存储引擎和程序自身的额外开销。
                 配置 Redis 时，共享历史与每个实例的内存缓存分别受此上限约束。
@@ -974,6 +975,7 @@ function Console() {
               <Form
                 layout="inline"
                 key={JSON.stringify(config.response_history)}
+                style={{ rowGap: 12 }}
                 initialValues={config.response_history}
                 onFinish={saveResponseHistory}
               >
@@ -986,10 +988,13 @@ function Console() {
                 <Form.Item name="max_storage_mb" label="总存储上限" rules={[{ required: true, message: '请输入总容量' }]}>
                   <InputNumber min={1} max={1000000000} precision={0} style={{ width: 180 }} addonAfter="MB" />
                 </Form.Item>
+                <Form.Item name="max_entry_mb" label="单条历史上限" rules={[{ required: true, message: '请输入单条历史容量' }]}>
+                  <InputNumber min={1} max={1000000000} precision={0} style={{ width: 180 }} addonAfter="MB" />
+                </Form.Item>
                 <Button type="primary" htmlType="submit">保存会话历史设置</Button>
               </Form>
               <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
-                一条记录对应一轮响应及其新增输入；超过总容量的单条记录不保存。父记录过期或被淘汰后，其后续响应 ID 也无法恢复完整对话。
+                一条记录对应一轮响应及其新增输入，单条上限默认 32 MB。单条上限与总存储上限分别生效，超过任一容量上限的记录不保存，也不会因此挤出其他历史。父记录过期或被淘汰后，其后续响应 ID 也无法恢复完整对话。
               </Paragraph>
             </Card>
           )}
