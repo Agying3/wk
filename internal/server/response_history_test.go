@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -273,44 +274,123 @@ func TestResponseHistoryRemoteRefillPreservesExpiration(t *testing.T) {
 }
 
 func TestResponseHistoryHTTPContinuation(t *testing.T) {
-	for _, stream := range []bool{false, true} {
-		t.Run(fmt.Sprint(stream), func(t *testing.T) {
-			count := 0
-			up := newFakeUpstream(t, func(string) (int, string, bool) {
-				count++
-				return 200, strings.ReplaceAll(sseOK, "chatcmpl-1", fmt.Sprintf("history-%d", count)), true
+	for _, disk := range []bool{false, true} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("disk=%v/stream=%v", disk, stream), func(t *testing.T) {
+				count := 0
+				up := newFakeUpstream(t, func(string) (int, string, bool) {
+					count++
+					return 200, strings.ReplaceAll(sseOK, "chatcmpl-1", fmt.Sprintf("history-%d", count)), true
+				})
+				base := up.HTTP.Transport
+				var upstreamMessages []any
+				up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					var doc map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&doc); err != nil {
+						t.Fatal(err)
+					}
+					upstreamMessages, _ = doc["messages"].([]any)
+					return base.RoundTrip(r)
+				})
+				cfg := Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "fake", ExpiresAt: 9999999999}), Upstream: up}
+				path := filepath.Join(t.TempDir(), "responses.db")
+				var archive *responsehistory.SQLStore
+				newHandler := func() authedHandler {
+					if disk {
+						if archive != nil {
+							archive.Close()
+						}
+						var err error
+						archive, err = responsehistory.OpenSQLite(path, responsehistory.Default(), nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						cfg.ResponseStore = archive
+						t.Cleanup(func() { archive.Close() })
+					}
+					return newTestHandler(t, cfg)
+				}
+				h := newHandler()
+				for turn := 1; turn <= 3; turn++ {
+					if disk && turn > 1 {
+						h = newHandler()
+					}
+					request := map[string]any{"model": "glm-5.2", "input": fmt.Sprintf("q%d", turn), "stream": stream, "instructions": "current instruction"}
+					if turn > 1 {
+						request["previous_response_id"] = fmt.Sprintf("history-%d", turn-1)
+					}
+					body, _ := json.Marshal(request)
+					rec := doResponsesRequest(h, string(body))
+					if rec.Code != 200 {
+						t.Fatalf("turn %d: %d %s", turn, rec.Code, rec.Body)
+					}
+					if len(upstreamMessages) != turn*2 {
+						t.Fatalf("turn %d restored %d messages: %v", turn, len(upstreamMessages), upstreamMessages)
+					}
+					if first := upstreamMessages[0].(map[string]any); first["content"] != "current instruction" {
+						t.Fatal("instructions misplaced")
+					}
+					if stream && !strings.Contains(rec.Body.String(), "response.completed") {
+						t.Fatal("stream did not complete")
+					}
+				}
 			})
-			base := up.HTTP.Transport
-			var upstreamMessages []any
-			up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				var doc map[string]any
-				if err := json.NewDecoder(r.Body).Decode(&doc); err != nil {
-					t.Fatal(err)
-				}
-				upstreamMessages, _ = doc["messages"].([]any)
-				return base.RoundTrip(r)
-			})
-			h := newTestHandler(t, Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "fake", ExpiresAt: 9999999999}), Upstream: up})
-			for turn := 1; turn <= 3; turn++ {
-				request := map[string]any{"model": "glm-5.2", "input": fmt.Sprintf("q%d", turn), "stream": stream, "instructions": "current instruction"}
-				if turn > 1 {
-					request["previous_response_id"] = fmt.Sprintf("history-%d", turn-1)
-				}
-				body, _ := json.Marshal(request)
-				rec := doResponsesRequest(h, string(body))
-				if rec.Code != 200 {
-					t.Fatalf("turn %d: %d %s", turn, rec.Code, rec.Body)
-				}
-				if len(upstreamMessages) != turn*2 {
-					t.Fatalf("turn %d restored %d messages: %v", turn, len(upstreamMessages), upstreamMessages)
-				}
-				if first := upstreamMessages[0].(map[string]any); first["content"] != "current instruction" {
-					t.Fatal("instructions misplaced")
-				}
-				if stream && !strings.Contains(rec.Body.String(), "response.completed") {
-					t.Fatal("stream did not complete")
-				}
-			}
-		})
+		}
+	}
+}
+
+func TestResponseHistoryDiskMetadataAndRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "responses.db")
+	p := responsehistory.Default()
+	s, err := responsehistory.OpenSQLite(path, p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newTestHandler(t, Config{ResponseStore: s})
+	messages := []map[string]any{
+		{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": strings.Repeat("中文\n", 10000)},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA=="}},
+		}},
+		{"role": "assistant", "content": "", "tool_calls": []any{
+			map[string]any{"id": "call-1", "type": "function", "function": map[string]any{"name": "f", "arguments": `{ "x": "a\\b" }`}},
+		}},
+	}
+	want, _ := json.Marshal(messages)
+	h.storeResponse("disk-parent", messages, "stable-route", "")
+	if r := h.responseHistory["disk-parent"]; r == nil || r.raw != nil || r.size == 0 || h.responseBytes != r.size {
+		t.Fatal("body retained in index")
+	}
+	messages[0]["content"] = "mutated after save"
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = responsehistory.OpenSQLite(path, p, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h = newTestHandler(t, Config{ResponseStore: s})
+	h.storeResponse("disk-child", historyMessages("next turn"), "stable-route", "disk-parent")
+	got, route, ok := h.loadResponseHistory("disk-child")
+	if !ok || route != "stable-route" || len(got) != 4 {
+		t.Fatalf("restart continuation: %s %v %d", route, ok, len(got))
+	}
+	actual, _ := json.Marshal(got[:2])
+	if string(actual) != string(want) {
+		t.Fatal("image/tool/text history changed")
+	}
+	for _, r := range h.responseHistory {
+		if r.raw != nil {
+			t.Fatal("refill retained body")
+		}
+	}
+	// Another instance can evict an entry; an old RAM index cannot serve it.
+	p.MaxEntries = 1
+	if err := s.ConfigureResponses(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := h.loadResponseRecord("disk-parent"); ok {
+		t.Fatal("RAM index bypassed database eviction")
 	}
 }

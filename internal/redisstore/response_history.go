@@ -216,8 +216,11 @@ func (u *Upstash) LoadResponse(id string) ([]byte, bool) {
 	if err != nil && err != redis.Nil {
 		log.Printf("[redisstore] response history read failed: %v", err)
 	}
-	if err != nil || len(values) != 2 {
+	if err != nil && err != redis.Nil {
 		return nil, false
+	}
+	if len(values) != 2 {
+		return u.loadLegacyResponse(ctx, id)
 	}
 	raw, valid := values[0].(string)
 	expires, validExpiry := values[1].(int64)
@@ -231,4 +234,29 @@ func (u *Upstash) LoadResponse(id string) ([]byte, bool) {
 	doc["expires_at_unix_ms"] = json.RawMessage(strconv.FormatInt(expires, 10))
 	payload, err := json.Marshal(doc)
 	return payload, err == nil
+}
+
+// Read the pre-budget per-key format lazily without a SCAN or a Redis rewrite.
+// Those records used a fixed one-hour TTL and lacked timestamp fields.
+func (u *Upstash) loadLegacyResponse(ctx context.Context, id string) ([]byte, bool) {
+	started := time.Now()
+	pipe := u.client.Pipeline()
+	value := pipe.Get(ctx, responsePrefix+id)
+	ttl := pipe.PTTL(ctx, responsePrefix+id)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, false
+	}
+	remaining, err := ttl.Result()
+	if err != nil || remaining <= 0 {
+		return nil, false
+	}
+	deadline := started.Add(remaining)
+	var doc map[string]json.RawMessage
+	if json.Unmarshal([]byte(value.Val()), &doc) != nil || doc == nil {
+		return nil, false
+	}
+	doc["created_at_unix_ms"] = json.RawMessage(strconv.FormatInt(deadline.Add(-time.Hour).UnixMilli(), 10))
+	doc["expires_at_unix_ms"] = json.RawMessage(strconv.FormatInt(deadline.UnixMilli(), 10))
+	raw, err := json.Marshal(doc)
+	return raw, err == nil
 }

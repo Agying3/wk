@@ -6,7 +6,8 @@ import (
 	"time"
 )
 
-// Policy limits serialized transcript payloads, not allocator or Redis overhead.
+// Policy limits uncompressed serialized transcript payloads, not physical SQL
+// storage, indexes, codec workspaces or allocator overhead.
 // Every field must be positive; omitted fields are supplied by Default.
 type Policy struct {
 	TTLSeconds   int64 `json:"ttl_seconds"`

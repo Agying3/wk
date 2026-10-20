@@ -187,7 +187,7 @@ type Config struct {
 	MaxRequestBodyBytes int
 }
 
-// ResponseStore is the optional Redis-backed persistence used by
+// ResponseStore is the optional persistence used by
 // previous_response_id across restarts and replicas.
 type ResponseStore interface {
 	SaveResponse(id string, data []byte, ttl time.Duration)
@@ -1206,15 +1206,16 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 	// 回显运行时的实际限制，包含环境变量和旧配置键的兼容结果。
 	c.MaxRequestBodyMB = h.currentMaxRequestBody() / 1_000_000
 	resp := struct {
-		Schedule        any `json:"schedule"`
-		Region          any `json:"region"`
-		Features        any `json:"features"`
-		Billing         any `json:"billing"`
-		Upstream        any `json:"upstream"`
-		SMS             any `json:"sms"`
-		AutoEnroll      any `json:"autoenroll"`
-		Retention       any `json:"request_log_retention"`
-		ResponseHistory any `json:"response_history"`
+		Schedule               any    `json:"schedule"`
+		Region                 any    `json:"region"`
+		Features               any    `json:"features"`
+		Billing                any    `json:"billing"`
+		Upstream               any    `json:"upstream"`
+		SMS                    any    `json:"sms"`
+		AutoEnroll             any    `json:"autoenroll"`
+		Retention              any    `json:"request_log_retention"`
+		ResponseHistory        any    `json:"response_history"`
+		ResponseHistoryStorage string `json:"response_history_storage"`
 		// MaxRequestBodyMB 对前端组装成嵌套对象（与 POST 补丁形状一致）。
 		MaxRequestBody any `json:"max_request_body"`
 	}{
@@ -1245,9 +1246,10 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 				"h5": h.h5SessionEcho(c.SMS.Haozhuma.H5Session),
 			},
 		},
-		AutoEnroll:      h.autoenrollEcho(c.AutoEnroll),
-		Retention:       map[string]int{"days": c.RetentionDays, "rows": c.RetentionRows},
-		ResponseHistory: h.currentResponseHistoryPolicy(),
+		AutoEnroll:             h.autoenrollEcho(c.AutoEnroll),
+		Retention:              map[string]int{"days": c.RetentionDays, "rows": c.RetentionRows},
+		ResponseHistory:        h.currentResponseHistoryPolicy(),
+		ResponseHistoryStorage: h.responseHistoryStorage(),
 		MaxRequestBody: map[string]int{
 			"mb":         c.MaxRequestBodyMB,
 			"min_mb":     minWebRequestBodyBytes / 1_000_000,
@@ -3877,11 +3879,17 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	routeKey := session.ExtractKeyFromValue(requestDoc)
 	previousID, _ := requestDoc["previous_response_id"].(string)
 	if previousID != "" {
-		previousMessages, previousRouteKey, ok := h.loadResponseHistory(previousID)
-		if !ok {
-			writeOpenAIError(w, http.StatusBadRequest, "previous_response_not_found", "previous_response_id is unknown or expired")
+		previousMessages, previousRouteKey, release, historyErr := h.acquireResponseHistory(previousID)
+		if historyErr != nil {
+			if errors.Is(historyErr, responsehistory.ErrNotFound) {
+				writeOpenAIError(w, http.StatusBadRequest, "previous_response_not_found", "previous_response_id is unknown or idle-expired")
+			} else {
+				log.Printf("[responses] history acquisition failed: %v", historyErr)
+				writeOpenAIError(w, http.StatusServiceUnavailable, "response_history_unavailable", "response history is temporarily unavailable")
+			}
 			return
 		}
+		defer release()
 		// Top-level Responses instructions apply to the current request. Keep
 		// them before the restored transcript and never insert them between a
 		// prior assistant tool call and its function_call_output.
@@ -3929,14 +3937,14 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		}
 		response := chatToResponse(chat, responseID)
 		if assistant := chatAssistantMessage(chat, responseID); assistant != nil {
-			h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
+			responseHistoryResult(response, h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID))
 		}
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	sw := &responsesStreamWriter{header: make(http.Header), dst: w, fallbackID: fallbackResponseID}
-	sw.onComplete = func(responseID string, assistant map[string]any) {
-		h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
+	sw.onComplete = func(responseID string, assistant map[string]any) error {
+		return h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
 	}
 	h.chatCompletions(sw, chatReq)
 }
@@ -3984,17 +3992,46 @@ func newResponseID() string {
 }
 
 func (h *Handler) loadResponseHistory(id string) ([]map[string]any, string, bool) {
+	messages, key, release, err := h.acquireResponseHistory(id)
+	if err != nil {
+		return nil, "", false
+	}
+	defer release()
+	return messages, key, true
+}
+
+func (h *Handler) acquireResponseHistory(id string) ([]map[string]any, string, func(), error) {
+	release := func() {}
+	if store, ok := h.cfg.ResponseStore.(interface{ AcquireResponse(string) (func(), error) }); ok {
+		var err error
+		release, err = store.AcquireResponse(id)
+		if err != nil {
+			return nil, "", nil, err
+		}
+	}
+	messages, key, err := h.readResponseHistory(id)
+	if err != nil {
+		release()
+		return nil, "", nil, err
+	}
+	return messages, key, release, nil
+}
+
+func (h *Handler) readResponseHistory(id string) ([]map[string]any, string, error) {
 	seen := make(map[string]struct{})
 	var routeKey string
 	var turns [][]map[string]any
 	for id != "" {
 		if _, duplicate := seen[id]; duplicate {
-			return nil, "", false
+			return nil, "", responsehistory.ErrNotFound
 		}
 		seen[id] = struct{}{}
-		record, ok := h.loadResponseRecord(id)
+		record, ok, err := h.loadResponseRecordResult(id)
+		if err != nil {
+			return nil, "", err
+		}
 		if !ok {
-			return nil, "", false
+			return nil, "", responsehistory.ErrNotFound
 		}
 		if routeKey == "" {
 			routeKey = record.RouteKey
@@ -4006,7 +4043,7 @@ func (h *Handler) loadResponseHistory(id string) ([]map[string]any, string, bool
 	for i := len(turns) - 1; i >= 0; i-- {
 		history = append(history, turns[i]...)
 	}
-	return history, routeKey, true
+	return history, routeKey, nil
 }
 
 // responsesToChat 把 Responses API 请求转成 chat 请求体。返回值额外带出
@@ -4567,7 +4604,7 @@ type responsesStreamWriter struct {
 	nextIndex        int
 	usage            map[string]any
 	calls            map[int]*responseStreamCall
-	onComplete       func(string, map[string]any)
+	onComplete       func(string, map[string]any) error
 	// seq 是 SSE 事件的单调递增序号（sequence_number）。OpenAI Responses
 	// 规范要求每个事件携带；移植自 responses-proxy 的 next_sequence_number。
 	seq int64
@@ -4808,7 +4845,7 @@ func (w *responsesStreamWriter) complete() error {
 			}
 			assistant["tool_calls"] = toolCalls
 		}
-		w.onComplete(w.id, assistant)
+		responseHistoryResult(response, w.onComplete(w.id, assistant))
 	}
 	if w.reasoningStarted {
 		// 思考收尾：done 事件先行（顺序与到达顺序一致：思考在正文之前），

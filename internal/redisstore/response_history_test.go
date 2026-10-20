@@ -69,6 +69,37 @@ func redisHistoryPayload(t *testing.T, body string, ttl time.Duration) []byte {
 	return raw
 }
 
+func TestResponseHistoryLegacyReadWithoutConfigure(t *testing.T) {
+	u := newHistoryRedisTest(t)
+	ctx := context.Background()
+	id := fmt.Sprintf("legacy-lazy-%d", time.Now().UnixNano())
+	key := responsePrefix + id
+	old := `{"messages":[{"role":"user","content":"literal image and text"}],"route_key":"route"}`
+	if err := u.client.Set(ctx, key, old, 30*time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	defer u.client.Del(ctx, key)
+	raw, ok := u.LoadResponse(id)
+	if !ok {
+		t.Fatal("legacy per-key history unavailable without configure")
+	}
+	var doc struct {
+		Created int64  `json:"created_at_unix_ms"`
+		Expires int64  `json:"expires_at_unix_ms"`
+		Route   string `json:"route_key"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	remaining := time.Until(time.UnixMilli(doc.Expires))
+	if doc.Route != "route" || doc.Expires-doc.Created != time.Hour.Milliseconds() || remaining > 30*time.Minute || remaining < 29*time.Minute {
+		t.Fatalf("legacy timestamps: %+v", doc)
+	}
+	if u.client.Get(ctx, key).Val() != old {
+		t.Fatal("read rewrote legacy Redis data")
+	}
+}
+
 func TestResponseHistoryRedisSharedBudget(t *testing.T) {
 	u := newHistoryRedisTest(t)
 	p := responsehistory.Policy{TTLSeconds: 3600, MaxEntries: 2, MaxStorageMB: 1, MaxEntryMB: 32}

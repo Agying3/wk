@@ -222,6 +222,7 @@ function Console() {
         request_log_retention: currentConfig.request_log_retention || current.request_log_retention,
         max_request_body: currentConfig.max_request_body || current.max_request_body,
         response_history: currentConfig.response_history || current.response_history,
+        response_history_storage: currentConfig.response_history_storage || current.response_history_storage,
       }));
     } catch (error) {
       if (error.name === 'AbortError') return;
@@ -522,7 +523,7 @@ function Console() {
       });
       setConfig(current => ({ ...current, response_history: result.updated.response_history }));
       if (result.updated.response_history_remote_pending) {
-        message.warning('本机策略已生效，Redis 策略更新失败；请恢复 Redis 连接后重新保存');
+        message.warning('本机索引限制已生效，持久层策略更新失败；请恢复存储连接后重新保存');
       } else {
         message.success('会话历史限制已保存并即时生效');
       }
@@ -966,11 +967,12 @@ function Console() {
           {config.response_history && (
             <Card title="Responses 会话历史存储">
               <Paragraph type="secondary" style={{ margin: '0 0 12px' }}>
-                用于 previous_response_id 接续对话。保存时间、历史条数和总容量同时生效，达到任一上限会清理旧记录。
+                用于 previous_response_id 接续对话。闲置过期时间、历史条数和总容量同时生效，超限时按会话最后活跃时间（LRU）整段淘汰。
                 单条历史上限独立控制每轮记录的大小，超限记录不保存。
-                保存后即时生效，调小限制会立即清理；调大保存时间只影响新记录。
-                容量按历史正文的 JSON 字节数计算（1 MB = 1,000,000 字节），不包含存储引擎和程序自身的额外开销。
-                配置 Redis 时，共享历史与每个实例的内存缓存分别受此上限约束。
+                成功保存新一轮后刷新整段会话的闲置期限；请求失败不续期。保存设置后即时生效，正在处理请求的会话会暂时保护，结束后再清理。
+                容量按压缩前的 JSON 字节数计算（1 MB = 1,000,000 字节），不包含存储引擎和程序自身的额外开销。
+                当前存储：{{ postgres: 'PostgreSQL', sqlite: '本地 SQLite', redis: 'Redis', memory: '内存' }[config.response_history_storage] || '未知'}。
+                正文落库后，内存只缓存索引；文字采用无损压缩，图片按原始字节去重，闲置 15 分钟后后台尝试更高强度压缩。
               </Paragraph>
               <Form
                 layout="inline"
@@ -979,7 +981,7 @@ function Console() {
                 initialValues={config.response_history}
                 onFinish={saveResponseHistory}
               >
-                <Form.Item name="ttl_seconds" label="保存时间" rules={[{ required: true, message: '请输入保存秒数' }]}>
+                <Form.Item name="ttl_seconds" label="闲置过期时间" rules={[{ required: true, message: '请输入闲置秒数' }]}>
                   <InputNumber min={1} max={3153600000} precision={0} style={{ width: 170 }} addonAfter="秒" />
                 </Form.Item>
                 <Form.Item name="max_entries" label="最大条数" rules={[{ required: true, message: '请输入最大条数' }]}>
@@ -994,7 +996,7 @@ function Console() {
                 <Button type="primary" htmlType="submit">保存会话历史设置</Button>
               </Form>
               <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
-                一条记录对应一轮响应及其新增输入，单条上限默认 32 MB。单条上限与总存储上限分别生效，超过任一容量上限的记录不保存，也不会因此挤出其他历史。父记录过期或被淘汰后，其后续响应 ID 也无法恢复完整对话。
+                一条记录对应一轮响应及其新增输入，单条上限默认 32 MB；同一根响应的所有分支一起保留或淘汰。单条上限与总存储上限分别生效。单个会话超过总容量或条数上限时，拒绝保存本轮并保留原历史，返回 history_stored=false；客户端需携带完整历史重试。
               </Paragraph>
             </Card>
           )}

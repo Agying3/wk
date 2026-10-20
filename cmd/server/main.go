@@ -26,6 +26,7 @@ import (
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/reqproxy"
+	"workbuddy2api/internal/responsehistory"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
@@ -300,10 +301,15 @@ func main() {
 		requestLogs = adapter
 		completions = adapter
 	}
-	var responseStore server.ResponseStore
-	if persistedResponses, ok := store.(server.ResponseStore); ok {
-		responseStore = persistedResponses
+	var legacyResponses responsehistory.LegacyStore
+	if old, ok := store.(responsehistory.LegacyStore); ok {
+		legacyResponses = old
 	}
+	responseStore, err := openResponseHistoryStore(cfg, metricsDB, legacyResponses)
+	if err != nil {
+		log.Fatalf("responses history storage unavailable: %v", err)
+	}
+	defer responseStore.Close()
 
 	p := pool.New(cfg.StateFile)
 	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
