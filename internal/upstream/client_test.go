@@ -45,7 +45,11 @@ func TestClassify(t *testing.T) {
 		{403, `The content did not pass the safety review.`, ErrRiskFlag},
 		// 11140 必须伴随 403；200 带 11140 文本不构成风控信号。
 		{200, `{"code":11140}`, ErrNone},
-		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		{401, `{"code":9999,"msg":"bad token"}`, ErrUnauthorized},
+		{401, `<html><h1>401 Authorization Required</h1><hr>openresty</html>`, ErrUnauthorized},
+		{401, `{"code":12153,"msg":"12153:refresh token failed:400 Bad Request: invalid_grant: User disabled"}`, ErrAccountDisabled},
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity"}}`, ErrAccountDisabled},
+		{200, `{"msg":"invalid_grant: User disabled"}`, ErrNone},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
@@ -98,6 +102,22 @@ func TestRefreshSuccess(t *testing.T) {
 	}
 	if a.ExpiresAt <= 1 {
 		t.Errorf("expiresAt not advanced: %d", a.ExpiresAt)
+	}
+}
+
+func TestRefreshTokenContextCancellation(t *testing.T) {
+	a := &auth.Auth{AccessToken: "old-access", RefreshToken: "old-refresh", ExpiresAt: 9999999999}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := c.RefreshTokenContext(ctx, a); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("refresh error=%v, want deadline exceeded", err)
+	}
+	if a.Snapshot().AccessToken != "old-access" {
+		t.Fatal("timed-out refresh changed the credential")
 	}
 }
 

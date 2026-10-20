@@ -1,7 +1,7 @@
 // Package pool 账号池：单一状态机（健康/冷却/熔断）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
 //
 // 每个账号有三个正交的账号级状态维度，另有按模型拆分的上游限流窗口：
-//  1. 健康维度（唯一权威）：healthy = !disabled && !until 生效 && !breakerUntil 生效
+//  1. 健康维度（唯一权威）：禁用、常规冷却、熔断、鉴权隔离/恢复中的账号均不可选
 //     - until：账号级即时冷却（CoolSoft / 旧版 CoolRateLimit / CoolHard）
 //     - breakerUntil：连续失败（fails）累计触发熔断的指数退避截止
 //  2. 并发维度：inFlight（在途租约，运行态）
@@ -78,6 +78,7 @@ type Status struct {
 	CoolKind        string                         `json:"cool_kind,omitempty"`
 	CoolRemaining   int64                          `json:"cool_remaining_sec,omitempty"`
 	Until           time.Time                      `json:"until,omitempty"`
+	AuthUntil       time.Time                      `json:"auth_until,omitempty"` // 独立于余额/限流的鉴权隔离
 	Reason          string                         `json:"reason,omitempty"`
 	Disabled        bool                           `json:"disabled"`
 	ModelCooldowns  map[string]ModelCooldownStatus `json:"model_cooldowns,omitempty"`
@@ -138,6 +139,10 @@ type entry struct {
 	// 独立（NoteSuccess 同时清两者）。持久化是为了重启不清零——被标记的号
 	// 重启后依旧被标记，计数不应归零重来。
 	riskStrikes int `json:"-"`
+	// 鉴权隔离截止持久化；恢复任务标识与进行中状态只存在于当前进程。
+	authUntil      time.Time
+	authRecoveryID uint64
+	authRecovering bool
 
 	// spent 影子扣减累计（运行态，不持久化）：请求成功结束时按上游
 	// usage.credit（或费率估算）累计，weightOf 里从 credits 里减去后再
@@ -176,6 +181,9 @@ func normalizeModel(model string) string {
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
+		return false
+	}
+	if now.Before(e.authUntil) || e.authRecovering {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -268,7 +276,8 @@ type stateAccount struct {
 	LastErr     time.Time `json:"last_err,omitempty"`
 	// RiskStrikes 11140 风控连续计数。达到 pool 的 riskDisableThreshold
 	// 时账号已被 Disable（disabled=true 配 reason），计数本身保留作观测。
-	RiskStrikes int `json:"risk_strikes,omitempty"`
+	RiskStrikes int       `json:"risk_strikes,omitempty"`
+	AuthUntil   time.Time `json:"auth_until,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -780,6 +789,10 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
 func (p *Pool) upsertLocked(a *auth.Auth) {
 	if e, ok := p.byUID[a.UID]; ok {
+		if e.a != a {
+			e.authRecovering = false
+			e.authRecoveryID++
+		}
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}
@@ -989,6 +1002,9 @@ func (p *Pool) pickEarliestExpiryLocked(model string, tried map[string]bool, now
 		}
 		if e.disabled {
 			continue // 禁用的账号永不参与兜底
+		}
+		if now.Before(e.authUntil) || e.authRecovering {
+			continue // 鉴权失败号不能通过全冷却兜底继续承接请求
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
@@ -1345,6 +1361,9 @@ func (p *Pool) Enable(uid string) bool {
 		return false
 	}
 	e.disabled = false
+	e.authUntil = time.Time{}
+	e.authRecoveryID++
+	e.authRecovering = false
 	e.reason = ""
 	e.until = time.Time{}
 	e.coolKind = 0
@@ -1389,6 +1408,9 @@ func (p *Pool) ClearCooldown(uid string) bool {
 	if !ok {
 		return false
 	}
+	e.authUntil = time.Time{}
+	e.authRecoveryID++
+	e.authRecovering = false
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.modelCooldowns = nil
@@ -1658,7 +1680,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CycleCapacityRemain: e.cycleCapacityRemain,
 		CycleCapacityUsed:   e.cycleCapacityUsed,
 		TokenExpiresAt:      e.a.Snapshot().ExpiresAt,
-		Cooling:             now.Before(e.until) || now.Before(e.breakerUntil),
+		Cooling:             now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.authUntil) || e.authRecovering,
+		AuthUntil:           e.authUntil,
 		Reason:              e.reason,
 		Disabled:            e.disabled,
 		SuccessCount:        e.successCount,
@@ -1681,6 +1704,17 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 			st.CoolRemaining = 0
 		}
 		st.CoolKind = e.coolKind.String()
+	}
+	if !e.disabled && (now.Before(e.authUntil) || e.authRecovering) {
+		st.CoolKind = "auth"
+		st.Reason = "401 authentication failed; awaiting credential recovery"
+		if e.authUntil.After(st.Until) {
+			st.Until = e.authUntil
+		}
+		st.CoolRemaining = int64(time.Until(st.Until).Seconds() + 0.999)
+		if st.CoolRemaining < 0 {
+			st.CoolRemaining = 0
+		}
 	}
 	for model, cooldown := range e.modelCooldowns {
 		if cooldown.Until.IsZero() || !now.Before(cooldown.Until) {
@@ -1749,6 +1783,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			lastErr:             s.LastErr,
 			lastSuccess:         s.LastSuccess,
 			riskStrikes:         s.RiskStrikes,
+			authUntil:           s.AuthUntil,
 		}
 	}
 }
@@ -1902,6 +1937,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			LastSuccess:         e.lastSuccess,
 			LastErr:             e.lastErr,
 			RiskStrikes:         e.riskStrikes,
+			AuthUntil:           e.authUntil,
 		}
 	}
 	return sf

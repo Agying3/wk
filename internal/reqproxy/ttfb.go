@@ -366,7 +366,7 @@ func (p *TTFBProber) probeNode(n Node, acct TTFBAccount, body []byte, timeout ti
 func probeErrIsAccountSide(status int, body string) bool {
 	switch upstream.Classify(status, body) {
 	case upstream.ErrHardCredit, upstream.ErrSoftRate,
-		upstream.ErrSessionDead, upstream.ErrRiskFlag:
+		upstream.ErrSessionDead, upstream.ErrRiskFlag, upstream.ErrUnauthorized, upstream.ErrAccountDisabled:
 		return true
 	}
 	return false

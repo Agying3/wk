@@ -69,6 +69,7 @@ func (p *Pool) stateAccountOfLocked(e *entry) stateAccount {
 		LastSuccess:         e.lastSuccess,
 		LastErr:             e.lastErr,
 		RiskStrikes:         e.riskStrikes,
+		AuthUntil:           e.authUntil,
 	}
 }
 

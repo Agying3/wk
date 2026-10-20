@@ -37,7 +37,9 @@ const (
 	// 返回 11140，责任归属由 pool 侧的连续计数（NoteRiskStrike）判定，
 	// 达阈值才 Disable；成功一次即清零。
 	ErrRiskFlag
-	ErrClient // 其他 4xx / 业务错误
+	ErrClient          // 其他 4xx / 业务错误
+	ErrUnauthorized    // 无明确失效原因的 401：隔离账号并刷新确认，不作为请求体错误
+	ErrAccountDisabled // 上游明确报告账号已禁用/受限
 )
 
 func (k ErrKind) String() string {
@@ -56,6 +58,10 @@ func (k ErrKind) String() string {
 		return "risk_flag"
 	case ErrClient:
 		return "client"
+	case ErrUnauthorized:
+		return "unauthorized"
+	case ErrAccountDisabled:
+		return "account_disabled"
 	default:
 		return "none"
 	}
@@ -88,6 +94,22 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 func Classify(status int, body string) ErrKind {
+	lower := strings.ToLower(body)
+	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden {
+		if strings.Contains(lower, "invalid_grant: user disabled") ||
+			(status == http.StatusForbidden && isRiskFlag11140(body) &&
+				strings.Contains(lower, "your account has been restricted due to unusual activity")) {
+			return ErrAccountDisabled
+		}
+	}
+	for _, m := range sessionDeadMarkers {
+		if strings.Contains(body, m) {
+			return ErrSessionDead
+		}
+	}
+	if status == http.StatusUnauthorized {
+		return ErrUnauthorized
+	}
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
@@ -96,15 +118,9 @@ func Classify(status int, body string) ErrKind {
 	if isHardCredit1418(body) {
 		return ErrHardCredit
 	}
-	lower := strings.ToLower(body)
 	for _, m := range hardMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrHardCredit
-		}
-	}
-	for _, m := range sessionDeadMarkers {
-		if strings.Contains(body, m) {
-			return ErrSessionDead
 		}
 	}
 	// code=6004 is the upstream's deterministic rate-limit response. Some
@@ -381,14 +397,22 @@ func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。全程持 a 锁，防止并发 SaveAtomic 读半更新 token。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	return c.RefreshTokenContext(context.Background(), a)
+}
+
+// RefreshTokenContext applies a separate HTTP deadline to recovery requests.
+func (c *Client) RefreshTokenContext(ctx context.Context, a *auth.Auth) error {
 	a.Lock()
 	defer a.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	credentials := a.Snapshot()
 	if strings.TrimSpace(credentials.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
 	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
 		return err
 	}

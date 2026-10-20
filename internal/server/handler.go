@@ -5022,8 +5022,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				switch {
-				case errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead:
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+				case errors.As(err, &ue) && (ue.Kind == upstream.ErrSessionDead || ue.Kind == upstream.ErrAccountDisabled):
+					h.cfg.Pool.Disable(acct.UID, "refresh rejected: "+ue.Kind.String())
+				case errors.As(err, &ue) && ue.Kind == upstream.ErrUnauthorized:
+					// The refresh itself was rejected; isolate without immediately
+					// sending the same refresh a second time in the background.
+					if id, ok := h.cfg.Pool.BeginAuthRecovery(acct, authRecoveryCooldown); ok {
+						h.cfg.Pool.FinishAuthRecovery(acct, id, "")
+					}
 				case errors.Is(err, upstream.ErrNoProxyNode):
 					// 代理池没有可用节点：换号重试（别的 region 可能还有节点），
 					// 但不喂熔断——账号本身没问题，代理恢复后应立即可用。
@@ -5067,6 +5073,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			setRequestError(st, kind.String(), bodyText)
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: bodyText}
 			h.applyErrorPolicy(acct.UID, routeModel, kind, bodyText)
+			if kind == upstream.ErrUnauthorized {
+				h.recoverUnauthorized(acct)
+				fail(acct.UID)
+				continue
+			}
 			if kind == upstream.ErrRiskFlag {
 				// 11140 账号级风控：账号侧已喂连续计数（达阈值自动 Disable）。
 				// 这里换号重试——被标记的号对任何内容都失败，但健康号
@@ -5282,6 +5293,8 @@ func (h *Handler) currentCreditPolicy() CreditPolicy {
 //     上游 code=6004 或带 reset 时间的限流 → 精确冷却到 reset，期间不对该模型兜底重试。
 //   - ErrNotFound → Cooldown(CoolSoft)：即时账号级软冷却（404）。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrAccountDisabled → Disable：上游明确报告账号已禁用。
+//   - ErrUnauthorized：调用方隔离账号并启动一次后台刷新，然后换号重试。
 //   - ErrRiskFlag → NoteRiskStrike：11140 风控连续计数，达阈值自动 Disable
 //     （健康号偶发的内容审核触发会被 NoteSuccess 清零，不会连坐）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
@@ -5330,6 +5343,8 @@ func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, bod
 		}
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
+	case upstream.ErrAccountDisabled:
+		h.cfg.Pool.Disable(uid, "upstream account disabled")
 	case upstream.ErrRiskFlag:
 		// 11140 账号级风控：喂连续计数，达阈值自动 Disable（返回的 reason
 		// 非空 = 本次触发禁用，打日志供运维归因）。冷却无意义——风控

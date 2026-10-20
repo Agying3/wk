@@ -36,7 +36,7 @@ type Config struct {
 	TravelDisabled    bool
 	ActivityDisabled  bool
 	KeepaliveDisabled bool
-	BlackcatDisabled bool
+	BlackcatDisabled  bool
 }
 
 // Scheduler 调度器。
@@ -441,8 +441,8 @@ func (s *Scheduler) KeepaliveAccount(uid string) AccountResult {
 	if err := s.snapshot().Upstream.RefreshToken(a); err != nil {
 		log.Printf("keepalive %s: %v", uid, err)
 		var ue *upstream.Error
-		if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-			s.snapshot().Pool.Disable(uid, "12153 session dead")
+		if errors.As(err, &ue) && (ue.Kind == upstream.ErrSessionDead || ue.Kind == upstream.ErrAccountDisabled) {
+			s.snapshot().Pool.Disable(uid, "refresh rejected: "+ue.Kind.String())
 		}
 		return AccountResult{UID: uid, Detail: err.Error()}
 	}
@@ -467,8 +467,8 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if err := cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("keepalive %s: %v", st.UID, err)
 			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-				cfg.Pool.Disable(st.UID, "12153 session dead")
+			if errors.As(err, &ue) && (ue.Kind == upstream.ErrSessionDead || ue.Kind == upstream.ErrAccountDisabled) {
+				cfg.Pool.Disable(st.UID, "refresh rejected: "+ue.Kind.String())
 			}
 			continue
 		}

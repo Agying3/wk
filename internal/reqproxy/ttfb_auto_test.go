@@ -102,6 +102,8 @@ func TestProbeNodeAccountSideClassification(t *testing.T) {
 		{429, `{"code":14018,"msg":"额度已用尽"}`, true}, // ErrHardCredit
 		{429, ``, true}, // ErrSoftRate
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, true}, // ErrSessionDead
+		{401, `<html>401 Authorization Required</html>`, true},
+		{401, `{"code":12153,"msg":"invalid_grant: User disabled"}`, true},
 		{500, `boom`, false},                            // ErrServer → 节点侧
 		{400, `{"code":9999,"msg":"bad token"}`, false}, // ErrClient → 节点侧（请求形态）
 	}
