@@ -5,11 +5,13 @@ import (
 	"sync/atomic"
 )
 
-// DSH's fixed opening sentence can trigger upstream channel verification.
-// Rewrite only its system-prompt identity, retaining the harness and meaning.
+// DSH's fixed identity and Web GUI instructions can trigger channel verification.
+// Rewrite these exact system-prompt templates while retaining their meaning.
 const (
 	dshIdentityOriginal  = "You are an AI agent powered by DeepSeek Harness"
 	dshIdentityRewritten = "You are an AI agent running on DeepSeek Harness"
+	dshGUIOriginal       = "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI."
+	dshGUIRewritten      = "You are communicating with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to \"this page\", \"this GUI\", or \"this app\" without naming another target, they mean this GUI."
 )
 
 var dshCompatEnabled atomic.Bool
@@ -18,6 +20,7 @@ var dshCompatEnabled atomic.Bool
 func SetDSHCompat(enabled bool) { dshCompatEnabled.Store(enabled) }
 
 func rewriteDSHPromptText(text string) string {
+	text = strings.ReplaceAll(text, dshGUIOriginal, dshGUIRewritten)
 	var out strings.Builder
 	pos, written := 0, 0
 	for pos < len(text) {

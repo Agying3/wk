@@ -448,14 +448,20 @@ stdout 同时保留一行便于排查的表格日志：
 
 设置 `features.dsh_compat=true`，或环境变量 `WB2A_DSH_COMPAT=true`，也可在控制台「管理设置 → 特性开关 → DSH 兼容」启用；默认关闭，控制台保存后即时生效并写回配置。
 
-出站系统提示词中的固定身份句会作同义替换：
+出站系统提示词中的固定身份句和 Web GUI 说明会作同义替换：
 
 ```text
 You are an AI agent powered by DeepSeek Harness.
 → You are an AI agent running on DeepSeek Harness.
 ```
 
-兼容原句带句号或省略句号的形式，保留周围文本、标点和空白。只处理 `system` 及归一化后的 `developer` 文本（包括内容数组的文本段），不修改用户、助手、工具消息或图片。Chat Completions 与 Responses 共用此处理；与 Codex 兼容及指纹脱敏开关独立。
+身份句兼容原句带句号或省略句号的形式。另对以下完整的两句话作精确匹配，仅将开头的 `interacting` 改为 `communicating`，保留 GUI 指代规则及原意：
+
+```text
+You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.
+```
+
+两项替换共用 `dsh_compat` 开关，保留周围文本、标点和空白。只处理 `system` 及归一化后的 `developer` 文本（包括内容数组的文本段），不修改用户、助手、工具消息或图片。Chat Completions 与 Responses 共用此处理；与 Codex 兼容及指纹脱敏开关独立。
 
 ## 工具脚本
 

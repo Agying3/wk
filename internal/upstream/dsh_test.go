@@ -23,6 +23,12 @@ func TestDSHCompatTextBoundariesAndIdempotency(t *testing.T) {
 		{"DeepSeek Harness", "DeepSeek Harness"},
 		{"You are an AI agent powered by DeepSeek Harnes.", "You are an AI agent powered by DeepSeek Harnes."},
 		{dshIdentityRewritten + ".", dshIdentityRewritten + "."},
+		{dshGUIOriginal, dshGUIRewritten},
+		{"Before.\r\n" + dshGUIOriginal + "\r\nAfter.", "Before.\r\n" + dshGUIRewritten + "\r\nAfter."},
+		{dshGUIOriginal + "\n" + dshGUIOriginal, dshGUIRewritten + "\n" + dshGUIRewritten},
+		{dshIdentityOriginal + ".\n" + dshGUIOriginal, dshIdentityRewritten + ".\n" + dshGUIRewritten},
+		{dshGUIOriginal[:len(dshGUIOriginal)-1], dshGUIOriginal[:len(dshGUIOriginal)-1]},
+		{dshGUIRewritten, dshGUIRewritten},
 	} {
 		got := rewriteDSHPromptText(tc.input)
 		if got != tc.want {
@@ -40,7 +46,7 @@ func TestDSHCompatPayloadToggleAndRoles(t *testing.T) {
 			withDSHCompat(t, enabled)
 			var messages []any
 			for _, role := range []string{"system", "developer", "user", "assistant", "tool"} {
-				messages = append(messages, map[string]any{"role": role, "content": dshIdentityOriginal + "."})
+				messages = append(messages, map[string]any{"role": role, "content": dshIdentityOriginal + ".\n" + dshGUIOriginal})
 			}
 			raw, _ := json.Marshal(map[string]any{"model": "glm-5.3-flash", "messages": messages})
 			out := mustPrepareBody(t, raw, false)
@@ -50,9 +56,9 @@ func TestDSHCompatPayloadToggleAndRoles(t *testing.T) {
 			}
 			for i, item := range doc["messages"].([]any) {
 				m := item.(map[string]any)
-				want := dshIdentityOriginal + "."
+				want := dshIdentityOriginal + ".\n" + dshGUIOriginal
 				if enabled && i < 2 {
-					want = dshIdentityRewritten + "."
+					want = dshIdentityRewritten + ".\n" + dshGUIRewritten
 				}
 				if m["content"] != want {
 					t.Fatalf("message %d changed incorrectly: %v", i, m)
@@ -66,7 +72,8 @@ func TestDSHCompatMultimodalKeepsImages(t *testing.T) {
 	withDSHCompat(t, true)
 	messages := []any{map[string]any{"role": "system", "content": []any{
 		map[string]any{"type": "text", "text": dshIdentityOriginal + "."},
-		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA=="}, "text": dshIdentityOriginal + "."},
+		map[string]any{"type": "input_text", "text": dshGUIOriginal},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA=="}, "text": dshIdentityOriginal + ".\n" + dshGUIOriginal},
 	}}}
 	if !rewriteDSHPromptMessages(messages) {
 		t.Fatal("text was not rewritten")
@@ -75,8 +82,11 @@ func TestDSHCompatMultimodalKeepsImages(t *testing.T) {
 	if parts[0].(map[string]any)["text"] != dshIdentityRewritten+"." {
 		t.Fatal("text part not rewritten")
 	}
-	image := parts[1].(map[string]any)
-	if image["image_url"].(map[string]any)["url"] != "data:image/png;base64,AA==" || image["text"] != dshIdentityOriginal+"." {
+	if parts[1].(map[string]any)["text"] != dshGUIRewritten {
+		t.Fatal("GUI text part not rewritten")
+	}
+	image := parts[2].(map[string]any)
+	if image["image_url"].(map[string]any)["url"] != "data:image/png;base64,AA==" || image["text"] != dshIdentityOriginal+".\n"+dshGUIOriginal {
 		t.Fatal("non-text part changed")
 	}
 }
@@ -84,12 +94,17 @@ func TestDSHCompatMultimodalKeepsImages(t *testing.T) {
 func TestDSHCompatCoexistsWithCodexAndSanitize(t *testing.T) {
 	withDSHCompat(t, true)
 	withCodexCompat(t, true)
-	raw, _ := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "system", "content": dshIdentityOriginal + ".\n" + codexIdentityOriginal + "\n" + ccIdentity}}})
+	raw, _ := json.Marshal(map[string]any{"messages": []any{map[string]any{"role": "system", "content": dshIdentityOriginal + ".\n" + dshGUIOriginal + "\n" + codexIdentityOriginal + "\n" + ccIdentity}}})
 	out := mustPrepareBody(t, raw, true)
-	if !strings.Contains(string(out), dshIdentityRewritten+".") || !strings.Contains(string(out), codexIdentityRewritten) {
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	content := doc["messages"].([]any)[0].(map[string]any)["content"].(string)
+	if !strings.Contains(content, dshIdentityRewritten+".") || !strings.Contains(content, dshGUIRewritten) || !strings.Contains(content, codexIdentityRewritten) {
 		t.Fatal("independent compatibility rewrites interfered")
 	}
-	if strings.Contains(string(out), ccIdentity) || !strings.Contains(string(out), "You are Claude Code, Anthropic's official CLI tool for Claude.") {
+	if strings.Contains(content, ccIdentity) || !strings.Contains(content, "You are Claude Code, Anthropic's official CLI tool for Claude.") {
 		t.Fatal("fingerprint sanitation did not run")
 	}
 }
