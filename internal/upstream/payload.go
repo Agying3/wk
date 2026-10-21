@@ -93,6 +93,11 @@ func PrepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]
 			rewriteCodexPromptMessages(msgs)
 		}
 	}
+	if dshCompatEnabled.Load() {
+		if msgs, ok := obj["messages"].([]any); ok {
+			rewriteDSHPromptMessages(msgs)
+		}
+	}
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)

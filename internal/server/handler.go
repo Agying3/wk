@@ -172,10 +172,11 @@ type Config struct {
 	// 保持"端点开"——大量单测直接构造 Config{}，默认关会全部打挂。
 	// main 从 features.responses_api 反转后传入。
 	DisableResponses bool
-	// SetSanitizeFingerprints / SetCodexCompat 把 WebUI 保存的特性开关
+	// SetSanitizeFingerprints / SetCodexCompat / SetDSHCompat 把 WebUI 保存的特性开关
 	// 推到 upstream Client（运行时即时生效）。可选：nil 时仅更新 handler 本地副本。
 	SetSanitizeFingerprints func(bool)
 	SetCodexCompat          func(bool)
+	SetDSHCompat            func(bool)
 	// SetUpstreamTimeouts 把 WebUI 保存的上游超时推到 upstream Client。
 	// 参数单位：秒；streamTotal/streamIdle 0 = 不限/不查（与 config 语义一致，
 	// 但不支持 -1 关闭——WebUI 上「0」即代表关闭，落盘时再翻译回 -1）。
@@ -227,10 +228,11 @@ type Handler struct {
 	// 读侧在每条 chat/responses 请求的入口，纯内存读，锁开销可忽略。
 	maxRequestBody int
 	sanitizeHooks  struct {
-		// upstream SetSanitizeFingerprints / SetCodexCompat 回调；nil 时
+		// upstream SetSanitizeFingerprints / SetCodexCompat / SetDSHCompat 回调；nil 时
 		// （如单测直接构造 Handler）仅更新本地副本，不外呼。
 		setSanitize func(bool)
 		setCodex    func(bool)
+		setDSH      func(bool)
 	}
 
 	// growthLocks 成长任务 per-account 互斥（growthtasks.go）。
@@ -363,6 +365,7 @@ func NewHandler(cfg Config) *Handler {
 	h.featuresMu.Lock()
 	h.sanitizeHooks.setSanitize = cfg.SetSanitizeFingerprints
 	h.sanitizeHooks.setCodex = cfg.SetCodexCompat
+	h.sanitizeHooks.setDSH = cfg.SetDSHCompat
 	h.featuresMu.Unlock()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
@@ -1108,6 +1111,7 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 			SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 			Passthrough                   bool `json:"passthrough"`
 			CodexCompat                   bool `json:"codex_compat"`
+			DSHCompat                     bool `json:"dsh_compat"`
 			ResponsesAPI                  bool `json:"responses_api"`
 		} `json:"features"`
 		Billing struct {
@@ -1346,6 +1350,7 @@ type featuresPatch struct {
 	SanitizeBlacklistFingerprints *bool `json:"sanitize_blacklist_fingerprints"`
 	Passthrough                   *bool `json:"passthrough"`
 	CodexCompat                   *bool `json:"codex_compat"`
+	DSHCompat                     *bool `json:"dsh_compat"`
 	ResponsesAPI                  *bool `json:"responses_api"`
 }
 
@@ -1694,6 +1699,9 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Features.CodexCompat != nil {
 			features["codex_compat"] = *req.Features.CodexCompat
+		}
+		if req.Features.DSHCompat != nil {
+			features["dsh_compat"] = *req.Features.DSHCompat
 		}
 		if req.Features.ResponsesAPI != nil {
 			features["responses_api"] = *req.Features.ResponsesAPI
@@ -2608,7 +2616,7 @@ func (h *Handler) applyRuntimeUpstreamTimeouts(p *upstreamPatch, updated map[str
 
 // applyRuntimeFeatures 把 WebUI 保存的特性开关/费率推到运行时状态：
 // handler 本地副本（passthrough/responsesOff/creditPolicy）+ upstream Client
-// （脱敏、Codex 改写）。返回实际生效的值供前端回显确认。
+// （脱敏、Codex/DSH 改写）。返回实际生效的值供前端回显确认。
 func (h *Handler) applyRuntimeFeatures(features *featuresPatch, billing *billingPatch) map[string]any {
 	h.featuresMu.Lock()
 	defer h.featuresMu.Unlock()
@@ -2633,6 +2641,12 @@ func (h *Handler) applyRuntimeFeatures(features *featuresPatch, billing *billing
 				h.sanitizeHooks.setCodex(*features.CodexCompat)
 			}
 			updated["codex_compat"] = *features.CodexCompat
+		}
+		if features.DSHCompat != nil {
+			if h.sanitizeHooks.setDSH != nil {
+				h.sanitizeHooks.setDSH(*features.DSHCompat)
+			}
+			updated["dsh_compat"] = *features.DSHCompat
 		}
 	}
 	if billing != nil {

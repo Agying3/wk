@@ -138,7 +138,8 @@ curl -sN http://localhost:7863/v1/chat/completions \
   "features": {
     "sanitize_blacklist_fingerprints": true,
     "passthrough": false,
-    "codex_compat": false
+    "codex_compat": false,
+    "dsh_compat": false
   },
   "billing": {
     "input_credits_per_1k_tokens": 0,
@@ -442,6 +443,19 @@ stdout 同时保留一行便于排查的表格日志：
 一句话只改一处连字符，用于绕开上游内容审核对该句的逐字指纹匹配（与 `sanitize_blacklist_fingerprints`
 对 Claude 指纹的处理是同一机制、互不干扰）。句子不存在时原样透传，不做任何其他改动；
 非 system 消息（user/assistant）中出现的同句不会被改写。默认关闭。
+
+### DSH 兼容
+
+设置 `features.dsh_compat=true`，或环境变量 `WB2A_DSH_COMPAT=true`，也可在控制台「管理设置 → 特性开关 → DSH 兼容」启用；默认关闭，控制台保存后即时生效并写回配置。
+
+出站系统提示词中的固定身份句会作同义替换：
+
+```text
+You are an AI agent powered by DeepSeek Harness.
+→ You are an AI agent running on DeepSeek Harness.
+```
+
+兼容原句带句号或省略句号的形式，保留周围文本、标点和空白。只处理 `system` 及归一化后的 `developer` 文本（包括内容数组的文本段），不修改用户、助手、工具消息或图片。Chat Completions 与 Responses 共用此处理；与 Codex 兼容及指纹脱敏开关独立。
 
 ## 工具脚本
 

@@ -393,6 +393,7 @@ func main() {
 	// Codex 兼容：改写 Codex CLI 系统提示词身份句（open source → open-source），
 	// 绕开上游逐字指纹拦截。开关由 features.codex_compat / WB2A_CODEX_COMPAT 控制。
 	upstream.SetCodexCompat(cfg.Features.CodexCompat)
+	upstream.SetDSHCompat(cfg.Features.DSHCompat)
 	log.Printf("upstream timeouts: request=%ds stream_total=%s stream_idle=%s",
 		cfg.Upstream.TimeoutSeconds, durLabel(cfg.StreamTimeoutDur), durLabel(cfg.StreamIdleDur))
 
@@ -555,6 +556,7 @@ func main() {
 		// WebUI 特性开关保存后即时推到 upstream Client（脱敏/Codex 改写）。
 		SetSanitizeFingerprints: up.SetSanitizeFingerprints,
 		SetCodexCompat:          upstream.SetCodexCompat,
+		SetDSHCompat:            upstream.SetDSHCompat,
 		// WebUI 上游超时保存后即时生效（单位秒）。
 		SetUpstreamTimeouts: func(reqSecs, streamTotalSecs, streamIdleSecs int) {
 			up.SetRequestTimeout(time.Duration(reqSecs) * time.Second)

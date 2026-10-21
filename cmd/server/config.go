@@ -101,6 +101,8 @@ type Config struct {
 		// → "open-source"），绕开上游内容审核的逐字指纹匹配。句子不存在
 		// 时原样透传。默认 false。
 		CodexCompat bool `json:"codex_compat"`
+		// DSHCompat rewrites the fixed DSH system-prompt identity. Default false.
+		DSHCompat bool `json:"dsh_compat"`
 		// ResponsesAPI 是否暴露 Responses 端点（/v1/responses、/responses）。
 		// 关闭时返回 404（表现为端点不存在）。默认 true。
 		// 用途：只用 Chat Completions 的部署关掉它，缩小攻击面与日志噪音
@@ -324,6 +326,7 @@ func Default() *Config {
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.Passthrough = false
 	c.Features.CodexCompat = false
+	c.Features.DSHCompat = false
 	c.Features.ResponsesAPI = true
 	// 请求体上限默认 8 MB（与历史硬编码一致）。0 = 默认，见 normalize。
 	c.MaxRequestBodyMB = 8
@@ -506,6 +509,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_CODEX_COMPAT"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.CodexCompat = b
+		}
+	}
+	if v := os.Getenv("WB2A_DSH_COMPAT"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.DSHCompat = b
 		}
 	}
 	if v := os.Getenv("WB2A_RESPONSES_API"); v != "" {
