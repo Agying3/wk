@@ -96,10 +96,14 @@
       "sticky_minutes": 30
     },
     "haozhuma": {
+      "provider": "ecode",
+      "ecode_base": "https://api.eomsg.com/zc/data.php",
+      "ecode_card_type": "全部",
+      "ecode_province": "",
       "user": "",
       "pass": "",
-      "token": "",
-      "sid": ""
+      "token": "你的E码云API令牌（个人中心→API对接中心创建）",
+      "sid": "腾讯科技"
     }
   },
   "reqproxy": {
