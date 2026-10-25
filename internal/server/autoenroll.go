@@ -404,12 +404,17 @@ func (a *AutoEnroller) AppendLog(format string, args ...any) {
 
 // Balance 查当前豪猪余额（元）；查询失败返回 -1 和错误。
 func (a *AutoEnroller) Balance(ctx context.Context) (float64, error) {
-	return a.hzm.Balance(ctx)
+	c := a.CurrentSMSClient()
+	if c == nil {
+		return -1, errors.New("接码客户端未配置")
+	}
+	return c.Balance(ctx)
 }
 
 // EnrollAccountSummary 账户卡片数据：一次调用拿全（WebUI「豪猪账户」卡片，
 // GET /admin/account/sms/haozhuma/summary 的响应体）。
 type EnrollAccountSummary struct {
+	Warning     string  `json:"warning,omitempty"`
 	Balance     float64 `json:"balance"`
 	Occupied    int     `json:"occupied"`   // 平台侧占用号数；-1 = 未知
 	HeldLocal   int     `json:"held_local"` // 本地账本"仍占着额度"的号数
@@ -443,6 +448,7 @@ func (a *AutoEnroller) Summary(ctx context.Context) (EnrollAccountSummary, error
 		return base, err
 	}
 	base.Balance = s.Balance
+	base.Warning = s.Warning
 	base.Occupied = s.Occupied
 	base.UID = hzm.UID()
 	base.ISP = hzm.ISP
@@ -511,6 +517,7 @@ func (a *AutoEnroller) FetchSnapshot() (sid, author, uid string, uids []string, 
 // 零值成员一律取默认值，所以调用方只填用户显式给的部分即可——这样新增参数
 // 不会打破既有调用点。
 type AutoRunOptions struct {
+	ProviderMode string
 	// Want 目标成功数（必填，>0）。
 	Want int
 	// Workers 并发数。<=0 用 defaultWorkers，>maxWorkers 夹住。
@@ -565,10 +572,18 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 		a.mu.Unlock()
 		return errors.New("自动加号已在进行中")
 	}
+	if a.hzm == nil {
+		a.mu.Unlock()
+		return errors.New("接码客户端未配置")
+	}
+	if err := a.hzm.ValidateMode(opts.ProviderMode); err != nil {
+		a.mu.Unlock()
+		return err
+	}
 	// 快照本次启动检查用的阈值（SetLimits 运行中热改只影响后续轮次）。
 	minBalance := a.minBalance
 	// 开跑前先看余额：不够一次成功就别启动，省得用户以为在跑其实取不到号。
-	if bal, err := a.hzm.Balance(context.Background()); err == nil && bal >= 0 && bal < minBalance {
+	if bal, err := a.hzm.Balance(haozhuma.WithMode(context.Background(), opts.ProviderMode)); err == nil && bal >= 0 && bal < minBalance {
 		a.mu.Unlock()
 		return fmt.Errorf("豪猪余额不足（当前 %.2f 元，低于阈值 %.2f 元），请充值后再启动", bal, minBalance)
 	}
@@ -598,6 +613,7 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	// ctx/cancel 必须在置 running 之前就绪：否则"启动后立刻点停止"会
 	// 撞上 a.cancel 还是 nil，Stop 静默失效（用户以为停了其实还在跑）。
 	ctx, cancel := context.WithCancel(context.Background())
+	ctx = haozhuma.WithMode(ctx, opts.ProviderMode)
 	a.cancel = cancel
 	a.mu.Unlock()
 	go func() {
@@ -800,6 +816,11 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 					}
 					// token 失效：重登一次再继续；重登失败则停。
 					if errors.As(err, &ae) && ae.TokenInvalid() {
+						if ae.Provider == "ecode" {
+							setStop("E码云 token 失效，请更新凭据后重试")
+							cancel()
+							return
+						}
 						a.reloginOnce()
 						continue
 					}
@@ -870,6 +891,7 @@ func (a *AutoEnroller) markReleased(phone string) {
 		a.persistLedgerLocked()
 	}
 	a.mu.Unlock()
+	a.hzm.ForgetPhone(phone)
 }
 
 // heldPhones 返回当前仍占着的号码快照。
@@ -893,6 +915,9 @@ func (a *AutoEnroller) persistLedgerLocked() {
 	}
 	phones := make([]string, 0, len(a.held))
 	for p := range a.held {
+		if a.hzm.IsEcodePhone(p) {
+			continue
+		}
 		phones = append(phones, p)
 	}
 	raw, err := json.Marshal(phones)

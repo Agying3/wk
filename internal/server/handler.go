@@ -67,7 +67,8 @@ type Config struct {
 	// HaozhumaClient 豪猪接码客户端（可选）。配置了 sms.haozhuma 时由 main
 	// 注入；NewHandler 内部用它组装 AutoEnroll（persist/find 回调指向 handler）。
 	HaozhumaClient *haozhuma.Client
-	// HaozhumaSid 豪猪项目 ID（如 52283 腾讯科技[限对接]）。
+	// HaozhumaSid 豪猪项目 ID（如 52283 腾讯科技[限对接]）。provider=ecode
+	// 时该值语义为短信关键词 keyWord（如"腾讯科技"）。
 	HaozhumaSid string
 	// SetHaozhumaSid 运行时切换豪猪项目 ID。NewHandler 组装 AutoEnroll 后
 	// 自动接上（见 NewHandler）；main 无需注入。nil = 自动加号未启用，
@@ -80,6 +81,9 @@ type Config struct {
 	// NewHandler 组装 AutoEnroll 后自动接上。nil = 未启用，只落盘
 	//（重启后生效）。
 	ReplaceHaozhumaClient func(c *haozhuma.Client) error
+	// FallbackModeEcho 当前兜底挂载状态回显（前端切换按钮用）。
+	// NewHandler 组装后自动接上；无 AutoEnroll 时返回 false。
+	FallbackModeEcho func() bool
 	// HaozhumaH5 豪猪网页版只读客户端（可选，P1 增强）。main 在
 	// sms.haozhuma.h5_session 非空时创建并注入；nil = 未启用，项目搜索/
 	// 对接码选择端点返回 503，前端退化为手填。会话可随时热贴
@@ -589,6 +593,7 @@ func NewHandler(cfg Config) *Handler {
 			}
 		})
 		h.cfg.ReplaceHaozhumaClient = h.cfg.AutoEnroll.ReplaceClient
+		h.cfg.FallbackModeEcho = h.cfg.AutoEnroll.FallbackMounted
 		h.cfg.SetAutoEnrollLimits = h.cfg.AutoEnroll.SetLimits
 		h.cfg.SetAutoEnrollRetry = func(seconds int) {
 			h.cfg.AutoEnroll.SetRetryDelay(time.Duration(seconds) * time.Second)
@@ -1128,17 +1133,7 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 		// SMS 豪猪接码配置（WebUI「自动加号」页）。sid/author/uid/isp 是
 		// 明文回显（非凭据）；user/token 做脱敏、pass/token 只回"有没有"。
 		SMS struct {
-			Haozhuma struct {
-				Sid       string   `json:"sid"`
-				Author    string   `json:"author"`
-				UID       string   `json:"uid"`
-				UIDs      []string `json:"uids"`
-				ISP       string   `json:"isp"`
-				User      string   `json:"user"`
-				Pass      string   `json:"pass"`
-				Token     string   `json:"token"`
-				H5Session string   `json:"h5_session"`
-			} `json:"haozhuma"`
+			Haozhuma haozhuma.Settings `json:"haozhuma"`
 		} `json:"sms"`
 		// AutoEnroll 任务控制参数（WebUI「高级设置」）。老配置没有该节时
 		// 用当前 AutoEnroller 实例的生效值兜底回显（它包含环境变量/默认值）。
@@ -1235,10 +1230,32 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 				"uid":    c.SMS.Haozhuma.UID,
 				"uids":   c.SMS.Haozhuma.UIDs,
 				"isp":    c.SMS.Haozhuma.ISP,
+				// 双平台共存：模式/主 provider 明文；兜底挂载状态优先取
+				// 运行时（FallbackModeEcho），配置文件值兜底。
+				"mode":               c.SMS.Haozhuma.Mode,
+				"provider":           c.SMS.Haozhuma.Provider,
+				"ecode_keyword":      c.SMS.Haozhuma.EcodeKeyword,
+				"ecode_base":         c.SMS.Haozhuma.EcodeBase,
+				"ecode_card_type":    c.SMS.Haozhuma.EcodeCardType,
+				"ecode_province":     c.SMS.Haozhuma.EcodeProvince,
+				"fallback_base":      c.SMS.Haozhuma.FallbackBase,
+				"fallback_card_type": c.SMS.Haozhuma.FallbackCardType,
+				"fallback_province":  c.SMS.Haozhuma.FallbackProvince,
+				"fallback_mounted": func() bool {
+					if h.cfg.FallbackModeEcho != nil {
+						return h.cfg.FallbackModeEcho()
+					}
+					return c.SMS.Haozhuma.Fallback != ""
+				}(),
 				// 凭据脱敏：user 前后各 2 位（不足 5 位全 *）；pass/token
 				// 只回"有没有"，值本体绝不出接口。
 				"auth": map[string]any{
-					"mode":      haozhumaAuthMode(c.SMS.Haozhuma.User, c.SMS.Haozhuma.Token),
+					"mode": func() string {
+						if c.SMS.Haozhuma.Provider == "ecode" {
+							return "token"
+						}
+						return haozhumaAuthMode(c.SMS.Haozhuma.User, c.SMS.Haozhuma.Token)
+					}(),
 					"user":      maskCredential(c.SMS.Haozhuma.User),
 					"has_pass":  c.SMS.Haozhuma.Pass != "",
 					"has_token": c.SMS.Haozhuma.Token != "",
@@ -1384,6 +1401,22 @@ type smsPatch struct {
 		User   *string   `json:"user"`
 		Pass   *string   `json:"pass"`
 		Token  *string   `json:"token"`
+		// provider=ecode 系（E码云/D1）取号参数。nil = 不改。
+		Provider      *string `json:"provider"`
+		EcodeBase     *string `json:"ecode_base"`
+		EcodeKeyword  *string `json:"ecode_keyword"`
+		EcodeCardType *string `json:"ecode_card_type"`
+		EcodeProvince *string `json:"ecode_province"`
+		// Mode 双平台选择模式（前端热切换）：auto/haozhuma/ecode/both。
+		// 独立于 provider——provider 定主客户端构建形态，mode 定运行时
+		// 取号路由。nil = 不改。
+		Mode *string `json:"mode"`
+		// Fallback 兜底平台（E码云系）API token。nil = 不改；""= 清空
+		//（摘掉兜底）。非空时验证通过才落盘（与主凭据同链路）。
+		Fallback         *string `json:"fallback"`
+		FallbackBase     *string `json:"fallback_base"`
+		FallbackCardType *string `json:"fallback_card_type"`
+		FallbackProvince *string `json:"fallback_province"`
 	} `json:"haozhuma"`
 }
 
@@ -1443,8 +1476,12 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
 	var req struct {
-		CheckinHours   []int `json:"checkin_hours"`
-		KeepaliveHours []int `json:"keepalive_hours"`
+		// CheckinHours / KeepaliveHours 历史上必填（整体替换）。2026-10 起改
+		// 指针语义：nil = 未提供（保留 config.json 现值）——否则任何局部
+		// PATCH（如 sms.haozhuma.mode 热切换）都会被小时校验 400 挡掉。
+		// 老前端带这两字段时行为不变（仍整体替换）。
+		CheckinHours   *[]int `json:"checkin_hours"`
+		KeepaliveHours *[]int `json:"keepalive_hours"`
 		// Schedule 完整排程补丁（五类任务时点 + 开关）。指针语义：nil = 未提供
 		// （保留 config.json 现值），给出数组 = 整体替换该时点集。
 		TravelHours           *[]int                `json:"travel_hours"`
@@ -1481,11 +1518,27 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if req.MaxRequestBody != nil && req.MaxRequestBody.MB == nil {
 		req.MaxRequestBody.MB = req.MaxRequestBody.LegacyMiB
 	}
-	checkinHours, checkinOK := normalizeScheduleHours(req.CheckinHours)
-	keepaliveHours, keepaliveOK := normalizeScheduleHours(req.KeepaliveHours)
-	if !checkinOK || !keepaliveOK {
-		writeJSON(w, 400, map[string]string{"error": "每项至少填写一个 0-23 的整数小时"})
-		return
+	// 排程时点校验（PATCH 语义）：显式提供的数组才校验/去重；未提供
+	// （nil）跳过——前端热切换单一字段（如 sms.haozhuma.mode）时不会带
+	// schedule 节，老逻辑 nil 会被 normalizeScheduleHours 判 false 直接
+	// 400，把不相关的单字段补丁全挡掉。nil 时保持 nil（下游落盘/排程
+	// 均按"未提供 = 保留现值"处理）。
+	var checkinHours, keepaliveHours []int
+	if req.CheckinHours != nil {
+		var ok bool
+		checkinHours, ok = normalizeScheduleHours(*req.CheckinHours)
+		if !ok {
+			writeJSON(w, 400, map[string]string{"error": "checkin_hours 每项需为 0-23 的整数小时"})
+			return
+		}
+	}
+	if req.KeepaliveHours != nil {
+		var ok bool
+		keepaliveHours, ok = normalizeScheduleHours(*req.KeepaliveHours)
+		if !ok {
+			writeJSON(w, 400, map[string]string{"error": "keepalive_hours 每项需为 0-23 的整数小时"})
+			return
+		}
 	}
 	for _, pair := range []struct {
 		hours *[]int
@@ -1604,7 +1657,7 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	// 鉴权字段（user/pass/token）的运行态保护：任务运行中换客户端会让
 	// 在途号码的收码/释放打到新 token 上。校验+构建新客户端在落盘段做
 	//（需要读 config.json 现值），这里先挡运行态。
-	if req.SMS != nil && h.haozhumaAuthPatchPresent(req.SMS) && h.cfg.AutoEnroll != nil && h.cfg.AutoEnroll.Status().Running {
+	if req.SMS != nil && supplierPatchPresent(req.SMS) && h.cfg.AutoEnroll != nil && h.cfg.AutoEnroll.Status().Running {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": ErrBusyAuth.Error()})
 		return
 	}
@@ -1652,9 +1705,14 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	if schedule == nil {
 		schedule = map[string]any{}
 	}
-	// 老字段：checkin/keepalive（本端点历史上必填，保持整体替换语义）。
-	schedule["checkin_hours"] = checkinHours
-	schedule["keepalive_hours"] = keepaliveHours
+	// 老字段：checkin/keepalive。历史语义是必填整体替换；PATCH 放宽后
+	// nil = 未提供 → 保留 config.json 现值（不再清空）。
+	if checkinHours != nil {
+		schedule["checkin_hours"] = checkinHours
+	}
+	if keepaliveHours != nil {
+		schedule["keepalive_hours"] = keepaliveHours
+	}
 	// 新字段：显式给出的才写；bool 开关同样指针判空。
 	if req.TravelHours != nil {
 		schedule["travel_hours"] = *req.TravelHours
@@ -1781,6 +1839,45 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		if req.SMS.Haozhuma.ISP != nil {
 			hz["isp"] = strings.TrimSpace(*req.SMS.Haozhuma.ISP)
 		}
+		// E码云系（provider=ecode）取号参数：基址/卡类型/归属地。
+		if req.SMS.Haozhuma.EcodeKeyword != nil {
+			hz["ecode_keyword"] = strings.TrimSpace(*req.SMS.Haozhuma.EcodeKeyword)
+		}
+		if req.SMS.Haozhuma.EcodeBase != nil {
+			hz["ecode_base"] = strings.TrimSpace(*req.SMS.Haozhuma.EcodeBase)
+		}
+		if req.SMS.Haozhuma.EcodeCardType != nil {
+			hz["ecode_card_type"] = strings.TrimSpace(*req.SMS.Haozhuma.EcodeCardType)
+		}
+		if req.SMS.Haozhuma.EcodeProvince != nil {
+			hz["ecode_province"] = strings.TrimSpace(*req.SMS.Haozhuma.EcodeProvince)
+		}
+		if req.SMS.Haozhuma.Provider != nil {
+			hz["provider"] = strings.TrimSpace(*req.SMS.Haozhuma.Provider)
+		}
+		// 双平台模式/兜底平台参数（热切换与 E码云兜底配置）。
+		if req.SMS.Haozhuma.Mode != nil {
+			m := strings.TrimSpace(*req.SMS.Haozhuma.Mode)
+			switch m {
+			case "", "auto", "haozhuma", "ecode", "both":
+				hz["mode"] = m
+			default:
+				writeJSON(w, 400, map[string]string{"error": "mode 只能是 auto/haozhuma/ecode/both"})
+				return
+			}
+		}
+		if req.SMS.Haozhuma.Fallback != nil {
+			hz["fallback"] = strings.TrimSpace(*req.SMS.Haozhuma.Fallback)
+		}
+		if req.SMS.Haozhuma.FallbackBase != nil {
+			hz["fallback_base"] = strings.TrimSpace(*req.SMS.Haozhuma.FallbackBase)
+		}
+		if req.SMS.Haozhuma.FallbackCardType != nil {
+			hz["fallback_card_type"] = strings.TrimSpace(*req.SMS.Haozhuma.FallbackCardType)
+		}
+		if req.SMS.Haozhuma.FallbackProvince != nil {
+			hz["fallback_province"] = strings.TrimSpace(*req.SMS.Haozhuma.FallbackProvince)
+		}
 		if len(hz) > 0 {
 			sms["haozhuma"] = hz
 			doc["sms"] = sms
@@ -1791,70 +1888,21 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	// 失败原样报错、什么都不动——绝不把一个坏 token 存进配置把运行中的
 	// 自动加号搞挂。
 	var haozhumaNewClient *haozhuma.Client
-	if h.haozhumaAuthPatchPresent(req.SMS) {
-		cur := struct {
-			SMS struct {
-				Haozhuma struct {
-					User string `json:"user"`
-					Pass string `json:"pass"`
-					// Token 指针：显式清空 token（改回纯账密模式）合法。
-					Token *string `json:"token"`
-					// 取号参数带上：新客户端要保持当前 author/uid/isp。
-					Author string `json:"author"`
-					UID    string `json:"uid"`
-					ISP    string `json:"isp"`
-				} `json:"haozhuma"`
-			} `json:"sms"`
-		}{}
-		_ = json.Unmarshal(raw, &cur)
-		user, pass := cur.SMS.Haozhuma.User, cur.SMS.Haozhuma.Pass
-		if req.SMS.Haozhuma.User != nil {
-			user = strings.TrimSpace(*req.SMS.Haozhuma.User)
+	mergeSMSCredentials(doc, req.SMS)
+	if supplierPatchPresent(req.SMS) {
+		settings := smsSettingsFromDoc(doc)
+		var previous *haozhuma.Client
+		if h.cfg.AutoEnroll != nil {
+			previous = h.cfg.AutoEnroll.CurrentSMSClient()
 		}
-		if req.SMS.Haozhuma.Pass != nil {
-			pass = *req.SMS.Haozhuma.Pass
-		}
-		token := ""
-		if cur.SMS.Haozhuma.Token != nil {
-			token = strings.TrimSpace(*cur.SMS.Haozhuma.Token)
-		}
-		if req.SMS.Haozhuma.Token != nil {
-			token = strings.TrimSpace(*req.SMS.Haozhuma.Token)
-		}
-		if user == "" && token == "" {
-			writeJSON(w, 400, map[string]string{"error": "账号与 token 至少要填一个（豪猪 API 凭据）"})
-			return
-		}
-		client, err := h.buildHaozhumaClient(user, pass, token,
-			cur.SMS.Haozhuma.Author, cur.SMS.Haozhuma.UID, cur.SMS.Haozhuma.ISP)
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		client, err := haozhuma.Build(ctx, settings, haozhumaBase, previous, true)
+		cancel()
 		if err != nil {
-			writeJSON(w, 400, map[string]string{"error": "豪猪凭据验证失败，未保存：" + err.Error()})
+			writeJSON(w, 400, map[string]string{"error": "接码配置验证失败，未保存：" + err.Error()})
 			return
 		}
 		haozhumaNewClient = client
-		// 验证通过：落盘新凭据（pass/token 未提供时保留文件现值）。
-		sms, _ := doc["sms"].(map[string]any)
-		if sms == nil {
-			sms = map[string]any{}
-		}
-		hz, _ := sms["haozhuma"].(map[string]any)
-		if hz == nil {
-			hz = map[string]any{}
-		}
-		hz["user"] = user
-		// pass：显式提供才写（避免把"没填"落成空串清掉现有密码）。
-		if req.SMS.Haozhuma.Pass != nil {
-			hz["pass"] = *req.SMS.Haozhuma.Pass
-		}
-		if user != "" {
-			// 账密模式下 token 由 login 动态持有，不落盘（旧 token 失效后
-			// 会误导排查）。显式清空 = 改回账密优先。
-			hz["token"] = ""
-		} else if req.SMS.Haozhuma.Token != nil {
-			hz["token"] = token
-		}
-		sms["haozhuma"] = hz
-		doc["sms"] = sms
 	}
 	// 任务控制参数（autoenroll 节）：增量合并，只写显式提供的字段。
 	if req.AutoEnrollCfg != nil {
@@ -1902,8 +1950,40 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		doc["response_history"] = historyPolicy
 	}
 	out, _ := json.MarshalIndent(doc, "", "  ")
-	if err := writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600); err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
+	persistAttempted := false
+	persistSMS := func() error {
+		persistAttempted = true
+		return writeFileAtomic(h.cfg.ConfigPath, append(out, '\n'), 0600)
+	}
+	var saveErr error
+	if h.cfg.AutoEnroll != nil && req.SMS != nil && (haozhumaNewClient != nil || req.SMS.Haozhuma.Mode != nil) {
+		saveErr = h.cfg.AutoEnroll.ApplySMSUpdate(haozhumaNewClient, req.SMS.Haozhuma.Mode, persistSMS)
+	} else {
+		if req.SMS != nil && req.SMS.Haozhuma.Mode != nil {
+			settings := smsSettingsFromDoc(doc)
+			if err := settings.Validate(); err != nil {
+				writeJSON(w, 400, map[string]string{"error": err.Error()})
+				return
+			}
+			mode := *req.SMS.Haozhuma.Mode
+			if mode == "ecode" && settings.Provider != "ecode" && settings.Fallback == "" ||
+				mode == "both" && (settings.Provider == "ecode" || settings.Fallback == "") ||
+				mode == "haozhuma" && settings.Provider == "ecode" {
+				writeJSON(w, 400, map[string]string{"error": "所选模式的接码平台尚未配置"})
+				return
+			}
+		}
+		saveErr = persistSMS()
+	}
+	if saveErr != nil {
+		status := http.StatusBadRequest
+		if persistAttempted {
+			status = http.StatusInternalServerError
+		}
+		if errors.Is(saveErr, ErrBusyAuth) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": saveErr.Error()})
 		return
 	}
 	// 对接码池自动生命周期（H5 账户侧同步）：uids 显式提供时，把"新勾选
@@ -2058,16 +2138,21 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 	// 鉴权热替换：验证通过的客户端直接换上。AutoEnroll 未组装（启动时
 	// 没配豪猪）时只落盘，重启后生效。
 	if haozhumaNewClient != nil {
-		if h.cfg.ReplaceHaozhumaClient != nil {
-			if err := h.cfg.ReplaceHaozhumaClient(haozhumaNewClient); err != nil {
-				// 理论上到不了这（前面已挡运行态），防御性兜底。
-				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-				return
-			}
+		if h.cfg.AutoEnroll != nil {
 			updated["haozhuma_auth"] = "reconnected"
 		} else {
 			updated["haozhuma_auth"] = "saved"
 			updated["haozhuma_auth_restart_required"] = true
+		}
+	}
+	if req.SMS != nil && req.SMS.Haozhuma.Mode != nil {
+		updated["provider_mode"] = *req.SMS.Haozhuma.Mode
+	}
+	if req.SMS != nil && req.SMS.Haozhuma.Fallback != nil {
+		if *req.SMS.Haozhuma.Fallback == "" {
+			updated["fallback"] = "cleared"
+		} else {
+			updated["fallback"] = "mounted"
 		}
 	}
 	// 任务控制参数热改：autoenroll 节显式提供的字段即时生效。
@@ -2165,6 +2250,12 @@ func (h *Handler) buildHaozhumaClient(user, pass, token, author, uid, isp string
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	// 验证读取当前文件配置，避免热切换后仍使用启动时的 provider。
+	smsSettings := h.currentSMSSettings()
+	if smsSettings.Provider == "ecode" {
+		smsSettings.Token, smsSettings.User, smsSettings.Pass = token, "", ""
+		return haozhuma.Build(ctx, smsSettings, haozhumaBase, nil, true)
+	}
 	if user != "" && pass != "" {
 		c := haozhuma.NewWithCredentials(token, user, pass)
 		c.Base = haozhumaBase
@@ -3210,9 +3301,18 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		MaxAttempts int `json:"max_attempts"`
 		// Groups 新账号登记的分组（多选；不填/空 = default）。
 		Groups []string `json:"groups"`
+		// Provider 本任务的取号平台（临时覆盖，不改全局配置）：
+		// haozhuma/ecode/both/auto；空 = 用全局 mode。
+		Provider string `json:"provider"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
+		return
+	}
+	switch strings.TrimSpace(req.Provider) {
+	case "", "auto", "haozhuma", "ecode", "both":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider 只能是 auto/haozhuma/ecode/both"})
 		return
 	}
 	if req.Count < 1 || req.Count > 50 {
@@ -3253,11 +3353,12 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := h.cfg.AutoEnroll.AutoRunWith(AutoRunOptions{
-		Want:        req.Count,
-		Workers:     req.Workers,
-		PollCount:   req.PollCount,
-		MaxAttempts: req.MaxAttempts,
-		Groups:      req.Groups,
+		Want:         req.Count,
+		Workers:      req.Workers,
+		PollCount:    req.PollCount,
+		MaxAttempts:  req.MaxAttempts,
+		Groups:       req.Groups,
+		ProviderMode: strings.TrimSpace(req.Provider),
 	})
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})

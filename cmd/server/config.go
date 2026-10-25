@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/responsehistory"
 )
 
@@ -148,34 +149,7 @@ type Config struct {
 		} `json:"proxy"`
 		// Haozhuma 豪猪接码平台（haozhuma.com），用于自动加号：取号 →
 		// 走本服务的短信直登链 → 收码 → 落盘账号。
-		Haozhuma struct {
-			// User / Pass 豪猪 API 账号密码（login 换 token 用）。
-			User string `json:"user"`
-			Pass string `json:"pass"`
-			// Token 已有 token 时直接用，跳过 login。
-			Token string `json:"token"`
-			// Sid 项目 ID。52283 = 腾讯科技[限对接]。
-			Sid string `json:"sid"`
-			// Author 「[限对接]」项目的对接方标识。留空则不下发。
-			// 注意：实测 52283 项目带 author=adminzfz 反而取不到号，默认留空。
-			Author string `json:"author"`
-			// UID 指定对接码（豪猪后台的"对接码 UID"）。一个 sid 下可能挂了
-			// 多个对接商，质量不一：不指定时平台随机分配，可能撞上没号的那个。
-			// 实测指定有号的对接码成功率 6/6，随机只有 3/6。
-			UID string `json:"uid"`
-			// UIDs 多对接码轮换池（2026-09）。配置后 GetPhone 在这些码间
-			// round-robin；某码失效自动出池（并经 H5 从账户移除），池空退
-			// 回单 uid / 平台自动分配。WebUI 对接码浮窗多选写这里，uid 字段
-			// 保留兼容旧配置（池非空时忽略单值）。
-			UIDs []string `json:"uids"`
-			// ISP 取号运营商优先级：1=移动 2=联通 3=电信，逗号分隔依次降级，
-			// 最后自动退回"不限"。留空表示直接不限。
-			ISP string `json:"isp"`
-			// H5Session 豪猪网页版（h5.haozhuma.com）的 PHPSESSID Cookie。
-			// 只服务 WebUI 的项目搜索/对接码选择增强（P1）；未配置时选择器
-			// 退化为手填。与接码 API 的 token 无关，失效不影响任务链路。
-			H5Session string `json:"h5_session"`
-		} `json:"haozhuma"`
+		Haozhuma haozhuma.Settings `json:"haozhuma"`
 	} `json:"sms"`
 
 	// AutoEnroll 自动加号的任务控制参数（WebUI「高级设置」）。指针类型区分

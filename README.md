@@ -611,3 +611,18 @@ internal/
 ## License
 
 MIT
+
+
+### 接码平台与任务选择
+
+自动加号支持豪猪和 E码云（D1 同模板）。在「自动加号 → 接码平台配置」中配置主平台、Token、E码云短信关键词、API 地址、卡类型和省份；豪猪主用时可挂载 E码云兜底。凭据、平台和关键词修改需等任务结束，验证失败或写盘失败均保留原配置。
+
+配置继续使用 `sms.haozhuma`，默认 `provider=haozhuma`、`mode=auto`，兼容原有豪猪配置。豪猪 `sid`（如 `52283`）与 `ecode_keyword`（如 `腾讯科技`）必须分开填写。E码云主用使用主 `token`；豪猪主用的 E码云凭据使用 `fallback`，地址、卡类型、省份分别使用 `fallback_base`、`fallback_card_type`、`fallback_province`。默认 E码云 API 为 `https://api.eomsg.com/zc/data.php`，D1 为 `https://api.uomsg.com/zc/data.php`。示例只保留空凭据。
+
+- `auto`：豪猪优先，失败后尝试 E码云；仅配置 E码云时直接使用 E码云。
+- `haozhuma` / `ecode`：只用指定平台，未配置时明确拒绝。
+- `both`：按取号轮次交替首选，失败时尝试另一侧；需要同时配置两平台，不承诺吞吐翻倍。
+- 「本次任务平台」只覆盖当前批次；跟随全局时下一次取号读取最新全局选择。在途号码始终沿用取号时的平台和关键词。
+- 豪猪对接码监控任务固定使用豪猪，避免 E码云消费进入豪猪项目预算。
+
+供应商请求及实际费用以平台规则为准。仓库、示例与日志不得写入真实 Token。

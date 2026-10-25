@@ -25,6 +25,17 @@ type Client struct {
 	Timeout time.Duration
 	HTTP    *http.Client
 
+	// Provider/Keyword/CardType/Province 在客户端构建完成后不再修改。
+	Provider       string
+	Keyword        string
+	CardType       string
+	Province       string
+	mode           string
+	fallback       *Client
+	preferFallback bool
+	routes         map[string]phoneRoute
+	settings       *Settings
+
 	// user/pass 留着，token 失效时 Relogin 用。
 	mu   sync.Mutex
 	user string
@@ -217,6 +228,9 @@ func Login(user, password string) (*Client, error) {
 // Relogin 用保存的账号密码重换 token（token 失效时调用）。
 // 没存过凭据（token 直建模式）时返回错误。
 func (c *Client) Relogin() error {
+	if c.Provider == "ecode" {
+		return errors.New("E码云 token 失效，请更新凭据")
+	}
 	c.mu.Lock()
 	user, pass := c.user, c.pass
 	c.mu.Unlock()
@@ -335,13 +349,17 @@ func (c *Client) call(ctx context.Context, api string, params url.Values) (map[s
 }
 
 type APIError struct {
-	API  string
-	Code string
-	Msg  string
-	Raw  map[string]any
+	Provider string
+	API      string
+	Code     string
+	Msg      string
+	Raw      map[string]any
 }
 
 func (e *APIError) Error() string {
+	if e.Provider == "ecode" {
+		return fmt.Sprintf("E码云[%s] code=%s msg=%s", e.API, e.Code, e.Msg)
+	}
 	return fmt.Sprintf("豪猪[%s] code=%s msg=%s", e.API, e.Code, e.Msg)
 }
 
@@ -431,6 +449,7 @@ func (e *APIError) TokenInvalid() bool {
 type Summary struct {
 	Balance  float64
 	Occupied int
+	Warning  string
 }
 
 // Balance 返回 getSummary 里的余额（元）。解析失败返回 -1。
@@ -440,7 +459,10 @@ func (c *Client) Balance(ctx context.Context) (float64, error) {
 	return s.Balance, err
 }
 
-func (c *Client) Summary(ctx context.Context) (Summary, error) {
+func (c *Client) summaryDirect(ctx context.Context) (Summary, error) {
+	if c.Provider == "ecode" {
+		return c.ecodeSummary(ctx)
+	}
 	raw, err := c.call(ctx, "getSummary", url.Values{"token": {c.Token}})
 	if err != nil {
 		return Summary{}, err
@@ -496,7 +518,10 @@ func truncate(s string, n int) string {
 // 多码轮换（2026-09）：配置了 SetUIDs 池时，每次调用从池里 round-robin
 // 取一个码用；某码报「专属码不存在」自动出池（记入 drained，上层负责
 // 从豪猪账户移除），换下一个码继续；池耗尽后退回平台自动分配。
-func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
+func (c *Client) getPhoneDirect(ctx context.Context, sid string) (string, error) {
+	if c.Provider == "ecode" {
+		return c.ecodePhone(ctx, sid)
+	}
 	// 轮换池模式：逐码尝试（每码内部仍按 ISP 降级）。
 	if len(c.uidsSnapshot()) > 0 {
 		var lastErr error
@@ -657,7 +682,10 @@ func redactNetErr(err error) error {
 
 // GetMessage 查一次短信。返回 sms 原文与 code 状态。
 // 官方 SDK 还会看 yzm 字段（有的项目把码单独放那里），这里两个都取。
-func (c *Client) GetMessage(ctx context.Context, sid, phone string) (string, error) {
+func (c *Client) getMessageDirect(ctx context.Context, sid, phone string) (string, error) {
+	if c.Provider == "ecode" {
+		return c.ecodeMessage(ctx, sid, phone)
+	}
 	raw, err := c.call(ctx, "getMessage", url.Values{
 		"token": {c.Token}, "sid": {sid}, "phone": {phone},
 	})
@@ -675,7 +703,10 @@ func (c *Client) GetMessage(ctx context.Context, sid, phone string) (string, err
 }
 
 // Release 释放号码（cancelRecv）。
-func (c *Client) Release(ctx context.Context, sid, phone string) error {
+func (c *Client) releaseDirect(ctx context.Context, sid, phone string) error {
+	if c.Provider == "ecode" {
+		return nil
+	}
 	_, err := c.call(ctx, "cancelRecv", url.Values{
 		"token": {c.Token}, "sid": {sid}, "phone": {phone},
 	})
@@ -687,7 +718,10 @@ func (c *Client) Release(ctx context.Context, sid, phone string) error {
 // 或界面上手动兜底（豪猪后台也有同款按钮）。注意它会释放**所有**
 // 占用号，不区分是谁取的；任务运行中调用会把在途号码一起放掉，
 // 调用方需自行保证没有并发取号。
-func (c *Client) ReleaseAll(ctx context.Context) error {
+func (c *Client) releaseAllDirect(ctx context.Context) error {
+	if c.Provider == "ecode" {
+		return nil
+	}
 	_, err := c.call(ctx, "cancelAllRecv", url.Values{
 		"token": {c.Token},
 	})
@@ -695,7 +729,10 @@ func (c *Client) ReleaseAll(ctx context.Context) error {
 }
 
 // Blacklist 拉黑号码（收不到码的号）。
-func (c *Client) Blacklist(ctx context.Context, sid, phone string) error {
+func (c *Client) blacklistDirect(ctx context.Context, sid, phone string) error {
+	if c.Provider == "ecode" {
+		return nil
+	}
 	_, err := c.call(ctx, "addBlacklist", url.Values{
 		"token": {c.Token}, "sid": {sid}, "phone": {phone},
 	})

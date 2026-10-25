@@ -119,11 +119,11 @@ func (f *fakeWatchH5) client() *h5.Client {
 // watchTestEnv 一次搭齐：fake H5 + fake 豪猪（取号失败即可，我们只测
 // watcher 的判定/记账）+ AutoEnroller + UIDWatcher。
 type watchTestEnv struct {
-	fh   *fakeWatchH5
-	fz   *fakeHZM
-	en   *AutoEnroller
-	w    *UIDWatcher
-	tmp  string
+	fh  *fakeWatchH5
+	fz  *fakeHZM
+	en  *AutoEnroller
+	w   *UIDWatcher
+	tmp string
 }
 
 func newWatchEnv(t *testing.T, table map[string]string) *watchTestEnv {
@@ -141,6 +141,7 @@ func newWatchEnv(t *testing.T, table map[string]string) *watchTestEnv {
 	en.pollCount = 3
 	tmp := t.TempDir()
 	w := NewUIDWatcher(WatchConfig{}, fh.client(), en, filepath.Join(tmp, "watcher-state.json"))
+	t.Cleanup(func() { w.Stop(); en.Stop("测试结束") })
 	return &watchTestEnv{fh: fh, fz: fz, en: en, w: w, tmp: tmp}
 }
 
@@ -172,7 +173,7 @@ func TestWatcherNewUIDTriggersAndCharges(t *testing.T) {
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
 	}
-	go e.w.Run(context.Background())
+	go e.w.Run(t.Context())
 
 	waitFor(t, 10*time.Second, func() bool { return e.fz.getPhone.Load() > 0 }, "取号应被触发")
 	// 等记账完成（任务结束 + charge）。
@@ -198,7 +199,7 @@ func TestWatcherNewUIDTriggersAndCharges(t *testing.T) {
 // 但吃干（stock < want）后放行——本测试验证"自身消耗制造的假回升
 // 不会发生 + 吃干即停"。
 func TestWatcherNoSelfTrigger(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|2"})
+	e := newManualWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|2"})
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 1)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
@@ -231,7 +232,7 @@ func TestWatcherRestockTriggers(t *testing.T) {
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
 	}
-	go e.w.Run(context.Background())
+	go e.w.Run(t.Context())
 
 	waitFor(t, 10*time.Second, func() bool { return e.w.Status().TriggerTotal >= 1 }, "第一轮触发")
 	waitFor(t, 10*time.Second, func() bool { return e.w.Status().EnrolledTotal >= 1 }, "第一轮成功")
@@ -250,7 +251,7 @@ func TestWatcherRestockTriggers(t *testing.T) {
 // TestWatcherPriceDropIntoRange 降价进入区间：1.65（>1.0 被过滤）→
 // 0.88（≤1.0）→ 触发。这是用户核心场景"出现比设定价格更低的对接码"。
 func TestWatcherPriceDropIntoRange(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-PRICEY": "1.65|23"})
+	e := newManualWatchEnv(t, map[string]string{"52283-PRICEY": "1.65|23"})
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 5)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
@@ -273,7 +274,7 @@ func TestWatcherPriceDropIntoRange(t *testing.T) {
 // TestWatcherBudgetExhausted 额度耗尽：不够一次触发 → 不派活 + 暂停原因；
 // 充值后恢复。
 func TestWatcherBudgetExhausted(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
+	e := newManualWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 5)}})
 	// 额度只给 0.5（不够 0.88）。
 	if _, err := e.w.AddBudget(0.5, nil); err != nil {
@@ -330,7 +331,7 @@ func TestWatcherSkipsWhenManualRunning(t *testing.T) {
 
 // TestWatcherRestoresFetchOptions 值班轮结束后恢复用户原取号参数。
 func TestWatcherRestoresFetchOptions(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
+	e := newManualWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
 	// 用户的配置：sid=52283、author=my、单码+池、isp。
 	e.en.UpdateFetchOptions("my", "52283-USER", []string{"52283-USER", "52283-USER2"}, "1,2")
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 5)}})
@@ -358,7 +359,7 @@ func TestWatcherStatePersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, Projects: []WatchProject{e.proj(1.0, 5)}})
-	go e.w.Run(context.Background())
+	go e.w.Run(t.Context())
 	statePath := filepath.Join(e.tmp, "watcher-state.json")
 	waitFor(t, 15*time.Second, func() bool {
 		raw, err := os.ReadFile(statePath)
@@ -389,11 +390,11 @@ func TestWatcherStatePersists(t *testing.T) {
 // TestWatchConfigValidate 配置校验。
 func TestWatchConfigValidate(t *testing.T) {
 	bad := []WatchConfig{
-		{Enabled: true},                                   // 无项目
-		{Projects: []WatchProject{{Sid: "", HexSID: "a1b2c3d4e5f60718", MaxPrice: 1, MinStock: 1}}},          // 空 sid
-		{Projects: []WatchProject{{Sid: "52283", HexSID: "zz", MaxPrice: 1, MinStock: 1}}},                   // 坏 hex
-		{Projects: []WatchProject{{Sid: "52283", HexSID: "a1b2c3d4e5f60718", MaxPrice: 0, MinStock: 1}}},    // 坏价
-		{Projects: []WatchProject{{Sid: "52283", HexSID: "a1b2c3d4e5f60718", MaxPrice: 1, MinStock: 0}}},    // 坏库存
+		{Enabled: true}, // 无项目
+		{Projects: []WatchProject{{Sid: "", HexSID: "a1b2c3d4e5f60718", MaxPrice: 1, MinStock: 1}}},      // 空 sid
+		{Projects: []WatchProject{{Sid: "52283", HexSID: "zz", MaxPrice: 1, MinStock: 1}}},               // 坏 hex
+		{Projects: []WatchProject{{Sid: "52283", HexSID: "a1b2c3d4e5f60718", MaxPrice: 0, MinStock: 1}}}, // 坏价
+		{Projects: []WatchProject{{Sid: "52283", HexSID: "a1b2c3d4e5f60718", MaxPrice: 1, MinStock: 0}}}, // 坏库存
 		{Projects: []WatchProject{
 			{Sid: "52283", HexSID: "a1b2c3d4e5f60718", MaxPrice: 1, MinStock: 1},
 			{Sid: "52283", HexSID: "a1b2c3d4e5f60718", MaxPrice: 1, MinStock: 1},
@@ -478,7 +479,7 @@ func TestWatcherUnavailable(t *testing.T) {
 // TestWatcherDeadUIDRevives dead 码（上游删除）重新出现且达标 → 触发
 // "重新上架"；锁定收割模式下目标消失即清目标，回来时重新锁定。
 func TestWatcherDeadUIDRevives(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-GONE": "0.88|2"})
+	e := newManualWatchEnv(t, map[string]string{"52283-GONE": "0.88|2"})
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 1)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
@@ -521,7 +522,7 @@ func TestWatcherDeadUIDRevives(t *testing.T) {
 // TestWatcherMultipleCandidatesQueued 锁定收割下的多候选：选最便宜
 // 的锁定，吃干它，下一轮自动切到次便宜的——每轮只收割一个目标。
 func TestWatcherMultipleCandidatesQueued(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{
+	e := newManualWatchEnv(t, map[string]string{
 		"52283-A": "0.50|1",
 		"52283-B": "0.30|1",
 		"52283-C": "0.40|1",
@@ -574,7 +575,7 @@ func TestWatcherMultipleCandidatesQueued(t *testing.T) {
 // TestWatcherCandidateOverflowKeepsEvent 候选多但本轮只锁定一个：
 // 其余候选的事件**不吞**（基线不同步），目标吃干后下轮继续按价轮到。
 func TestWatcherCandidateOverflowKeepsEvent(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{
+	e := newManualWatchEnv(t, map[string]string{
 		"52283-A": "0.10|1",
 		"52283-B": "0.20|1",
 		"52283-C": "0.30|1",
@@ -612,7 +613,7 @@ func TestWatcherCandidateOverflowKeepsEvent(t *testing.T) {
 // TestWatcherBadUIDCooldownDiffuse 给出号收不到码（sms 永远空）→
 // 本轮 0 成功 → 不扣额度 + 差码冷却（下轮同码不再触发）+ 从账户移除。
 func TestWatcherBadUIDCooldownDiffuse(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-BAD": "0.88|23"})
+	e := newManualWatchEnv(t, map[string]string{"52283-BAD": "0.88|23"})
 	// 短信永远收不到（豪猪 getMessage 一直无码）——"给得出号接不到码"。
 	e.fz.msgResp.Store(`{"code":"0","msg":"ok","sms":""}`)
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
@@ -653,7 +654,7 @@ func TestWatcherBadUIDCooldownDiffuse(t *testing.T) {
 
 // TestWatcherCooldownExpires 差码冷却到期自动恢复资格（不是拉黑）。
 func TestWatcherCooldownExpires(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-BAD": "0.88|23"})
+	e := newManualWatchEnv(t, map[string]string{"52283-BAD": "0.88|23"})
 	e.fz.msgResp.Store(`{"code":"0","msg":"ok","sms":""}`)
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
@@ -681,7 +682,7 @@ func TestWatcherCooldownExpires(t *testing.T) {
 // TestWatcherEventsRecorded 成果面板数据源：触发事件结构化入账（时间/
 // 项目/码/事件/价格/成功/花费/时长），持久化且今日汇总正确。
 func TestWatcherEventsRecorded(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
+	e := newManualWatchEnv(t, map[string]string{"52283-CHEAP": "0.88|23"})
 	e.w.Reconfigure(WatchConfig{Enabled: true, IntervalSeconds: 60, WantPerTrigger: 1, Projects: []WatchProject{e.proj(1.0, 5)}})
 	if _, err := e.w.AddBudget(10, nil); err != nil {
 		t.Fatal(err)
@@ -724,7 +725,7 @@ func TestWatcherEventsRecorded(t *testing.T) {
 // 直到可取库存 < 每轮目标才放它走。
 func TestWatcherHarvestLock(t *testing.T) {
 	// 便宜码 A（0.30）和贵码 B（0.50）同时出现；库存 3。
-	e := newWatchEnv(t, map[string]string{
+	e := newManualWatchEnv(t, map[string]string{
 		"52283-A": "0.30|3",
 		"52283-B": "0.50|3",
 	})
@@ -764,7 +765,7 @@ func TestWatcherHarvestLock(t *testing.T) {
 // 同一轮立即切换下一个候选（不等下一轮）。
 func TestWatcherHarvestSwitchOnBadUID(t *testing.T) {
 	// A 更便宜但是差码（收不到短信）；B 贵一点但好。
-	e := newWatchEnv(t, map[string]string{
+	e := newManualWatchEnv(t, map[string]string{
 		"52283-A": "0.30|3",
 		"52283-B": "0.50|3",
 	})
@@ -775,9 +776,13 @@ func TestWatcherHarvestSwitchOnBadUID(t *testing.T) {
 	}
 	e.w.tick(context.Background(), e.w.cfg)
 	// 第一轮：A（最便宜）0 成功 → 冷却 → 目标清空，**同一轮**试 B。
-	waitFor(t, 40*time.Second, func() bool { return e.w.Status().TriggerTotal >= 2 }, "差码当轮应切换 B")
-	if st := e.w.Status(); st.TargetUID != "52283-B" {
-		t.Fatalf("差码后目标应切到 B，实际 %q", st.TargetUID)
+	// tick 同步等待两轮都结束，不能再断言已经结束的中间目标 B。
+	st := e.w.Status()
+	if st.TriggerTotal != 2 || len(st.Events) != 2 {
+		t.Fatalf("同一轮应完成 A/B 两次派活：triggers=%d events=%d", st.TriggerTotal, len(st.Events))
+	}
+	if st.Events[0].UID != "52283-B" || st.Events[1].UID != "52283-A" {
+		t.Fatalf("候选切换顺序应为 A -> B，实际 %+v", st.Events)
 	}
 	// B 也全失败 → 同样冷却清目标（两个候选都消化完）。
 	waitFor(t, 40*time.Second, func() bool { return e.w.Status().TargetUID == "" }, "B 失败后目标应清空")
@@ -790,7 +795,7 @@ func TestWatcherHarvestSwitchOnBadUID(t *testing.T) {
 
 // TestWatcherStateFileShape 状态文件结构（字段名/类型约定：前端与排查依赖）。
 func TestWatcherStateFileShape(t *testing.T) {
-	e := newWatchEnv(t, map[string]string{})
+	e := newManualWatchEnv(t, map[string]string{})
 	if _, err := e.w.AddBudget(3.336, nil); err != nil { // 两位小数化
 		t.Fatal(err)
 	}
@@ -816,4 +821,11 @@ func TestWatcherStateFileShape(t *testing.T) {
 func readFileStr(path string) (string, error) {
 	b, err := os.ReadFile(path)
 	return string(b), err
+}
+
+// newManualWatchEnv 只手动驱动 tick，避免 Reconfigure 同时启动真实后台循环。
+func newManualWatchEnv(t *testing.T, table map[string]string) *watchTestEnv {
+	e := newWatchEnv(t, table)
+	e.w.reloadCh = make(chan struct{}, 1)
+	return e
 }

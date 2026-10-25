@@ -481,8 +481,8 @@ func main() {
 		Traffic:  trafficTracker,
 		// 豪猪自动加号（可选）：取号→直登→落盘全自动。与手动发码共用代理池；
 		// AutoEnroll 在 NewHandler 内部组装（persist 回调指向 handler）。
-		HaozhumaClient: newHaozhumaClient(cfg),
-		HaozhumaSid:    strings.TrimSpace(cfg.SMS.Haozhuma.Sid),
+		HaozhumaClient: newSMSCodeClient(cfg),
+		HaozhumaSid:    strings.TrimSpace(cfg.SMS.Haozhuma.Project()),
 		// 号码账本放在 state.json 同目录（部署时该目录已挂载为卷）。
 		AutoEnrollLedger: autoEnrollLedgerPath(cfg),
 		// SMS 诊断日志同目录（data/ 卷内）：完整手机号+短信原文，本机排障用。
@@ -943,4 +943,19 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 		return setup(haozhuma.New(token))
 	}
 	return nil
+}
+
+func newSMSCodeClient(cfg *Config) *haozhuma.Client {
+	s := cfg.SMS.Haozhuma
+	if s.Project() == "" || (s.Token == "" && s.User == "") {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := haozhuma.Build(ctx, s, "", nil, false)
+	if err != nil {
+		log.Printf("auto-enroll: 接码配置不可用: %v", err)
+		return nil
+	}
+	return c
 }

@@ -187,14 +187,14 @@ type watchUIDState struct {
 
 // watcherState 持久化的运行时状态。
 type watcherState struct {
-	BudgetRemaining float64                  `json:"budget_remaining"`
-	SpentTotal      float64                  `json:"spent_total"`
-	EnrolledTotal   int                     `json:"enrolled_total"`
-	TriggerTotal    int                     `json:"trigger_total"`
-	PausedReason    string                  `json:"paused_reason"`
+	BudgetRemaining float64                   `json:"budget_remaining"`
+	SpentTotal      float64                   `json:"spent_total"`
+	EnrolledTotal   int                       `json:"enrolled_total"`
+	TriggerTotal    int                       `json:"trigger_total"`
+	PausedReason    string                    `json:"paused_reason"`
 	PerUID          map[string]*watchUIDState `json:"per_uid"`
-	LastTick        string                  `json:"last_tick"`
-	UpdatedAt       string                  `json:"updated_at"`
+	LastTick        string                    `json:"last_tick"`
+	UpdatedAt       string                    `json:"updated_at"`
 	// Events 触发事件流水（环形，最近 watchEventMax 条）。成果面板的
 	// 数据源——比活动日志强：结构化（项目/码/价格/成功/花费/时长分开
 	// 字段）、持久化（重启不丢）。
@@ -208,17 +208,17 @@ type watcherState struct {
 
 // watchEvent 一次值班触发的完整生命周期记录（成果面板数据源）。
 type watchEvent struct {
-	Time     string  `json:"time"`              // 触发时刻（2006-01-02 15:04:05）
-	Day      string  `json:"day"`               // 触发日期（2006-01-02，今日汇总用）
-	Sid      string  `json:"sid"`               // 项目 ID
-	UID      string  `json:"uid"`               // 对接码
-	Ev       string  `json:"ev"`                // 事件类型（新码/降价/补货/重新上架）
-	Price    float64 `json:"price"`             // 触发时码价
-	Want     int     `json:"want"`              // 本轮目标数
-	OK       int     `json:"ok"`                // 成功数
-	Cost     float64 `json:"cost"`              // 真实花费（= OK × Price，失败 0）
-	Duration int     `json:"duration"`          // 任务耗时（秒）
-	Note     string  `json:"note,omitempty"`    // 结果备注（熔断原因/冷却标记等）
+	Time     string  `json:"time"`           // 触发时刻（2006-01-02 15:04:05）
+	Day      string  `json:"day"`            // 触发日期（2006-01-02，今日汇总用）
+	Sid      string  `json:"sid"`            // 项目 ID
+	UID      string  `json:"uid"`            // 对接码
+	Ev       string  `json:"ev"`             // 事件类型（新码/降价/补货/重新上架）
+	Price    float64 `json:"price"`          // 触发时码价
+	Want     int     `json:"want"`           // 本轮目标数
+	OK       int     `json:"ok"`             // 成功数
+	Cost     float64 `json:"cost"`           // 真实花费（= OK × Price，失败 0）
+	Duration int     `json:"duration"`       // 任务耗时（秒）
+	Note     string  `json:"note,omitempty"` // 结果备注（熔断原因/冷却标记等）
 }
 
 // watchEventMax 事件流水上限（环形裁剪）。200 条足够看一周的活跃度，
@@ -482,15 +482,15 @@ type WatchStatus struct {
 	Groups          []string       `json:"groups"`
 	Projects        []WatchProject `json:"projects"`
 
-	BudgetRemaining float64 `json:"budget_remaining"`
-	SpentTotal      float64 `json:"spent_total"`
-	EnrolledTotal   int     `json:"enrolled_total"`
-	TriggerTotal    int     `json:"trigger_total"`
-	PausedReason    string  `json:"paused_reason"`
-	Available       bool    `json:"available"` // H5 + AutoEnroller 就绪
-	Running         bool    `json:"running"`   // 值班触发的任务在跑
-	LastTick        string  `json:"last_tick"`
-	NextTick        string  `json:"next_tick"`
+	BudgetRemaining float64  `json:"budget_remaining"`
+	SpentTotal      float64  `json:"spent_total"`
+	EnrolledTotal   int      `json:"enrolled_total"`
+	TriggerTotal    int      `json:"trigger_total"`
+	PausedReason    string   `json:"paused_reason"`
+	Available       bool     `json:"available"` // H5 + AutoEnroller 就绪
+	Running         bool     `json:"running"`   // 值班触发的任务在跑
+	LastTick        string   `json:"last_tick"`
+	NextTick        string   `json:"next_tick"`
 	Logs            []string `json:"logs"`
 
 	// Events 触发事件流水（倒序：最新在前），成果面板数据源。
@@ -910,6 +910,11 @@ func (w *UIDWatcher) syncSnapshot(p WatchProject, items []haozhumah5.UIDItem, sk
 // executeTrigger 派活：加入账户 → 临时切换取号参数 → 跑一轮 → 记账 → 恢复。
 // 返回本轮成功加号数（收割循环据此决定锁定目标还是切下一个）。
 func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p WatchProject, uid string, price float64, ev string) int {
+	c := w.en.CurrentSMSClient()
+	if c == nil || c.ValidateMode("haozhuma") != nil {
+		w.log("豪猪接码未配置，跳过对接码任务")
+		return 0
+	}
 	want := cfg.want()
 	start := time.Now()
 	w.log("触发：%s %s（项目 %s）——加 %d 个号，预算 ¥%.2f", uid, ev, p.Sid, want, round2(price*float64(want)))
@@ -951,10 +956,11 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 		maxAttempts = watchAttemptCapFloor
 	}
 	err := w.en.AutoRunWith(AutoRunOptions{
-		Want:        want,
-		Workers:     cfg.workers(),
-		Groups:      cfg.Groups,
-		MaxAttempts: maxAttempts,
+		ProviderMode: "haozhuma",
+		Want:         want,
+		Workers:      cfg.workers(),
+		Groups:       cfg.Groups,
+		MaxAttempts:  maxAttempts,
 	})
 	if err != nil {
 		w.log("启动加号失败：%v（本轮放弃）", err)
