@@ -49,7 +49,11 @@ export default function SMSPlatforms({ settings, running, onSave, onSaved }) {
       const result = await onSave(patch);
       if (!result) return;
       setToken(''); setFallback('');
-      message.success('接码平台配置已保存');
+      if (result.updated?.haozhuma_auth_restart_required) {
+        message.warning('配置已保存，重启后生效');
+      } else {
+        message.success('接码平台配置已保存并即时生效');
+      }
       onSaved?.();
     } catch (err) { message.error(err.message); }
     finally { setSaving(false); }

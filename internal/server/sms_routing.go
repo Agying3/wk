@@ -13,6 +13,16 @@ func (a *AutoEnroller) CurrentSMSClient() *haozhuma.Client {
 	defer a.mu.Unlock()
 	return a.hzm
 }
+func (a *AutoEnroller) SMSConfigured() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.hzm != nil && a.sid != ""
+}
+
+func (a *AutoEnroller) HasHaozhuma() bool {
+	c := a.CurrentSMSClient()
+	return c != nil && c.ValidateMode("haozhuma") == nil
+}
 func (a *AutoEnroller) FallbackMounted() bool {
 	c := a.CurrentSMSClient()
 	return c != nil && c.Fallback() != nil

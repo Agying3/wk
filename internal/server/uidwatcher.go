@@ -526,6 +526,7 @@ type WatchDaySummary struct {
 
 // Status 当前配置 + 状态 + 日志 + 事件流水 + 今日汇总。
 func (w *UIDWatcher) Status() WatchStatus {
+	available := w.h5 != nil && w.en != nil && w.en.HasHaozhuma()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	st := WatchStatus{
@@ -540,7 +541,7 @@ func (w *UIDWatcher) Status() WatchStatus {
 		EnrolledTotal:   w.state.EnrolledTotal,
 		TriggerTotal:    w.state.TriggerTotal,
 		PausedReason:    w.state.PausedReason,
-		Available:       w.h5 != nil && w.en != nil,
+		Available:       available,
 		Running:         w.running,
 		LastTick:        w.state.LastTick,
 		Logs:            append([]string(nil), w.logs...),
@@ -623,6 +624,10 @@ func (w *UIDWatcher) AddBudget(add float64, set *float64) (float64, error) {
 // 在 Run 的 goroutine 里串行执行，天然无并发问题（state 读写仍走锁，
 // 因为 AddBudget/Status 会并发进来）。
 func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
+	if w.en == nil || !w.en.HasHaozhuma() {
+		w.setPaused("豪猪接码未配置；E码云自动加号不受影响")
+		return
+	}
 	w.mu.Lock()
 	w.state.LastTick = time.Now().Format("2006-01-02 15:04:05")
 	w.mu.Unlock()

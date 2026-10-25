@@ -617,6 +617,8 @@ MIT
 
 自动加号支持豪猪和 E码云（D1 同模板）。在「自动加号 → 接码平台配置」中配置主平台、Token、E码云短信关键词、API 地址、卡类型和省份；豪猪主用时可挂载 E码云兜底。凭据、平台和关键词修改需等任务结束，验证失败或写盘失败均保留原配置。
 
+启动时没有接码凭据或豪猪登录失败，控制台仍可配置平台；选择「E码云主用」验证并保存后立即启用，无需豪猪配置或再次重启。未配置时显示配置提示并禁用启动按钮。豪猪 UID 监控在未配置豪猪时暂停，不阻断 E码云任务。
+
 配置继续使用 `sms.haozhuma`，默认 `provider=haozhuma`、`mode=auto`，兼容原有豪猪配置。豪猪 `sid`（如 `52283`）与 `ecode_keyword`（如 `腾讯科技`）必须分开填写。E码云主用使用主 `token`；豪猪主用的 E码云凭据使用 `fallback`，地址、卡类型、省份分别使用 `fallback_base`、`fallback_card_type`、`fallback_province`。默认 E码云 API 为 `https://api.eomsg.com/zc/data.php`，D1 为 `https://api.uomsg.com/zc/data.php`。示例只保留空凭据。
 
 - `auto`：豪猪优先，失败后尝试 E码云；仅配置 E码云时直接使用 E码云。

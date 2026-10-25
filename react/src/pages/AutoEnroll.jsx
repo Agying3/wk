@@ -45,7 +45,7 @@ function logTone(text) {
 // 脱敏账号还原展示：豪猪回显 user 形如 "my***er"，直接展示即可。
 // authText 把鉴权状态拼成一句话，折叠区顶部/空态共用。
 function authSummary(auth) {
-  if (!auth || auth.mode === 'none') return '尚未配置豪猪 API 凭据';
+  if (!auth || auth.mode === 'none') return '尚未配置接码平台凭据';
   if (auth.mode === 'token') return `Token 模式${auth.has_token ? '（已保存）' : ''}`;
   return `账号密码模式（${auth.user || '?'}）`;
 }
@@ -367,6 +367,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
           : "豪猪只在收到短信验证码时扣费；取号后收不到码不扣费。每个取到的号（成功或失败）都会加入黑名单，不会被重复取到。"}
       />
 
+      {status?.enabled === false && <Alert type="info" showIcon message="配置接码平台后即可启用" description={status.reason} />}
       {summary?.warning && <Alert type="warning" showIcon message={summary.warning} />}
       {error && <Alert type="error" showIcon message="操作失败" description={error} />}
 
@@ -379,8 +380,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
           <Paragraph type="secondary" style={{ marginBottom: 8 }}>
             {isEcode
               ? <>自动加号使用 E码云接码（eomsg.com）。在下方「接码平台配置」中选择 E码云并粘贴 API token（后台「API对接中心」创建，需先充值）即可开始。</>
-              : <>自动加号需要豪猪接码平台账户。展开下方「鉴权与增强设置」填入 API 账号密码即可开始使用。
-              还没有账户？<a href="https://www.haozhuma.com" target="_blank" rel="noreferrer">去豪猪注册 <LinkOutlined /></a></>}
+              : <>自动加号支持豪猪和 E码云。在下方「接码平台配置」中选择平台并保存凭据；仅使用 E码云无需配置豪猪。</>}
           </Paragraph>
         ) : (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: 16 }}>
@@ -433,7 +433,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
         />
       </Card>
 
-      <SMSPlatforms settings={hz} running={running} onSave={onSaveHaozhuma} onSaved={() => { refreshConfig?.(); loadSummary(); }} />
+      <SMSPlatforms settings={hz} running={running} onSave={onSaveHaozhuma} onSaved={() => { refreshConfig?.(); load(); loadSummary(); }} />
       {/* —— 卡片② 启动任务（参数 + 主按钮 + 统计条 + 进度） —— */}
       <Card
         title="启动任务"
@@ -544,7 +544,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
               notFoundContent={groupsFailed ? '分组服务不可用，新账号将进 default' : '暂无分组'}
             />
           </div>
-          <Button type="primary" icon={<PlayCircleOutlined />} loading={starting} disabled={running} onClick={start}>
+          <Button type="primary" icon={<PlayCircleOutlined />} loading={starting} disabled={running || status?.enabled === false} onClick={start}>
             开始加号
           </Button>
           <Tooltip title={running ? '请求停止当前任务' : '当前没有运行中的任务'}>
@@ -792,7 +792,7 @@ function AuthPanel({ api, auth, h5, running, isEcode, onSaveHaozhuma, onSaved, o
       if (updated.haozhuma_auth === 'reconnected') {
         message.success('鉴权已保存，新凭据立即生效');
       } else if (updated.haozhuma_auth_restart_required) {
-        message.warning('凭据已保存，重启后自动加号可用（服务启动时未配置豪猪）');
+        message.warning('凭据已保存，重启后自动加号可用（短信直登模块未启用）');
       } else {
         message.success('已保存');
       }

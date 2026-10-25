@@ -427,8 +427,7 @@ type EnrollAccountSummary struct {
 	Running     bool    `json:"running"`
 }
 
-// Summary 账户概览（余额/占用/本地账本/当前取号配置）。hzm 为 nil 时
-// 返回 ErrNotConfigured（理论上不会发生：AutoEnroller 只在有豪猪配置时组装）。
+// Summary 账户概览；待配置的加号器不请求供应商。
 func (a *AutoEnroller) Summary(ctx context.Context) (EnrollAccountSummary, error) {
 	a.mu.Lock()
 	base := EnrollAccountSummary{
@@ -441,7 +440,7 @@ func (a *AutoEnroller) Summary(ctx context.Context) (EnrollAccountSummary, error
 	hzm := a.hzm
 	a.mu.Unlock()
 	if hzm == nil {
-		return base, errors.New("豪猪客户端未配置")
+		return base, errors.New("请先配置豪猪或 E码云接码凭据")
 	}
 	s, err := hzm.Summary(ctx)
 	if err != nil {
@@ -910,7 +909,7 @@ func (a *AutoEnroller) heldPhones() []string {
 // 写的只有号码本身，不含 token/凭据；号码是已付费资产，所以文件权限收紧到
 // 0600。失败只记日志：账本写不下去不该中断加号主流程。
 func (a *AutoEnroller) persistLedgerLocked() {
-	if a.ledgerPath == "" {
+	if a.hzm == nil || a.hzm.ValidateMode("haozhuma") != nil || a.ledgerPath == "" {
 		return
 	}
 	phones := make([]string, 0, len(a.held))
@@ -1013,7 +1012,7 @@ func (a *AutoEnroller) reclaimStuck() int {
 //
 // 必须在服务开始接单前调用（main 里）。返回补释放的号码数。
 func (a *AutoEnroller) ReclaimOrphans() int {
-	if a.ledgerPath == "" {
+	if !a.HasHaozhuma() || a.ledgerPath == "" {
 		return 0
 	}
 	raw, err := os.ReadFile(a.ledgerPath)
@@ -1145,6 +1144,10 @@ func (a *AutoEnroller) SetSMSDebugPath(path string) {
 // 返回 (执行了释放, 前账本遗留数)。
 func (a *AutoEnroller) ReleaseAllHeld(ctx context.Context) (bool, int, error) {
 	a.mu.Lock()
+	if a.hzm == nil {
+		a.mu.Unlock()
+		return false, 0, errors.New("请先配置接码平台凭据")
+	}
 	if a.running {
 		a.mu.Unlock()
 		return false, 0, ErrBusy

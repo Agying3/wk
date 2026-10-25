@@ -30,7 +30,7 @@ type Settings struct {
 }
 
 func (s Settings) Project() string {
-	if s.Provider == "ecode" && s.Sid == "" {
+	if s.Provider == "ecode" && s.EcodeKeyword != "" {
 		return s.EcodeKeyword
 	}
 	return s.Sid

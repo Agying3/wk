@@ -491,9 +491,9 @@ func NewHandler(cfg Config) *Handler {
 	// 成长任务持久台账：一次性任务完成情况 + 积分收益（三态统计）。
 	h.mux.HandleFunc("GET /admin/growth/ledger", h.withFrontend(h.growthLedgerOverview))
 	h.startGrowthJobSweeper()
-	// 自动加号：豪猪取号→短信直登→落盘。persist/find 回调指向本 handler，
-	// 必须在 NewHandler 里组装（main 那边拿不到方法值）。
-	if cfg.HaozhumaClient != nil && cfg.SMSLogin != nil && cfg.HaozhumaSid != "" {
+	// 先组装待配置的加号器；供应商启动失败时仍允许从控制台配置 E码云。
+	// 验证通过后由 ApplySMSUpdate 原子发布客户端，无需重启。
+	if cfg.SMSLogin != nil {
 		h.cfg.AutoEnroll = NewAutoEnroller(
 			cfg.SMSLogin, cfg.HaozhumaClient, cfg.HaozhumaSid,
 			func(cred accountCredential, region string) (map[string]any, int, error) {
@@ -2326,7 +2326,11 @@ func (h *Handler) haozhumaVerify(w http.ResponseWriter, r *http.Request) {
 // 前端手动刷新或慢轮询用（免费接口，但没必要高频打）。
 func (h *Handler) haozhumaSummary(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.AutoEnroll == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用（缺少豪猪配置）"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号不可用：短信直登模块未启用"})
+		return
+	}
+	if !h.cfg.AutoEnroll.SMSConfigured() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "请先在接码平台配置中选择豪猪或 E码云，验证并保存凭据"})
 		return
 	}
 	s, err := h.cfg.AutoEnroll.Summary(r.Context())
@@ -3289,7 +3293,11 @@ func (h *Handler) proxyStatus(w http.ResponseWriter, r *http.Request) {
 // accountSMSAutoEnroll 启动自动加号任务。
 func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.SMSLogin == nil || h.cfg.AutoEnroll == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号未启用（缺少豪猪配置）"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "自动加号不可用：短信直登模块未启用"})
+		return
+	}
+	if !h.cfg.AutoEnroll.SMSConfigured() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请先在接码平台配置中选择豪猪或 E码云，验证并保存凭据"})
 		return
 	}
 	var req struct {
@@ -3384,11 +3392,15 @@ func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Requ
 	}
 	st := h.cfg.AutoEnroll.Status()
 	body := map[string]any{
+		"enabled": h.cfg.AutoEnroll.SMSConfigured(),
 		"running": st.Running, "attempts": st.Attempts,
 		"ok": st.OK, "fail": st.Fail, "logs": st.Logs,
 		"consumed": st.Consumed,
 		// held > 0 表示还有号占着豪猪额度（会拖累后续取号），控制台要能看见。
 		"held": st.Held, "released": st.Released,
+	}
+	if body["enabled"] == false {
+		body["reason"] = "请在接码平台配置中选择豪猪或 E码云，验证并保存凭据后立即启用"
 	}
 	if st.Workers > 0 {
 		body["workers"] = st.Workers
@@ -3404,10 +3416,7 @@ func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Requ
 	if st.StopReason != "" {
 		body["stop_reason"] = st.StopReason
 	}
-	// 余额：任务开始前能看出钱还够不够，失败也不用翻后台。
-	if bal, err := h.cfg.AutoEnroll.Balance(r.Context()); err == nil && bal >= 0 {
-		body["balance"] = bal
-	}
+	// 余额由独立的账户概览接口获取；任务状态轮询只读内存，不请求供应商。
 	writeJSON(w, http.StatusOK, body)
 }
 
