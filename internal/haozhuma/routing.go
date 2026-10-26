@@ -23,6 +23,8 @@ type phoneRoute struct {
 	sid    string
 }
 
+var ErrDuplicatePhone = errors.New("接码平台重复返回已占用或本批次已尝试的号码")
+
 func validMode(mode string) bool {
 	switch mode {
 	case "", "auto", "haozhuma", "ecode", "both":
@@ -187,10 +189,10 @@ func (c *Client) GetPhone(ctx context.Context, sid string) (string, error) {
 		if c.routes == nil {
 			c.routes = make(map[string]phoneRoute)
 		}
-		if old, exists := c.routes[phone]; exists && (old.client != supplier || old.sid != project) {
+		if _, exists := c.routes[phone]; exists {
 			c.mu.Unlock()
-			_ = supplier.releaseDirect(context.Background(), project, phone)
-			return "", errors.New("取号平台返回了其他在途任务正在使用的号码，已拒绝覆盖来源")
+			// 该号属于原持有者：不能释放、拉黑或覆盖来源，否则会破坏在途收码。
+			return "", ErrDuplicatePhone
 		}
 		c.routes[phone] = phoneRoute{client: supplier, sid: project}
 		c.mu.Unlock()

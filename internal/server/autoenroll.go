@@ -112,6 +112,8 @@ type AutoEnroller struct {
 	// （实测：一次任务结束后额度仍被占着，下一轮 14 次尝试全部失败）。
 	// 任务收尾时按这份账本兜底释放，保证"任务结束 = 号全部还回去"。
 	held map[string]bool
+	// E码云没有平台拉黑接口，本批次用过的号即使收尾后也不重复发码。
+	seenEcode map[string]bool
 	// released 已确认释放的号（从 held 移出后记在这里，用于统计与日志）。
 	released int
 	// ledgerPath 账本落盘路径（空 = 不落盘）。
@@ -584,7 +586,7 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	// 开跑前先看余额：不够一次成功就别启动，省得用户以为在跑其实取不到号。
 	if bal, err := a.hzm.Balance(haozhuma.WithMode(context.Background(), opts.ProviderMode)); err == nil && bal >= 0 && bal < minBalance {
 		a.mu.Unlock()
-		return fmt.Errorf("豪猪余额不足（当前 %.2f 元，低于阈值 %.2f 元），请充值后再启动", bal, minBalance)
+		return fmt.Errorf("接码平台余额不足（当前 %.2f 元，低于阈值 %.2f 元），请充值后再启动", bal, minBalance)
 	}
 	a.running = true
 	a.attempts = 0
@@ -598,6 +600,7 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	a.consumed = 0
 	// released 是"本次运行归还了多少号"的计数，每次重置。
 	a.released = 0
+	a.seenEcode = make(map[string]bool)
 	// 注意：账本 a.held **不在这里清空**。
 	//
 	// 它是"我们仍认为占着豪猪额度"的持久集合，正确性要求它跨任务存活：
@@ -692,6 +695,7 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 		consecutive atomic.Int64 // 连续失败（成功即清零）
 		quotaWaits  atomic.Int64 // 因"占用号到上限"而退避的次数（诊断用）
 		inflight    atomic.Int64 // 在途尝试数（超发保护，见循环内注释）
+		duplicates  atomic.Int64
 		stopMu      sync.Mutex
 		stopReason  string
 	)
@@ -748,7 +752,7 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 				if mb := a.currentMinBalance(); mb > 0 {
 					bal, err := a.hzm.Balance(ctx)
 					if err == nil && bal >= 0 && bal < mb {
-						setStop(fmt.Sprintf("豪猪余额不足（%.2f 元 < %.2f），任务停止。请充值后重跑。", bal, mb))
+						setStop(fmt.Sprintf("接码平台余额不足（%.2f 元 < %.2f），任务停止。请充值后重跑。", bal, mb))
 						cancel()
 						return
 					}
@@ -770,6 +774,20 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 				// 真实尝试：不计入完成统计，也不计入熔断。
 				if !ok && errors.Is(err, context.Canceled) && ctx.Err() != nil {
 					return
+				}
+				if errors.Is(err, haozhuma.ErrDuplicatePhone) {
+					duplicates.Add(1)
+					a.logf("[w%d] 平台重复返号，已跳过发码，等待后重试", worker)
+					delay := a.RetryDelay()
+					if delay <= 0 {
+						delay = 5 * time.Second
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(delay):
+					}
+					continue
 				}
 
 				a.mu.Lock()
@@ -809,7 +827,7 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 					}
 					// 致命错误：余额/无号/项目禁用等，重试无意义。
 					if errors.As(err, &ae) && ae.Fatal() {
-						setStop(fmt.Sprintf("豪猪致命错误，任务停止：%v", err))
+						setStop(fmt.Sprintf("接码平台致命错误，任务停止：%v", err))
 						cancel()
 						return
 					}
@@ -826,7 +844,7 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 					// 熔断阈值同样每轮快照：运行中调小阈值能立刻触发，调大
 					// 立刻放宽（已累计的连续失败数保留）。
 					if n := consecutive.Add(1); n >= int64(a.currentConsecutiveFails()) {
-						setStop(fmt.Sprintf("连续 %d 个号失败（成功 %d/%d），熔断停止。若都是「取号失败」= 对接商没号；若是「未收到验证码」= 对接商号码收不到腾讯短信。失败号不扣费。",
+						setStop(fmt.Sprintf("连续 %d 次失败（成功 %d/%d），熔断停止。请区分取号、接口故障与等待验证码超时；计费以供应商规则为准。",
 							n, oks, want))
 						cancel()
 						return
@@ -846,6 +864,9 @@ func (a *AutoEnroller) run(ctx context.Context, want, workers, pollCount, limit 
 		}(w)
 	}
 	wg.Wait()
+	if duplicates.Load() > 0 && got.Load() < int64(want) && used.Load() >= int64(limit) && ctx.Err() == nil {
+		setStop(fmt.Sprintf("已达到取号尝试上限，跳过重复返号 %d 次，未达到目标；请稍后重试", duplicates.Load()))
+	}
 	stopMu.Lock()
 	defer stopMu.Unlock()
 	return stopReason
@@ -1148,6 +1169,10 @@ func (a *AutoEnroller) ReleaseAllHeld(ctx context.Context) (bool, int, error) {
 		a.mu.Unlock()
 		return false, 0, errors.New("请先配置接码平台凭据")
 	}
+	if a.hzm.Provider == "ecode" {
+		a.mu.Unlock()
+		return false, 0, errors.New("E码云未提供平台释放接口，号码回收以供应商规则为准")
+	}
 	if a.running {
 		a.mu.Unlock()
 		return false, 0, ErrBusy
@@ -1210,7 +1235,7 @@ func (a *AutoEnroller) releaseAllHeld() {
 		a.markReleased(phone)
 	}
 	if failed == 0 {
-		a.logf("兜底释放完成：%d 个号码已全部归还", len(left))
+		a.logf("收尾完成：%d 个号码的本地占用已结束", len(left))
 	} else {
 		a.logf("兜底释放结束：%d 个成功，%d 个失败（失败的号已留在账本，下次启动会重试）",
 			len(left)-failed, failed)
@@ -1256,6 +1281,21 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 		// 没取到号 = 没有消耗。
 		return false, false, fmt.Errorf("取号失败: %w", err)
 	}
+	isEcode := a.hzm.IsEcodePhone(phone)
+	if isEcode {
+		a.mu.Lock()
+		if a.seenEcode == nil {
+			a.seenEcode = make(map[string]bool)
+		}
+		seen := a.seenEcode[phone]
+		a.seenEcode[phone] = true
+		a.mu.Unlock()
+		if seen {
+			// GetPhone 已为本次调用独占预留，但该批次早先用过它；只解除本地预留。
+			a.hzm.ForgetPhone(phone)
+			return false, false, haozhuma.ErrDuplicatePhone
+		}
+	}
 	// 从这里开始，号码已经被占用，任何退出路径都要计入消耗。
 	usedPhone = true
 	// 记进账本：任务收尾时会按它兜底释放，保证不会把号留在豪猪那边占额度。
@@ -1293,24 +1333,35 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 	// 把两者并列也印证这一点）。这里拉黑后仍然补一次 release：对已
 	// 归还的号豪猪返回"手机号不存在"，reclaim 的 goneUpstream 判定
 	// 会把它当成功处理，双保险没有副作用。
-	finish := func(blacklist bool) {
+	finish := func(blacklist bool) string {
+		if isEcode {
+			a.markReleased(phone)
+			return "本地占用已结束；未调用平台拉黑或释放"
+		}
 		bg := context.Background()
+		blacklisted := false
 		if blacklist {
 			if err := a.hzm.Blacklist(bg, sid, phone); err != nil {
 				a.logf("拉黑 %s 失败: %v", phone, err)
+			} else {
+				blacklisted = true
 			}
 		}
 		if err := a.hzm.Release(bg, sid, phone); err != nil {
 			a.logf("释放 %s 失败: %v（留待任务收尾重试）", phone, err)
-			return
+			return "平台释放失败，留待收尾重试"
 		}
 		a.markReleased(phone)
+		if blacklisted {
+			return "已拉黑并释放"
+		}
+		return "已释放"
 	}
 
 	// 2) 已在号池里的号：拉黑（避免反复取到同一个）+ 换下一个。
 	if _, exists := a.find(phone); exists {
-		a.logf("号 %s 已在号池，拉黑换下一个", phone)
-		finish(true)
+		note := finish(true)
+		a.logf("号 %s 已在号池，跳过（%s）", phone, note)
 		return false, true, nil
 	}
 
@@ -1372,8 +1423,8 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 			if cb := a.enrolledCallback(); cb != nil {
 				go cb(creds.UID)
 			}
-			a.logf("号 %s 加号成功 uid=%s…（已释放）", phone, shortUID(creds.UID))
-			finish(false)
+			note := finish(false)
+			a.logf("号 %s 加号成功 uid=%s…（%s）", phone, shortUID(creds.UID), note)
 			return true, true, nil
 		}
 		a.logf("号 %s 验码失败: %v", phone, verr)
@@ -1385,9 +1436,9 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 	}
 
 	// 等不到码：拉黑 + 释放，换下一个号。
-	a.logf("号 %s 未收到验证码: %v（已拉黑）", phone, waitErr)
+	note := finish(true)
+	a.logf("号 %s 收码未完成: %v（%s）", phone, waitErr, note)
 	a.smsDebug("[%s] 收码超时 phone=%s err=%v", sid, phone, waitErr)
-	finish(true)
 	return false, true, waitErr
 }
 
@@ -1423,13 +1474,32 @@ func (a *AutoEnroller) pollCode(ctx context.Context, sid, phone string, count in
 	if count > maxPollCount {
 		count = maxPollCount
 	}
-	var polls int
+	var polls, temporaryFailures int
 	for polls < count {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		sms, err := a.hzm.GetMessage(ctx, sid, phone)
 		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			if haozhuma.TemporaryEcodeFailure(err) {
+				temporaryFailures++
+				polls++ // 重试占用原轮询预算，不能无限延长任务。
+				const maxRetries = 3
+				if temporaryFailures > maxRetries || polls >= count {
+					return "", fmt.Errorf("收码接口故障，尚未确认短信是否到达（已查询 %d 次）: %w", polls, err)
+				}
+				delay := pollInterval * time.Duration(1<<(temporaryFailures-1))
+				a.logf("号 %s 收码接口暂时不可用: %v，%s 后重试（%d/%d）", phone, err, delay, temporaryFailures, maxRetries)
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-time.After(delay):
+				}
+				continue
+			}
 			// "等待短信" 是正常轮询状态，不是错误：GetMessage 把豪猪的
 			// code=-1/msg=等待短信 包成 APIError 返回，必须用 errors.As 取出来判断。
 			// 之前这里漏了 errors.As，ae 恒为 nil，于是每次"还在等待"都会直接
@@ -1441,6 +1511,7 @@ func (a *AutoEnroller) pollCode(ctx context.Context, sid, phone string, count in
 				return "", err
 			}
 		}
+		temporaryFailures = 0
 		polls++
 		if code := haozhuma.ExtractCode(sms); code != "" {
 			// 诊断日志（本机文件，不脱敏）：完整短信原文 + 提取到的码，

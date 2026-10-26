@@ -94,15 +94,17 @@ func TestSMSModesAndTemporarySelection(t *testing.T) {
 	if err != nil || hz.Load() != 1 {
 		t.Fatal("next task did not return to primary")
 	}
+	c.ForgetPhone("13900000001")
 	if err := c.SetMode("both"); err != nil {
 		t.Fatal(err)
 	}
 	h, e := hz.Load(), ec.Load()
 	for i := 0; i < 2; i++ {
-		_, err = c.GetPhone(context.Background(), "52283")
+		phone, err := c.GetPhone(context.Background(), "52283")
 		if err != nil {
 			t.Fatal(err)
 		}
+		c.ForgetPhone(phone)
 	}
 	if hz.Load() != h+1 || ec.Load() != e+1 {
 		t.Fatal("both mode did not alternate")

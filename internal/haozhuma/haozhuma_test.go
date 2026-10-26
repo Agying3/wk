@@ -371,6 +371,8 @@ func TestGetPhoneUIDPoolRotation(t *testing.T) {
 	if got := c.UIDs(); len(got) != 1 || got[0] != "52283-P2" {
 		t.Fatalf("pool after drop=%v", got)
 	}
+	// 首个号码已使用完毕，解除占用后再测试下一次 UID 轮换。
+	c.ForgetPhone(phone)
 
 	// 第二次：P2 还在池里，round-robin 继续用它。
 	phone, err = c.GetPhone(context.Background(), "52283")
@@ -410,7 +412,7 @@ func TestGetPhoneUIDPoolExhausted(t *testing.T) {
 }
 
 // TestGetPhoneUIDPoolNoNumbers 池里的码没失效但项目没号：如实报错
-//（不逐码放大请求量）。
+// （不逐码放大请求量）。
 func TestGetPhoneUIDPoolNoNumbers(t *testing.T) {
 	var uidCalls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

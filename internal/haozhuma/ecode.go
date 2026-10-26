@@ -16,6 +16,17 @@ import (
 
 const DefaultEcodeBase = "https://api.eomsg.com/zc/data.php"
 
+type temporaryEcodeError struct{ err error }
+
+func (e *temporaryEcodeError) Error() string { return e.err.Error() }
+func (e *temporaryEcodeError) Unwrap() error { return e.err }
+
+// TemporaryEcodeFailure 只标记传输故障和可重试 HTTP 状态；凭据/业务错误不重试。
+func TemporaryEcodeFailure(err error) bool {
+	var temporary *temporaryEcodeError
+	return errors.As(err, &temporary)
+}
+
 func NewEcode(base, token string) *Client {
 	if base == "" {
 		base = DefaultEcodeBase
@@ -40,19 +51,23 @@ func (c *Client) ecodeGet(ctx context.Context, action string, q url.Values) (str
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("E码云网络错误: %w", redactNetErr(err))
+		return "", &temporaryEcodeError{fmt.Errorf("E码云网络错误: %w", redactNetErr(err))}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", errors.New("读取 E码云响应失败")
+		return "", &temporaryEcodeError{fmt.Errorf("读取 E码云响应失败: %w", err)}
 	}
 	text := strings.TrimSpace(string(body))
 	if token != "" {
 		text = strings.ReplaceAll(text, token, "[redacted]")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", &APIError{Provider: "ecode", API: action, Code: strconv.Itoa(resp.StatusCode), Msg: fmt.Sprintf("E码云 HTTP %d", resp.StatusCode)}
+		err := &APIError{Provider: "ecode", API: action, Code: strconv.Itoa(resp.StatusCode), Msg: fmt.Sprintf("E码云 HTTP %d", resp.StatusCode)}
+		if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			return "", &temporaryEcodeError{err}
+		}
+		return "", err
 	}
 	if strings.HasPrefix(text, "ERROR:") {
 		return "", &APIError{Provider: "ecode", API: action, Code: "-1", Msg: truncate(strings.TrimPrefix(text, "ERROR:"), 160)}

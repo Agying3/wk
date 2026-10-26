@@ -21,16 +21,17 @@ import (
 
 // fakeHZM 假豪猪服务器：可编程的响应序列，用于测试终止逻辑。
 type fakeHZM struct {
-	t         *testing.T
-	srv       *httptest.Server
-	getPhone  atomic.Int32 // getPhone 调用次数
-	getMsg    atomic.Int32 // getMessage 调用次数（验证轮询次数用）
-	blacklist atomic.Int32 // addBlacklist 成功次数
-	releaseOK atomic.Int32 // cancelRecv 成功次数
-	summary   atomic.Value // string: 余额响应
-	phoneResp atomic.Value // string: getPhone 响应
-	tokenResp atomic.Value // string: login 响应
-	msgResp   atomic.Value // string: getMessage 响应（默认"等待短信"）
+	t            *testing.T
+	srv          *httptest.Server
+	getPhone     atomic.Int32 // getPhone 调用次数
+	uniquePhones atomic.Bool  // 并发占用测试使用不同号码，而不是重复分配同一号码。
+	getMsg       atomic.Int32 // getMessage 调用次数（验证轮询次数用）
+	blacklist    atomic.Int32 // addBlacklist 成功次数
+	releaseOK    atomic.Int32 // cancelRecv 成功次数
+	summary      atomic.Value // string: 余额响应
+	phoneResp    atomic.Value // string: getPhone 响应
+	tokenResp    atomic.Value // string: login 响应
+	msgResp      atomic.Value // string: getMessage 响应（默认"等待短信"）
 	// releaseFail 剩余多少次 cancelRecv 要失败（模拟释放请求失败）。
 	releaseFail atomic.Int32
 	// releaseGone 为 true 时豪猪对释放返回"手机号不存在"（号已不在它手里）。
@@ -62,8 +63,12 @@ func newFakeHZM(t *testing.T) *fakeHZM {
 		case "getPhone":
 			// 记下第一次取号的时刻（compare-and-swap：只记首次）。
 			f.firstPhoneSeq.CompareAndSwap(0, f.nextSeq())
-			f.getPhone.Add(1)
-			_, _ = w.Write([]byte(f.phoneResp.Load().(string)))
+			n := f.getPhone.Add(1)
+			if f.uniquePhones.Load() {
+				fmt.Fprintf(w, `{"code":"0","phone":"170%08d"}`, n)
+			} else {
+				_, _ = w.Write([]byte(f.phoneResp.Load().(string)))
+			}
 		case "getMessage":
 			f.getMsg.Add(1)
 			// 默认永远等待（模拟收不到码）。
@@ -643,6 +648,7 @@ func TestAutoEnrollStopKeepsReason(t *testing.T) {
 // 计入消耗——否则"取了 3 个号后停止"会显示成 0，看不出号码去了哪。
 func TestAutoEnrollStopCountsConsumedNumbers(t *testing.T) {
 	f := newFakeHZM(t)
+	f.uniquePhones.Store(true)
 	en := NewAutoEnroller(successSMSManager(t), f.client(), "52283",
 		func(accountCredential, string) (map[string]any, int, error) { return nil, 200, nil },
 		nil,

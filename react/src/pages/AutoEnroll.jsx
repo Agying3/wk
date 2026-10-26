@@ -553,11 +553,11 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
             </Button>
           </Tooltip>
           <Button icon={<ReloadOutlined />} loading={loadingStatus} onClick={load}>刷新</Button>
-          <Tooltip title="调用豪猪「释放全部」（cancelAllRecv），释放账户名下所有占用中的号码，并清空本地遗留账本。额度被旧号占满时的手动兜底；任务运行中不可用。">
+          {!isEcode && <Tooltip title="调用豪猪「释放全部」（cancelAllRecv），释放账户名下所有占用中的号码，并清空本地遗留账本。额度被旧号占满时的手动兜底；任务运行中不可用。">
             <Button loading={releasingAll} disabled={running} onClick={releaseAll}>
               一键释放全部号码
             </Button>
-          </Tooltip>
+          </Tooltip>}
           <Button type="link" icon={<SettingOutlined />} onClick={() => setAdvancedOpen(true)}>
             高级设置{advancedDirtyCount > 0 ? `（${advancedDirtyCount}）` : ''}
           </Button>
@@ -587,7 +587,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
               <Statistic title="尝试" value={attempts} valueStyle={{ fontSize: 18 }} />
               <Statistic title="成功率" value={successRate} suffix="%" valueStyle={{ fontSize: 18 }} />
               <Statistic title="号码消耗" value={consumed} valueStyle={{ fontSize: 18 }} />
-              <Statistic title="已释放" value={status?.released ?? 0} valueStyle={{ fontSize: 18 }} />
+              <Statistic title={isEcode ? '已结束本地占用' : '已释放'} value={status?.released ?? 0} valueStyle={{ fontSize: 18 }} />
               <Statistic
                 title="连续失败熔断"
                 value={autoenrollCfg.consecutive_fails ?? 15}
@@ -612,7 +612,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
         )}
       </Card>
 
-      {holding > 0 && (
+      {holding > 0 && !isEcode && (
         <Alert
           type="error"
           showIcon
