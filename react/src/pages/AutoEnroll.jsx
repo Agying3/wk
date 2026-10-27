@@ -695,8 +695,9 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
  *   - [保存并重连]：inline confirm（按钮原地变确认），onSaveHaozhuma 落盘
  *     并触发后端 ReplaceClient；失败 Alert 顶部常驻（回滚由后端保证）
  *   - 密码/token 框：已保存时留空 = 不修改（placeholder 说明）
- *   - H5 会话（P1 增强）：粘贴 PHPSESSID 解锁项目搜索/对接码选择。
- *     后端验证通过才落盘；失效（410）提示重贴。
+ *   - 网页 token（P1 增强）：粘贴豪猪网页登录 token 解锁项目搜索/对接码选择。
+ *     后端验证通过才落盘；失效（410）提示重贴。token 7 天硬过期，刷新必须
+ *     重过点选验证码，无法自动保活——过期后手动再贴一次。
  */
 function AuthPanel({ api, auth, h5, running, isEcode, onSaveHaozhuma, onSaved, onH5Saved, fallbackMounted, onFallbackChanged }) {
   // ecode 主用（无账密登录概念）强制 token 形态。
@@ -719,7 +720,7 @@ function AuthPanel({ api, auth, h5, running, isEcode, onSaveHaozhuma, onSaved, o
 
   const pasteH5 = async () => {
     const session = h5Draft.trim();
-    if (!session) { message.info('先粘贴 PHPSESSID（浏览器 F12 → 应用 → Cookie）'); return; }
+    if (!session) { message.info('先粘贴网页 token（登录 h5.haozhuma.cn 后从控制台或接口复制）'); return; }
     setH5Saving(true);
     try {
       await api('/admin/account/sms/haozhuma/h5-session', {
@@ -727,7 +728,7 @@ function AuthPanel({ api, auth, h5, running, isEcode, onSaveHaozhuma, onSaved, o
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session }),
       });
-      message.success('会话已保存，项目搜索/对接码选择已解锁');
+      message.success('token 已保存，项目搜索/对接码选择已解锁');
       setH5Draft('');
       onH5Saved?.();
     } catch (err) {
@@ -745,7 +746,7 @@ function AuthPanel({ api, auth, h5, running, isEcode, onSaveHaozhuma, onSaved, o
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session: '' }),
       });
-      message.success('H5 会话已清空，选择器退化为手填');
+      message.success('网页 token 已清空，选择器退化为手填');
       onH5Saved?.();
     } catch (err) {
       message.error(err.message);
@@ -901,28 +902,28 @@ function AuthPanel({ api, auth, h5, running, isEcode, onSaveHaozhuma, onSaved, o
       <Space wrap size={12} align="center">
         <Text type="secondary">H5 增强（项目搜索/对接码选择）</Text>
         {h5Expired
-          ? <Tag color="red">会话已失效，请重贴</Tag>
+          ? <Tag color="red">token 已失效，请重贴</Tag>
           : h5Has
             ? <Tag color="green">已启用</Tag>
             : <Tag>未配置</Tag>}
         <Input.Password
           value={h5Draft}
           onChange={e => setH5Draft(e.target.value)}
-          placeholder={h5Has ? '粘贴新 PHPSESSID 覆盖' : '浏览器登录 h5.haozhuma.com 后 F12 复制 PHPSESSID'}
+          placeholder={h5Has ? '粘贴新 token 覆盖' : '登录 h5.haozhuma.cn 后复制网页登录 token'}
           style={{ width: 340 }}
           disabled={h5Saving}
           visibilityToggle={false}
         />
-        <Button loading={h5Saving} onClick={pasteH5}>保存会话</Button>
+        <Button loading={h5Saving} onClick={pasteH5}>保存 token</Button>
         {h5Has && (
-          <Popconfirm title="清空 H5 会话？项目/对接码选择器将退化为手填。" onConfirm={clearH5}>
+          <Popconfirm title="清空网页 token？项目/对接码选择器将退化为手填。" onConfirm={clearH5}>
             <Button danger type="text" loading={h5Saving}>清空</Button>
           </Popconfirm>
         )}
       </Space>
       <Text type="secondary" style={{ fontSize: 12 }}>
-        一次性操作：豪猪网页版登录后按 F12 → 应用/存储 → Cookie → 复制 PHPSESSID 的值粘到这里。
-        后端每 7 天自动保活（官方有效期 10 天滑动）。该会话只用于选择器数据源，与接码任务链路无关。
+        登录 h5.haozhuma.cn 后复制网页登录 token（Bearer）粘到这里。有效期 7 天且无法自动续期，
+        过期后需重新登录并再过一次点选验证码。该 token 只用于选择器数据源，与接码任务链路无关。
       </Text>
 
     </Space>

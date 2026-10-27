@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Input, Modal, Spin, Tag, Typography } from 'antd';
+import { Input, Modal, Spin, Space, Tag, Typography } from 'antd';
 import { SearchOutlined } from '@ant-design/icons';
 
 const { Text } = Typography;
@@ -22,9 +22,24 @@ export default function ProjectPickerModal({ open, onClose, api, onPick }) {
   const [projects, setProjects] = useState(null); // null=未搜索
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [history, setHistory] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('haozhuma-project-search-history') || '[]');
+      return Array.isArray(saved) ? saved.filter(x => typeof x === 'string' && x.trim()).slice(0, 8) : [];
+    } catch {
+      return [];
+    }
+  });
   const timer = useRef(null);
 
-  // 每次打开重置（不残留上次的搜索词与结果）。
+  const saveHistory = (items) => {
+    setHistory(items);
+    try { localStorage.setItem('haozhuma-project-search-history', JSON.stringify(items)); } catch { /* storage unavailable */ }
+  };
+
+  const removeHistory = (term) => saveHistory(history.filter(item => item !== term));
+
+  // 每次打开重置（不残留上次的搜索词与结果）；搜索历史保留。
   useEffect(() => {
     if (open) {
       setKeyword('');
@@ -33,14 +48,15 @@ export default function ProjectPickerModal({ open, onClose, api, onPick }) {
     }
   }, [open]);
 
-  const search = async () => {
-    const q = keyword.trim();
+  const search = async (query = keyword) => {
+    const q = query.trim();
     if (!q) return;
     setLoading(true);
     setError('');
     try {
       const resp = await api(`/admin/account/sms/haozhuma/projects?q=${encodeURIComponent(q)}`);
       setProjects(resp.projects || []);
+      saveHistory([q, ...history.filter(item => item !== q)].slice(0, 8));
     } catch (err) {
       setError(err.message);
       setProjects(null);
@@ -74,6 +90,25 @@ export default function ProjectPickerModal({ open, onClose, api, onPick }) {
         allowClear
         size="large"
       />
+      {history.length > 0 && (
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 12 }}>
+          <Text type="secondary" style={{ flexShrink: 0, lineHeight: '24px', fontSize: 12 }}>最近搜索</Text>
+          <Space size={[6, 6]} wrap>
+            {history.map(term => (
+              <Tag
+                key={term}
+                color="default"
+                style={{ marginInlineEnd: 0, cursor: 'pointer', borderRadius: 12, color: '#666', background: '#f3f4f6', borderColor: '#e5e7eb' }}
+                closable
+                onClick={() => { setKeyword(term); search(term); }}
+                onClose={event => { event.preventDefault(); event.stopPropagation(); removeHistory(term); }}
+              >
+                {term}
+              </Tag>
+            ))}
+          </Space>
+        </div>
+      )}
       <div style={{ marginTop: 12, maxHeight: 420, overflowY: 'auto' }}>
         {loading && <div style={{ textAlign: 'center', padding: 32 }}><Spin tip="搜索中…" /></div>}
         {!loading && error && <Text type="danger" style={{ display: 'block', padding: 16 }}>{error}</Text>}

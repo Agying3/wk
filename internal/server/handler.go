@@ -89,7 +89,7 @@ type Config struct {
 	// 对接码选择端点返回 503，前端退化为手填。会话可随时热贴
 	//（SetHaozhumaH5Session），与任务链路完全无关。
 	HaozhumaH5 *haozhumah5.Client
-	// SetHaozhumaH5Session 运行时粘贴/清空 PHPSESSID。main 注入（指向
+	// SetHaozhumaH5Session 运行时粘贴/清空网页 token。main 注入（指向
 	// HaozhumaH5.Session）；未注入时粘贴只落盘（重启后生效）。
 	SetHaozhumaH5Session func(session string)
 	// SetAutoEnrollLimits 运行时更新自动加号任务控制参数（余额阈值/熔断）。
@@ -419,7 +419,7 @@ func NewHandler(cfg Config) *Handler {
 	// 豪猪凭据验证（不保存）+ 账户概览（余额/占用/账本）。
 	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/verify", h.withFrontend(h.haozhumaVerify))
 	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/summary", h.withFrontend(h.haozhumaSummary))
-	// 豪猪 H5 增强（P1，可选）：粘贴 PHPSESSID / 项目搜索 / 对接码列表。
+	// 豪猪 H5 增强（P1，可选）：粘贴网页 token / 项目搜索 / 对接码列表。
 	// HaozhumaH5 为 nil 时三个端点统一 503（前端退化为手填模式）。
 	h.mux.HandleFunc("POST /admin/account/sms/haozhuma/h5-session", h.withFrontend(h.haozhumaH5Session))
 	h.mux.HandleFunc("GET /admin/account/sms/haozhuma/projects", h.withFrontend(h.haozhumaProjects))
@@ -542,7 +542,7 @@ func NewHandler(cfg Config) *Handler {
 		// 的运行态保护（ErrBusyAuth）在 AutoEnroller 内部。
 		h.cfg.SetHaozhumaFetch = h.cfg.AutoEnroll.UpdateFetchOptions
 		// 对接码池自动生命周期：失效码出池后，从 config 的 uids 删掉 +
-		// 经 H5 type=41 从豪猪账户移出（"用完自动移出账户"）。
+		// 经网页端 batch delete 从豪猪账户移出（"用完自动移出账户"）。
 		h.cfg.AutoEnroll.SetOnUIDsDrained(func(uids []string) {
 			if len(uids) == 0 {
 				return
@@ -580,7 +580,7 @@ func NewHandler(cfg Config) *Handler {
 				}
 				h.configMu.Unlock()
 			}
-			// 2) 豪猪账户：H5 type=41 移出（H5 未配置时跳过——账户侧残留
+			// 2) 豪猪账户：batch delete 移出（未配置时跳过——账户侧残留
 			// 无害，用户下次保存配置时同步逻辑会清掉）。
 			if h.cfg.HaozhumaH5 != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1261,7 +1261,7 @@ func (h *Handler) adminConfig(w http.ResponseWriter, r *http.Request) {
 					"has_token": c.SMS.Haozhuma.Token != "",
 				},
 				// H5 会话（P1 增强）：同样只回"有没有/是否失效"，值本体
-				// （PHPSESSID）绝不出接口。来源优先级：运行时 client 状态
+				// （网页 token）绝不出接口。来源优先级：运行时 client 状态
 				// （含 last_seen/失效判定）> 配置文件（未启动 client 时
 				// 只知道配没配）。
 				"h5": h.h5SessionEcho(c.SMS.Haozhuma.H5Session),
@@ -1306,7 +1306,7 @@ func maskCredential(s string) string {
 }
 
 // h5SessionEcho H5 会话回显（脱敏）：只报 has/expired/last_seen/last_error，
-// PHPSESSID 值本体绝不出接口（泄露 = 豪猪账号完全被盗，见设计文档 §6.2）。
+// token 值本体绝不出接口（泄露 = 豪猪账号完全被盗，见设计文档 §6.2）。
 // configuredSession 来自配置文件（未启动 client 时只知道配没配）。
 func (h *Handler) h5SessionEcho(configuredSession string) map[string]any {
 	echo := map[string]any{"has": false}
@@ -1987,7 +1987,7 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 对接码池自动生命周期（H5 账户侧同步）：uids 显式提供时，把"新勾选
-	// 的码"在豪猪侧加入账户、"取消勾选的已加入码"移出账户（type=4/41）。
+	// 的码"在豪猪侧加入账户、"取消勾选的已加入码"移出账户（bindings 加/批删）。
 	// 异步执行——豪猪 H5 慢，不该拖住配置保存响应；失败只进响应字段提示
 	//（配置本身已落盘，取号不受影响——没加入的码 GetPhone 自动跳过）。
 	if req.SMS != nil && req.SMS.Haozhuma.UIDs != nil && h.cfg.HaozhumaH5 != nil {
@@ -2341,10 +2341,10 @@ func (h *Handler) haozhumaSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s)
 }
 
-// haozhumaH5Session 粘贴/清空 PHPSESSID（WebUI 增强设置）。验证通过才
+// haozhumaH5Session 粘贴/清空豪猪网页 token（WebUI 增强设置）。验证通过才
 // 落盘：立即用新会话真调一次项目搜索（gjc=腾讯——豪猪最主流的项目族，
 // 命中即视为会话有效）。清空（session=""）不验证直接落盘。
-// 运行中的任务不受任何影响：H5 只服务选择器，与接码 API 完全独立。
+// 运行中的任务不受任何影响：网页端只服务选择器，与接码 API 完全独立。
 func (h *Handler) haozhumaH5Session(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Session string `json:"session"`
@@ -2366,14 +2366,14 @@ func (h *Handler) haozhumaH5Session(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": true})
 		return
 	}
-	// 验证：临时客户端真调一次 type=30。
+	// 验证：临时客户端真调一次项目搜索。
 	probe := haozhumah5.New(session)
 	defer probe.Close()
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	if _, err := probe.Projects(ctx, "腾讯"); err != nil {
-		// 会话无效/网络故障都拒绝保存（与鉴权 patch 同语义：坏值不落盘）。
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "会话验证失败：" + err.Error()})
+		// token 无效/网络故障都拒绝保存（与鉴权 patch 同语义：坏值不落盘）。
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token 验证失败：" + err.Error()})
 		return
 	}
 	// 验证通过：先落盘，再热更运行态（客户端不存在时按需创建——
@@ -2392,13 +2392,50 @@ func (h *Handler) haozhumaH5Session(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.SetHaozhumaH5Session != nil {
 		h.cfg.SetHaozhumaH5Session(session)
 	}
+	// 监控值班员只在 main 启动时组装（要求 H5 客户端已存在）。运行中首次
+	// 粘贴 token 的情况下它还是 nil——这里补装配，否则监控卡会一直显示
+	// "需粘贴网页 token"，明明已经贴好了。
+	h.ensureUIDWatcher()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// haozhumaProjects 项目搜索（代理 H5 type=30）。q 为搜索关键词。
+// ensureUIDWatcher 按需组装监控值班员（幂等）。缺 AutoEnroll 或 H5 客户端
+// 时什么都不做：监控本来就需要这两者齐备才能跑。
+//
+// 配置来源与 main 一致：读 config.json 的 autoenroll.watch 节。读不到就用
+// 零值（= 未启用），用户在监控卡里保存配置时会走 Reconfigure 热生效。
+func (h *Handler) ensureUIDWatcher() {
+	if h.cfg.UIDWatcher != nil || h.cfg.HaozhumaH5 == nil || h.cfg.AutoEnroll == nil {
+		return
+	}
+	var wc WatchConfig
+	if h.cfg.ConfigPath != "" {
+		if raw, err := os.ReadFile(h.cfg.ConfigPath); err == nil {
+			var doc struct {
+				AutoEnroll struct {
+					Watch WatchConfig `json:"watch"`
+				} `json:"autoenroll"`
+			}
+			if json.Unmarshal(raw, &doc) == nil {
+				wc = doc.AutoEnroll.Watch
+			}
+		}
+	}
+	statePath := ""
+	if h.cfg.ConfigPath != "" {
+		statePath = filepath.Join(filepath.Dir(h.cfg.ConfigPath), "data", "watcher-state.json")
+	}
+	h.cfg.UIDWatcher = NewUIDWatcher(wc, h.cfg.HaozhumaH5, h.cfg.AutoEnroll, statePath)
+	h.cfg.UIDWatcher.SetLogf(h.cfg.AutoEnroll.AppendLog)
+	if wc.Enabled {
+		h.cfg.UIDWatcher.Start()
+	}
+}
+
+// haozhumaProjects 项目搜索（代理网页端 /projects/search）。q 为搜索关键词。
 func (h *Handler) haozhumaProjects(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.HaozhumaH5 == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "项目搜索未启用（需在增强设置里粘贴 PHPSESSID）"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "项目搜索未启用（需在增强设置里粘贴豪猪网页 token）"})
 		return
 	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -2416,11 +2453,11 @@ func (h *Handler) haozhumaProjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"projects": projects})
 }
 
-// haozhumaUIDs 对接码列表（代理 H5 type=8）。sid 支持 16 位 hex 会话
-// 标识与数字项目 ID 两种（上游两者都收）。
+// haozhumaUIDs 对接码列表（代理网页端 /projects/{sid}/public-codes）。
+// sid 必须是服务端签发的 16 位 hex 引用——新站的裸数字项目 ID 查码返回空。
 func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.HaozhumaH5 == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码列表未启用（需在增强设置里粘贴 PHPSESSID）"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码列表未启用（需在增强设置里粘贴豪猪网页 token）"})
 		return
 	}
 	sid := strings.TrimSpace(r.URL.Query().Get("sid"))
@@ -2438,7 +2475,7 @@ func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"uids": uids})
 }
 
-// haozhumaAddUID 把对接码加入豪猪账户（代理 H5 type=4）。POST 防止
+// haozhumaAddUID 把对接码加入豪猪账户（代理网页端 POST /bindings）。POST 防止
 // 被当链接点/预取——这是写操作。
 //
 // 背景：官方 getPhone?uid= 只认**已加入账户**的对接码；市场列表里
@@ -2446,7 +2483,7 @@ func (h *Handler) haozhumaUIDs(w http.ResponseWriter, r *http.Request) {
 // 前端选码后调用本端点完成"加入"，再保存配置。
 func (h *Handler) haozhumaAddUID(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.HaozhumaH5 == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码增强未启用（需粘贴 PHPSESSID）"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码增强未启用（需粘贴豪猪网页 token）"})
 		return
 	}
 	var req struct {
@@ -2471,11 +2508,11 @@ func (h *Handler) haozhumaAddUID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"added": uid})
 }
 
-// haozhumaMyUIDs 我账户已加入的对接码（代理 H5 type=3）。前端用它
+// haozhumaMyUIDs 我账户已加入的对接码（代理网页端 GET /bindings）。前端用它
 // 标注市场列表里哪些码"已加入可直接取号"。
 func (h *Handler) haozhumaMyUIDs(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.HaozhumaH5 == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码增强未启用（需粘贴 PHPSESSID）"})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "对接码增强未启用（需粘贴豪猪网页 token）"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
@@ -2488,7 +2525,7 @@ func (h *Handler) haozhumaMyUIDs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"uids": uids})
 }
 
-// writeH5Error H5 调用错误的统一出口：会话失效 410（前端据此弹"重新粘贴"
+// writeH5Error 网页端调用错误的统一出口：token 失效 410（前端据此弹"重新粘贴"
 // 并退化手填），网络/上游错误 502，参数问题 400。
 func writeH5Error(w http.ResponseWriter, err error) {
 	switch {
@@ -2507,9 +2544,10 @@ func writeH5Error(w http.ResponseWriter, err error) {
 // 最近日志。watcher 未组装（豪猪 H5 或自动加号缺失）时回 503 + 原因，
 // 前端显示"监控不可用"而不是空白。
 func (h *Handler) haozhumaWatchGet(w http.ResponseWriter, r *http.Request) {
+	h.ensureUIDWatcher()
 	if h.cfg.UIDWatcher == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error":     "监控不可用：需配置豪猪接码账号并粘贴 H5 会话",
+			"error":     "监控不可用：需配置豪猪接码账号并粘贴网页 token",
 			"available": false,
 		})
 		return
@@ -2521,9 +2559,10 @@ func (h *Handler) haozhumaWatchGet(w http.ResponseWriter, r *http.Request) {
 // 配置。校验（WatchConfig.Validate）→ 落盘 config.json（autoenroll.watch
 // 节整体替换）→ 热生效（Reconfigure 重建 ticker）。
 func (h *Handler) haozhumaWatchPut(w http.ResponseWriter, r *http.Request) {
+	h.ensureUIDWatcher()
 	if h.cfg.UIDWatcher == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error":     "监控不可用：需配置豪猪接码账号并粘贴 H5 会话",
+			"error":     "监控不可用：需配置豪猪接码账号并粘贴网页 token",
 			"available": false,
 		})
 		return
@@ -2564,9 +2603,10 @@ func (h *Handler) haozhumaWatchPut(w http.ResponseWriter, r *http.Request) {
 // haozhumaWatchBudget POST /admin/account/sms/haozhuma/watch/budget：
 // {add: 10} 充值 或 {set: 5} 重置。充值会清除"额度耗尽"暂停。
 func (h *Handler) haozhumaWatchBudget(w http.ResponseWriter, r *http.Request) {
+	h.ensureUIDWatcher()
 	if h.cfg.UIDWatcher == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error":     "监控不可用：需配置豪猪接码账号并粘贴 H5 会话",
+			"error":     "监控不可用：需配置豪猪接码账号并粘贴网页 token",
 			"available": false,
 		})
 		return

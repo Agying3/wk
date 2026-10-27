@@ -634,7 +634,7 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 
 	// 会话失效：暂停派活但继续拉表（拉表免费，充值/重贴会话后立即恢复）。
 	if err := w.h5.Ping(ctx); err != nil {
-		w.setPaused(fmt.Sprintf("H5 会话失效（%v）——请在控制台重新粘贴 PHPSESSID", err))
+		w.setPaused(fmt.Sprintf("网页 token 失效（%v）——请在控制台重新粘贴 token（7 天过期）", err))
 		return
 	}
 

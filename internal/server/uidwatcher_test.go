@@ -18,9 +18,10 @@ import (
 	h5 "workbuddy2api/internal/haozhumah5"
 )
 
-// fakeWatchH5 可编程的 fake H5：type=8 返回 uidTable 里的当前值，
-// type=4 记录加码，type=41 记录移码，/time.php 恒通。consume() 模拟
-// 真实市场——号码被取走后可取库存下降（真实 H5 的 zxky 就是这么动的）。
+// fakeWatchH5 可编程的 fake 网页端（veeto 约定）：public-codes 返回
+// uidTable 里的当前值，POST /bindings 记录加码，POST /bindings/batch
+// 记录移码，GET /projects/search 供 Ping 探活。consume() 模拟真实市场——
+// 号码被取走后可取库存下降。
 type fakeWatchH5 struct {
 	t        *testing.T
 	srv      *httptest.Server
@@ -61,34 +62,50 @@ func (f *fakeWatchH5) consume(uid string, n int) {
 func newFakeWatchH5(t *testing.T, hexSID string, table map[string]string) *fakeWatchH5 {
 	f := &fakeWatchH5{t: t, hexSID: hexSID, uidTable: table}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api.php":
-			switch r.URL.Query().Get("type") {
-			case "8":
-				if r.URL.Query().Get("sid") != f.hexSID {
-					w.Write([]byte(`{"code":-1,"data":null,"msg":"sid 不匹配"}`))
-					return
-				}
-				f.mu.lock()
-				rows := make([]string, 0, len(f.uidTable))
-				for uid, meta := range f.uidTable {
-					rows = append(rows, fmt.Sprintf(
-						`{"sid":"52283","mc":"腾讯科技","uid":%q,"yhj":%q,"zxky":"可用数量:%s","yyy":"移动|","sheng":"","haoduan":"未知号段","hd":"198|","time":"2026-09-24 00:00:00","zd":"0"}`,
-						uid, price(meta), stockOf(meta)))
-				}
-				f.mu.unlock()
-				w.Write([]byte(`{"code":1,"data":[` + strings.Join(rows, ",") + `],"msg":"Success"}`))
-			case "4":
-				f.added.Add(1)
-				w.Write([]byte(`{"code":1,"data":null,"msg":"添加成功"}`))
-			case "41":
-				f.removed.Add(int32(len(strings.Split(r.URL.Query().Get("uid"), ","))))
-				w.Write([]byte(`{"code":200,"data":null,"msg":"对接码状态:已删除"}`))
-			default:
-				w.Write([]byte(`{"code":-1,"data":null,"msg":"unknown type"}`))
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/projects/search":
+			// Ping 探活用；也供项目解析。
+			fmt.Fprintf(w, `{"code":0,"message":"ok","data":{"list":[{"id":"52283","sid":%q,"name":"腾讯科技[限对接]"}]}}`, f.hexSID)
+		case strings.HasSuffix(r.URL.Path, "/public-codes"):
+			// 路径形如 /projects/{sid}/public-codes。
+			sid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/projects/"), "/public-codes")
+			if sid != f.hexSID {
+				fmt.Fprint(w, `{"code":404,"message":"项目不存在","data":{}}`)
+				return
 			}
-		case "/time.php":
-			w.Write([]byte(time.Now().Format(time.RFC3339)))
+			f.mu.lock()
+			rows := make([]string, 0, len(f.uidTable))
+			for uid, meta := range f.uidTable {
+				rows = append(rows, fmt.Sprintf(
+					`{"code":%q,"projectId":"52283","projectName":"腾讯科技[限对接]","price":%q,"available":%s,"operators":["移动"],"provinces":[],"prefixes":["198"],"segmentType":"正常号段","pinned":false}`,
+					uid, price(meta), stockOf(meta)))
+			}
+			f.mu.unlock()
+			fmt.Fprint(w, `{"code":0,"message":"ok","data":[`+strings.Join(rows, ",")+`]}`)
+		case r.URL.Path == "/bindings" && r.Method == http.MethodPost:
+			f.added.Add(1)
+			// 上游真实行为：逐码回结果，code 原样回显。写死别的码会让
+			// 客户端按码匹配失败（AddUID 要求回本码的结果）。
+			var body struct {
+				Codes []string `json:"codes"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			results := make([]string, 0, len(body.Codes))
+			for _, c := range body.Codes {
+				results = append(results, fmt.Sprintf(`{"code":%q,"ok":true,"message":"添加成功"}`, c))
+			}
+			fmt.Fprint(w, `{"code":0,"message":"ok","data":{"results":[`+strings.Join(results, ",")+`]}}`)
+		case r.URL.Path == "/bindings/batch":
+			var body struct {
+				Action string   `json:"action"`
+				Codes  []string `json:"codes"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Action == "delete" {
+				f.removed.Add(int32(len(body.Codes)))
+			}
+			fmt.Fprint(w, `{"code":0,"message":"ok","data":{"affected":`+strconv.Itoa(len(body.Codes))+`}}`)
 		default:
 			http.NotFound(w, r)
 		}

@@ -8,43 +8,36 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	h5 "workbuddy2api/internal/haozhumah5"
 )
 
-// newFakeH5Server 起 fake H5（项目搜索/对接码列表）。与 haozhumah5 包内
-// 的 fake 语义一致但独立维护——handler 测试只需要固定响应。
-// validSession 非空时校验值（不匹配 = 会话失效路径），空 = 只要有
-// PHPSESSID 就放行。
-func newFakeH5Server(t *testing.T, validSession string) *httptest.Server {
+// newFakeH5Server 起 fake 网页端（veeto 约定：项目搜索 / 对接码列表）。
+// 与 haozhumah5 包内的 fake 语义一致但独立维护——handler 测试只需要固定响应。
+// validToken 非空时校验 Bearer 值（不匹配 = token 失效路径），空 = 放行。
+func newFakeH5Server(t *testing.T, validToken string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, err := r.Cookie("PHPSESSID")
-		if err != nil || got.Value == "" || (validSession != "" && got.Value != validSession) {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"code":-1,"data":null,"msg":"请选择正确的API"}`))
+		w.Header().Set("Content-Type", "application/json")
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if got == "" || (validToken != "" && got != validToken) {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"code":401,"message":"unauthorized","data":{}}`))
 			return
 		}
-		switch r.URL.Path {
-		case "/api.php":
-			switch r.URL.Query().Get("type") {
-			case "30":
-				w.Write([]byte(`{"code":1,"data":[
-  {"name":"【52283】腾讯科技[限对接] [70da814e38b466b6]","sid":"70da814e38b466b6"},
-  {"name":"【61904】腾讯科技3次[限对接] [1972972d69bd0453]","sid":"1972972d69bd0453"}
-],"msg":"Success"}`))
-			case "8":
-				w.Write([]byte(`{"code":1,"data":[
-  {"sid":"52283","mc":"[52283]腾讯科技[限对接]","uid":"52283-WW9L2J4WOL","yhj":"16.500","zxky":"可用数量:23","yyy":"移动|电信|联通|","sheng":"","haoduan":"未知号段","hd":"198|193|","time":"2026-09-22 23:24:18","zd":"1"}
-],"msg":"Success"}`))
-			default:
-				w.Write([]byte(`{"code":-1,"data":null,"msg":"unknown type"}`))
-			}
-		case "/time.php":
-			w.Write([]byte(time.Now().Format(time.RFC3339)))
+		switch {
+		case r.URL.Path == "/projects/search":
+			w.Write([]byte(`{"code":0,"message":"ok","data":{"list":[
+  {"id":"52283","sid":"70da814e38b466b6","name":"腾讯科技[限对接]"},
+  {"id":"61904","sid":"1972972d69bd0453","name":"腾讯科技3次[限对接]"}
+],"total":2,"page":1,"size":50}}`))
+		case strings.HasSuffix(r.URL.Path, "/public-codes"):
+			w.Write([]byte(`{"code":0,"message":"ok","data":[
+  {"code":"52283-WW9L2J4WOL","projectId":"52283","projectName":"腾讯科技[限对接]","price":"16.500","available":23,"operators":["移动","电信","联通"],"provinces":[],"prefixes":["198","193"],"segmentType":"未知号段","pinned":true}
+]}`))
 		default:
-			http.NotFound(w, r)
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"code":404,"message":"Not Found","data":{}}`))
 		}
 	}))
 	t.Cleanup(srv.Close)

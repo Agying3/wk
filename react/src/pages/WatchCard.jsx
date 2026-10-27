@@ -104,7 +104,7 @@ export default function WatchCard({ api, h5Ready }) {
   }, [watch]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!h5Ready) {
-    return null; // H5 未配置：整卡隐藏（高级设置里粘贴 PHPSESSID 后出现）
+    return null; // 网页 token 未配置：整卡隐藏（高级设置里粘贴 token 后出现）
   }
 
   const available = watch?.available !== false;
@@ -115,7 +115,7 @@ export default function WatchCard({ api, h5Ready }) {
           type="warning"
           showIcon
           message="监控不可用"
-          description="需配置豪猪接码账号并粘贴 H5 会话（PHPSESSID）后才能监控对接码市场。"
+          description="需配置豪猪接码账号并粘贴网页 token 后才能监控对接码市场。"
         />
       </Card>
     );
@@ -233,7 +233,7 @@ export default function WatchCard({ api, h5Ready }) {
 
   const pickProject = (p) => {
     if (!p || !p.project_id || !p.sid) {
-      message.warning('该项目缺少数字 ID 或会话标识，无法监控');
+      message.warning('该项目缺少数字 ID 或码表引用，无法监控');
       return;
     }
     setDraftProjects(cur => [...(cur || watch?.projects || []), {
