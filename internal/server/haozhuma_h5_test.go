@@ -28,8 +28,8 @@ func newFakeH5Server(t *testing.T, validToken string) *httptest.Server {
 		switch {
 		case r.URL.Path == "/projects/search":
 			w.Write([]byte(`{"code":0,"message":"ok","data":{"list":[
-  {"id":"52283","sid":"70da814e38b466b6","name":"腾讯科技[限对接]"},
-  {"id":"61904","sid":"1972972d69bd0453","name":"腾讯科技3次[限对接]"}
+  {"id":"52283","sid":"cccc3333dddd4444","name":"腾讯科技[限对接]"},
+  {"id":"99998","sid":"eeee5555ffff6666","name":"腾讯科技3次[限对接]"}
 ],"total":2,"page":1,"size":50}}`))
 		case strings.HasSuffix(r.URL.Path, "/public-codes"):
 			w.Write([]byte(`{"code":0,"message":"ok","data":[
@@ -187,7 +187,7 @@ func TestHaozhumaProjectsEndpoint(t *testing.T) {
 	if len(resp.Projects) != 2 {
 		t.Fatalf("projects = %d, want 2", len(resp.Projects))
 	}
-	if resp.Projects[0].SID != "70da814e38b466b6" || resp.Projects[0].ProjectID != "52283" {
+	if resp.Projects[0].SID != "cccc3333dddd4444" || resp.Projects[0].ProjectID != "52283" {
 		t.Fatalf("first project = %+v", resp.Projects[0])
 	}
 }
@@ -209,7 +209,7 @@ func TestHaozhumaUIDsEndpoint(t *testing.T) {
 	}
 
 	// 正常列表。
-	req = httptest.NewRequest(http.MethodGet, "/admin/account/sms/haozhuma/uids?sid=70da814e38b466b6", nil)
+	req = httptest.NewRequest(http.MethodGet, "/admin/account/sms/haozhuma/uids?sid=cccc3333dddd4444", nil)
 	rec = httptest.NewRecorder()
 	ah.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -241,7 +241,7 @@ func TestHaozhumaUIDsEndpoint(t *testing.T) {
 	// 会话失效：client 换成 fake 不认的会话值 → 上游报"请选择正确的API"
 	// → 410（前端据此弹"重新粘贴"并退化手填）。
 	ah.Handler.cfg.HaozhumaH5.Session("expired-session")
-	req = httptest.NewRequest(http.MethodGet, "/admin/account/sms/haozhuma/uids?sid=70da814e38b466b6", nil)
+	req = httptest.NewRequest(http.MethodGet, "/admin/account/sms/haozhuma/uids?sid=cccc3333dddd4444", nil)
 	rec = httptest.NewRecorder()
 	ah.ServeHTTP(rec, req)
 	if rec.Code != 410 {

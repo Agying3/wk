@@ -68,7 +68,7 @@ type Project struct {
 
 // UIDItem 对接码列表项。字段与旧版保持一致，前端无需改动。
 type UIDItem struct {
-	UID         string   `json:"uid"`          // 对接码（61903-MDGCVYBLNZ）
+	UID         string   `json:"uid"`          // 对接码（形如 <项目ID>-<随机串>）
 	Name        string   `json:"name"`         // 项目名称
 	Price       float64  `json:"price"`        // 单价（元）
 	Stock       int      `json:"stock"`        // 可用数量（-1=未知）

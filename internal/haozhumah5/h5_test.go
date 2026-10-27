@@ -108,7 +108,7 @@ func newFakeVeeto(t *testing.T) *fakeVeeto {
 func TestProjectsParsesStructuredFields(t *testing.T) {
 	f := newFakeVeeto(t)
 	f.searchResp = `{"code":0,"message":"ok","data":{"list":[
-		{"id":"61903","sid":"5b02b39a13d7c2de","name":"腾讯科技2次[限对接]"},
+		{"id":"61903","sid":"aaaa1111bbbb2222","name":"腾讯科技2次[限对接]"},
 		{"id":"52283","sid":"70da814e38b466b6","name":"腾讯科技[限对接]"}
 	],"total":2,"page":1,"size":50}}`
 
@@ -125,7 +125,7 @@ func TestProjectsParsesStructuredFields(t *testing.T) {
 	for _, p := range got {
 		byID[p.ProjectID] = p
 	}
-	if p := byID["61903"]; p.SID != "5b02b39a13d7c2de" || p.Name != "腾讯科技2次[限对接]" {
+	if p := byID["61903"]; p.SID != "aaaa1111bbbb2222" || p.Name != "腾讯科技2次[限对接]" {
 		t.Fatalf("61903 解析错误: %+v", p)
 	}
 	// 新站结构化返回，不再需要从「【52283】名称」里抠 ID。
@@ -159,13 +159,13 @@ func TestProjectsCached(t *testing.T) {
 func TestUIDsParsesAndSorts(t *testing.T) {
 	f := newFakeVeeto(t)
 	f.codesResp = `{"code":0,"message":"ok","data":[
-		{"code":"61903-DEAD","projectId":"61903","projectName":"腾讯科技2次","price":"0.230","available":0,"operators":["虚拟运营商"],"provinces":["山东"],"prefixes":["171"],"segmentType":"虚拟号段","pinned":false},
-		{"code":"61903-VALID","projectId":"61903","projectName":"腾讯科技2次","price":"0.495","available":22,"operators":["虚拟运营商"],"provinces":["内蒙古"],"prefixes":["170","167"],"segmentType":"虚拟号段","pinned":false},
-		{"code":"61903-REAL","projectId":"61903","projectName":"腾讯科技2次","price":"41.800","available":130,"operators":["移动"],"provinces":["广东"],"prefixes":["198"],"segmentType":"正常号段","pinned":true}
+		{"code":"99999-DEAD","projectId":"99999","projectName":"腾讯科技2次","price":"0.230","available":0,"operators":["虚拟运营商"],"provinces":["山东"],"prefixes":["171"],"segmentType":"虚拟号段","pinned":false},
+		{"code":"99999-VALID","projectId":"99999","projectName":"腾讯科技2次","price":"0.495","available":22,"operators":["虚拟运营商"],"provinces":["内蒙古"],"prefixes":["170","167"],"segmentType":"虚拟号段","pinned":false},
+		{"code":"99999-REAL","projectId":"99999","projectName":"腾讯科技2次","price":"41.800","available":130,"operators":["移动"],"provinces":["广东"],"prefixes":["198"],"segmentType":"正常号段","pinned":true}
 	]}`
 
 	c := New("tok-ok")
-	got, err := c.UIDs(context.Background(), "5b02b39a13d7c2de")
+	got, err := c.UIDs(context.Background(), "aaaa1111bbbb2222")
 	if err != nil {
 		t.Fatalf("UIDs: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestUIDsParsesAndSorts(t *testing.T) {
 		t.Fatalf("want 3, got %d", len(got))
 	}
 	// 有货优先，且同库存下价格低→高：REAL(130) 在前，VALID(22) 次之，DEAD(0) 最后。
-	if got[0].UID != "61903-REAL" || got[1].UID != "61903-VALID" || got[2].UID != "61903-DEAD" {
+	if got[0].UID != "99999-REAL" || got[1].UID != "99999-VALID" || got[2].UID != "99999-DEAD" {
 		t.Fatalf("排序不对: %v %v %v", got[0].UID, got[1].UID, got[2].UID)
 	}
 	if got[1].Price != 0.495 || got[1].Stock != 22 {
@@ -200,11 +200,11 @@ func TestMyUIDsPaginates(t *testing.T) {
 	// 第一页满 100 条，第二页 2 条 —— 必须翻到第二页才完整。
 	page1 := make([]string, 0, 100)
 	for i := 0; i < 100; i++ {
-		page1 = append(page1, fmt.Sprintf(`{"code":"61903-C%03d","projectName":"腾讯科技","price":"0.5","available":1}`, i))
+		page1 = append(page1, fmt.Sprintf(`{"code":"99999-C%03d","projectName":"腾讯科技","price":"0.5","available":1}`, i))
 	}
 	f.bindingsResp = []string{
 		`{"code":0,"message":"ok","data":{"list":[` + strings.Join(page1, ",") + `],"total":102,"page":1,"size":100}}`,
-		`{"code":0,"message":"ok","data":{"list":[{"code":"61903-Z1","projectName":"腾讯科技","price":"0.5","available":1},{"code":"61903-Z2","projectName":"联通项目","price":"0.6","available":2}],"total":102,"page":2,"size":100}}`,
+		`{"code":0,"message":"ok","data":{"list":[{"code":"99999-Z1","projectName":"腾讯科技","price":"0.5","available":1},{"code":"99999-Z2","projectName":"联通项目","price":"0.6","available":2}],"total":102,"page":2,"size":100}}`,
 	}
 	c := New("tok-ok")
 	all, err := c.MyUIDs(context.Background(), "")
@@ -219,7 +219,7 @@ func TestMyUIDsPaginates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MyUIDs filtered: %v", err)
 	}
-	if len(filtered) != 1 || filtered[0].UID != "61903-Z2" {
+	if len(filtered) != 1 || filtered[0].UID != "99999-Z2" {
 		t.Fatalf("过滤结果不对: %+v", filtered)
 	}
 }
@@ -227,7 +227,7 @@ func TestMyUIDsPaginates(t *testing.T) {
 func TestAddUIDSuccess(t *testing.T) {
 	f := newFakeVeeto(t)
 	c := New("tok-ok")
-	if err := c.AddUID(context.Background(), "61903-81H9C4KYDZ"); err != nil {
+	if err := c.AddUID(context.Background(), "99999-EXAMPLE001"); err != nil {
 		t.Fatalf("AddUID: %v", err)
 	}
 	var sent struct {
@@ -236,16 +236,16 @@ func TestAddUIDSuccess(t *testing.T) {
 	if err := json.Unmarshal([]byte(f.lastJoinBody), &sent); err != nil {
 		t.Fatalf("请求体不是 JSON: %s", f.lastJoinBody)
 	}
-	if len(sent.Codes) != 1 || sent.Codes[0] != "61903-81H9C4KYDZ" {
+	if len(sent.Codes) != 1 || sent.Codes[0] != "99999-EXAMPLE001" {
 		t.Fatalf("请求体不对: %s", f.lastJoinBody)
 	}
 }
 
 func TestAddUIDUpstreamRejects(t *testing.T) {
 	f := newFakeVeeto(t)
-	f.joinResp = `{"code":0,"message":"ok","data":{"results":[{"code":"61903-BAD","ok":false,"message":"库存不足"}]}}`
+	f.joinResp = `{"code":0,"message":"ok","data":{"results":[{"code":"99999-BAD","ok":false,"message":"库存不足"}]}}`
 	c := New("tok-ok")
-	err := c.AddUID(context.Background(), "61903-BAD")
+	err := c.AddUID(context.Background(), "99999-BAD")
 	if err == nil {
 		t.Fatal("上游 ok:false 必须报错")
 	}
@@ -259,7 +259,7 @@ func TestAddUIDMissingResult(t *testing.T) {
 	// 上游返回了别人的码结果，没回我们这条 —— 不能当成功。
 	f.joinResp = `{"code":0,"message":"ok","data":{"results":[{"code":"OTHER","ok":true,"message":"添加成功"}]}}`
 	c := New("tok-ok")
-	if err := c.AddUID(context.Background(), "61903-MINE"); err == nil {
+	if err := c.AddUID(context.Background(), "99999-MINE"); err == nil {
 		t.Fatal("上游未返回该码结果时必须报错")
 	}
 }
@@ -276,7 +276,7 @@ func TestBatchActions(t *testing.T) {
 		{"pause", c.PauseUIDs, "pause"},
 		{"resume", c.ResumeUIDs, "resume"},
 	} {
-		if err := tc.call(context.Background(), []string{"61903-A", " ", "61903-B"}); err != nil {
+		if err := tc.call(context.Background(), []string{"99999-A", " ", "99999-B"}); err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
 		var sent struct {
@@ -362,19 +362,19 @@ func TestUpstreamErrorSurfaces(t *testing.T) {
 func TestSessionSwitchFlushesCache(t *testing.T) {
 	f := newFakeVeeto(t)
 	f.token = "" // 两个 token 都放行
-	f.codesResp = `{"code":0,"message":"ok","data":[{"code":"61903-A","price":"1","available":5}]}`
+	f.codesResp = `{"code":0,"message":"ok","data":[{"code":"99999-A","price":"1","available":5}]}`
 	c := New("tok-1")
 	if _, err := c.UIDs(context.Background(), "sid1"); err != nil {
 		t.Fatalf("UIDs: %v", err)
 	}
 	// 换账号后必须重新拉，不能命中旧账号的缓存（否则会显示别人的库存）。
 	c.Session("tok-2")
-	f.codesResp = `{"code":0,"message":"ok","data":[{"code":"61903-B","price":"2","available":9}]}`
+	f.codesResp = `{"code":0,"message":"ok","data":[{"code":"99999-B","price":"2","available":9}]}`
 	got, err := c.UIDs(context.Background(), "sid1")
 	if err != nil {
 		t.Fatalf("UIDs after switch: %v", err)
 	}
-	if len(got) != 1 || got[0].UID != "61903-B" {
+	if len(got) != 1 || got[0].UID != "99999-B" {
 		t.Fatalf("缓存未随 token 清空: %+v", got)
 	}
 }
