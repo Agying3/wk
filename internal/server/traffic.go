@@ -71,7 +71,7 @@ func (h *Handler) observeClientRequest(next http.HandlerFunc, w http.ResponseWri
 		}
 		lease.End(c)
 	}()
-	next(writer, r.WithContext(context.WithValue(r.Context(), trafficResultKey{}, result)))
+	h.observeCapturedRequest(next, writer, r.WithContext(context.WithValue(r.Context(), trafficResultKey{}, result)))
 }
 
 func (h *Handler) beginTrafficAttempt(ctx context.Context, st *chatStat, uid, name string, started time.Time) context.Context {
@@ -99,6 +99,7 @@ func (h *Handler) beginTrafficAttempt(ctx context.Context, st *chatStat, uid, na
 			}
 		}
 		st.trafficProxyStart = time.Now()
+		captureProxy(ctx, uid, id, groupID)
 		st.trafficProxy = h.cfg.Traffic.Begin(traffic.Entity{Dimension: "proxy", ID: id, Name: maskPhonesIn(name)},
 			traffic.Entity{Dimension: "proxy_group", ID: groupID, Name: maskPhonesIn(groupName)})
 	})

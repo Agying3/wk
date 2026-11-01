@@ -209,6 +209,7 @@ type ResponseStore interface {
 
 // Handler 主路由。
 type Handler struct {
+	requestCapture    captureManager
 	cacheRouter       *cacheroute.Router
 	sessionResolver   *session.Resolver
 	cfg               Config
@@ -429,6 +430,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/unlock", h.unlock)
 	h.mux.HandleFunc("GET /admin/config", h.withFrontend(h.adminConfig))
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
+	h.mux.HandleFunc("GET /admin/request-capture", h.withFrontend(h.requestCaptureAPI))
+	h.mux.HandleFunc("GET /admin/request-capture/{id}", h.withFrontend(h.requestCaptureAPI))
+	h.mux.HandleFunc("POST /admin/request-capture", h.withFrontend(h.requestCaptureAPI))
+	h.mux.HandleFunc("DELETE /admin/request-capture", h.withFrontend(h.requestCaptureAPI))
 	h.registerPromptGuard()
 	h.registerCollection()
 	// 分组 + 密钥管理（多密钥体系）。分组存储未启用时端点回 503。
@@ -5279,6 +5284,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.spendHook = h.cfg.Pool.SpendCredits
 	}
 	defer st.done()
+	defer captureChatStat(r.Context(), st)
+	captureNormalized(r.Context(), body)
 	// The upstream client canonicalizes public aliases before sending the body.
 	// Use the same canonical ID for model-level routing/cooldowns so a limit
 	// learned from kimi-k3-1 also applies to the upstream kimi-k3 request.
@@ -5388,6 +5395,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		policy := h.cfg.Upstream.RequestPolicy(stream)
 		sent := time.Now()
 		attemptCtx := h.beginTrafficAttempt(r.Context(), st, acct.UID, acct.Nickname, sent)
+		attemptCtx = captureAttemptContext(attemptCtx, acct.UID)
 		rc, status, respBody, upstreamHeaders, terr := h.cfg.Upstream.ChatStreamPreparedWithPolicy(attemptCtx, acct, preparedBody, policy)
 		upstream.CopyResponseIDHeaders(w.Header(), upstreamHeaders)
 		upstreamHeaderID := upstream.ResponseIDFromHeader(upstreamHeaders)

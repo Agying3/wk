@@ -2,6 +2,18 @@
 
 ## 快速开始
 
+### 错误请求自动捕获
+
+“请求日志”页的“错误请求自动捕获”默认启用，捕获业务错误码 `11128`、`11140`、`11148`，可在该卡片修改错误码或暂停。匹配发生在每一次上游尝试；即使随后换号重试成功、最终 HTTP 200，也会保留此前的失败尝试。它不改变请求、重试或账号状态，也不会额外向供应商发请求。
+
+记录包含 WorkBuddy 收到的入口请求、转换后的 Chat 请求、每个账号实际发往上游的请求和错误、请求 ID，以及账号/代理的稳定脱敏标识。WorkBuddy 入口位于 NewAPI 之后，因此无法还原 NewAPI 转换前的客户端请求。SSE 中途出现业务错误同样可捕获。
+
+记录只在内存中供管理员查看，不写常规请求日志、业务数据库、文件或浏览器存储；保留10分钟，最多20条、总计32 MiB，重启即丢失。每份记录的请求正文预算为6 MiB，单份正文上限2 MiB；超限仅保存大小和哈希并标明省略。最多同时采样8个在途请求，繁忙时跳过数会显示在界面。每请求至多记录8次上游尝试，超出部分计数标明省略。常规成功请求不留存。
+
+抓取只保留白名单元数据头，不记录认证头、Cookie 或原始账号 UID。正文中的已知认证值、常见密钥格式、带标签的密码/令牌、JSON 字符串内嵌凭据会脱敏，内联图片数据会省略；自动脱敏无法识别所有无标签的私密文本，记录仍按敏感请求内容处理。原始正文 SHA-256 在脱敏之前计算，用于对照；`hashed_bytes` 标明哈希覆盖的实际字节数，`complete`/`truncated` 标明不完整内容。详情仅供受保护的管理员会话或全局管理员密钥访问，分组密钥不可读取。
+
+管理员 API（均为本地观测，不触发上游）：`GET /admin/request-capture` 返回设置和记录摘要；`GET /admin/request-capture/{id}` 读取一份详情；`POST /admin/request-capture` 接收 `{"enabled":true,"business_codes":[11128,11140,11148]}`；`DELETE /admin/request-capture` 清空记录。设置仅本次进程生效，重启恢复默认。修改设置、暂停或清空会丢弃尚未完成的采样，实际推理请求继续。启用该功能不代表能阻止上游限制，也不证明捕获到的请求就是风控唯一原因。
+
 本修改版采用 **AGPL-3.0-only**。基于 / 包含了 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)、[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 和 [workbuddy2api-panel](https://github.com/yreidev/workbuddy2api-panel) 的代码或材料；这是独立维护的修改版，不代表原作者或腾讯官方。版权与第三方授权见 [NOTICE](NOTICE) 和 [LICENSES](LICENSES)。
 
 ### 上游读取兼容

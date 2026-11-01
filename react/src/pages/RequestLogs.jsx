@@ -4,6 +4,7 @@ import {
 } from 'antd';
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons';
 import RequestSummaryNotice from '../components/RequestSummaryNotice';
+import ErrorRequestCapture from '../components/ErrorRequestCapture';
 import { createLatestRequestLoader, requestFilterKey, statisticsFromSummary } from '../lib/requestStatistics';
 
 const { Text } = Typography;
@@ -153,6 +154,7 @@ export default function RequestLogs({ api, models, accounts }) {
       </div>
       <RequestSummaryNotice summary={summary} />
 
+      <ErrorRequestCapture api={api} />
       <Card title="筛选" extra={<Text type="secondary">汇总基于窗口内已保留记录；表格最多展示 500 条</Text>}>
         <Space wrap style={{ width: '100%' }}>
           <Select value={windowKey} onChange={setWindowKey} style={{ width: 130 }} options={WINDOW_PRESETS.map(w => ({ value: w.key, label: w.label }))} />

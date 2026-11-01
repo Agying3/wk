@@ -566,6 +566,9 @@ func (c *Client) ChatStreamWithPolicyObj(ctx context.Context, a *auth.Auth, obj 
 
 // chatStreamPrepared 发送已改写完毕的出站请求体并处理响应。
 func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody []byte, policy StreamPolicy) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
+	defer func() {
+		observeChat(ctx, ChatObservation{Phase: "result", Status: status, ResponseHeaders: headers, ErrorBody: respBody, Err: err})
+	}()
 	outBody, err = c.accountEffortBody(a, outBody)
 	if err != nil {
 		return nil, 0, nil, nil, err
@@ -618,6 +621,7 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 	}
 	cli := *baseCli
 	cli.Timeout = 0
+	observeChat(ctx, ChatObservation{Phase: "request", URL: req.URL.Scheme + "://" + req.URL.Host + req.URL.Path, RequestHeaders: req.Header, Body: outBody})
 	resp, err := doUpstream(&cli, req)
 	// 声明"响应头已到"：若回调抢先抢到 CAS，这里会失败且 headerTimedOut 已置位。
 	alreadyArrived := headerArrived.CompareAndSwap(false, true)
@@ -661,7 +665,7 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 		return nil, resp.StatusCode, raw, headers, nil
 	}
 	// 交还 body 时把 cancel 挂上：调用方 Close 即释放 ctx（含 Total 定时器）。
-	return newTimeoutBody(resp.Body, policy.Total, policy.Idle, cancel), resp.StatusCode, nil, headers, nil
+	return observeChatStream(ctx, newTimeoutBody(resp.Body, policy.Total, policy.Idle, cancel), headers), resp.StatusCode, nil, headers, nil
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
