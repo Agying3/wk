@@ -60,7 +60,10 @@ func (c *Client) RefreshTokenContext(ctx context.Context, a *auth.Auth) error {
 		if result.Err != nil {
 			return result.Err
 		}
-		a.ApplyRefreshIfCurrent(before, result.Val.(auth.Credentials))
+		next := result.Val.(auth.Credentials)
+		if !a.ApplyRefreshIfCurrent(before, next) && !sameRefreshCredential(a.Snapshot(), next) {
+			return fmt.Errorf("refresh discarded: credentials changed")
+		}
 		return nil
 	}
 }
@@ -87,7 +90,7 @@ func (c *Client) refreshCredential(ctx context.Context, a *auth.Auth, before aut
 	c.refreshHeaders(req, authFromCredentials(before))
 	data, err := c.doJSON(req, a)
 	if err != nil {
-		return next, err
+		return next, &refreshStageError{stage: "token request", cause: err}
 	}
 	var tok struct {
 		AccessToken  string `json:"accessToken"`
@@ -248,3 +251,29 @@ func (c *Client) verifyRefreshedIdentity(ctx context.Context, before, next auth.
 	}
 	return next, nil
 }
+
+// Preserve errors.Is/As for the existing rotation policy, but keep responses,
+// request URLs and credentials out of refresh diagnostics.
+type refreshStageError struct {
+	stage string
+	cause error
+}
+
+func (e *refreshStageError) Error() string {
+	var upstreamErr *Error
+	if errors.As(e.cause, &upstreamErr) {
+		return fmt.Sprintf("refresh %s failed: HTTP %d (%s)", e.stage, upstreamErr.Status, upstreamErr.Kind)
+	}
+	if errors.Is(e.cause, context.Canceled) {
+		return "refresh " + e.stage + " canceled"
+	}
+	if errors.Is(e.cause, context.DeadlineExceeded) {
+		return "refresh " + e.stage + " timed out"
+	}
+	if errors.Is(e.cause, ErrNoProxyNode) {
+		return "refresh " + e.stage + " failed: proxy unavailable"
+	}
+	return "refresh " + e.stage + " failed"
+}
+
+func (e *refreshStageError) Unwrap() error { return e.cause }

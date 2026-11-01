@@ -428,6 +428,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 		req.Header.Set("X-User-Id", creds.UID)
 	}
 	var out struct {
+		Items   []MarketExpert `json:"items"`
 		Experts []MarketExpert `json:"experts"`
 	}
 	if c.desktopHeaders() {
@@ -440,6 +441,9 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, fmt.Errorf("expert list parse: %w", err)
+	}
+	if out.Items != nil {
+		return out.Items, nil
 	}
 	return out.Experts, nil
 }
@@ -509,7 +513,7 @@ func (c *Client) DesktopChatWithExpertObserved(a *auth.Auth, expertID string) (r
 		return result, err // D4：无可用节点，不回退直连
 	}
 	result.StartedAt = time.Now().UnixMilli()
-	resp, err := cli.Do(req)
+	resp, err := doUpstream(cli, req)
 	if err != nil {
 		return result, err
 	}

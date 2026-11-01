@@ -409,12 +409,15 @@ func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error
 	if err != nil {
 		return nil, err // D4：无可用节点，不回退直连
 	}
-	resp, err := cli.Do(req)
+	resp, err := doUpstream(cli, req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readControlBody(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
@@ -590,7 +593,7 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 	}
 	cli := *baseCli
 	cli.Timeout = 0
-	resp, err := cli.Do(req)
+	resp, err := doUpstream(&cli, req)
 	// 声明"响应头已到"：若回调抢先抢到 CAS，这里会失败且 headerTimedOut 已置位。
 	alreadyArrived := headerArrived.CompareAndSwap(false, true)
 	headerTimer.Stop()
@@ -650,7 +653,7 @@ type ModelInfo struct {
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return c.FetchModelsContext(context.Background(), a)
 }
-func (c *Client) FetchModelsContext(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
+func (c *Client) fetchLegacyModels(ctx context.Context, a *auth.Auth) ([]ModelInfo, error) {
 	url := c.chatBase(a) + "/console/enterprises/personal/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -671,12 +674,15 @@ func (c *Client) FetchModelsContext(ctx context.Context, a *auth.Auth) ([]ModelI
 	if err != nil {
 		return nil, err // D4：无可用节点，不回退直连
 	}
-	resp, err := cli.Do(req)
+	resp, err := doUpstream(cli, req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readControlBody(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, &Error{Kind: Classify(resp.StatusCode, string(raw)), Status: resp.StatusCode, Msg: truncate(string(raw), 120), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
 	}
@@ -781,7 +787,10 @@ func (c *Client) FetchModelsContext(ctx context.Context, a *auth.Auth) ([]ModelI
 // ResourceUsage contains the aggregate upstream credit counters for one user.
 // Remaining follows the same cycle-first rule used by the account pool.
 type ResourceUsage struct {
-	Remaining           int64
+	Remaining int64
+	// RemainingPrecise retains the decimal upstream amount for collection
+	// snapshots; routing keeps its existing integer credit unit.
+	RemainingPrecise    string `json:",omitempty"`
 	CapacitySize        int64
 	CapacityRemain      int64
 	CapacityUsed        int64
@@ -842,7 +851,7 @@ func (c *Client) UserRequestUsageContext(ctx context.Context, a *auth.Auth, star
 func (c *Client) UserResourceDetails(a *auth.Auth) (ResourceUsage, error) {
 	return c.UserResourceDetailsContext(context.Background(), a)
 }
-func (c *Client) UserResourceDetailsContext(ctx context.Context, a *auth.Auth) (ResourceUsage, error) {
+func (c *Client) legacyResourceDetails(ctx context.Context, a *auth.Auth) (ResourceUsage, error) {
 	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
 	now := time.Now()
 	body := map[string]any{

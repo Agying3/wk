@@ -12,6 +12,46 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
+type joinedRefreshContext struct {
+	context.Context
+	joined chan struct{}
+	once   sync.Once
+}
+
+func (c *joinedRefreshContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.joined) })
+	return c.Context.Done()
+}
+
+func TestRefreshWaiterCannotReportSuccessAfterImport(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	c := testClient(func(*http.Request) (*http.Response, error) {
+		close(started)
+		<-release
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"rotated"}}`), nil
+	})
+	leader := &auth.Auth{UID: "u", AccessToken: "old", RefreshToken: "r"}
+	waiter := &auth.Auth{UID: "u", AccessToken: "old", RefreshToken: "r"}
+	leaderDone := make(chan error, 1)
+	go func() { leaderDone <- c.RefreshToken(leader) }()
+	<-started
+	ctx := &joinedRefreshContext{Context: context.Background(), joined: make(chan struct{})}
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- c.RefreshTokenContext(ctx, waiter) }()
+	<-ctx.joined
+	waiter.ApplyRefresh("imported", "imported-r", "", 0)
+	close(release)
+	if err := <-leaderDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waiterDone; err == nil {
+		t.Fatal("waiter reported success after newer credential import")
+	}
+	if waiter.Snapshot().AccessToken != "imported" {
+		t.Fatal("waiter overwrote newer credentials")
+	}
+}
+
 func TestRefreshCoalescesCredentialCopies(t *testing.T) {
 	var requests atomic.Int32
 	started, release := make(chan struct{}), make(chan struct{})

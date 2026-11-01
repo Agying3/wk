@@ -179,6 +179,13 @@ func (c *Client) billingHeaders(req *http.Request, a *auth.Auth) {
 			}
 			req.Header.Set("Accept-Language", language)
 		}
+	case resourceSummaryAPI, resourceFreeAPI, resourcePaidAPI:
+		req.Header.Set("User-Agent", "axios/1.16.1")
+		language := "zh"
+		if a.Region() == auth.RegionGlobal {
+			language = "en"
+		}
+		req.Header.Set("Accept-Language", language)
 	default:
 		req.Header.Set("User-Agent", c.desktopUserAgent(a, false))
 	}

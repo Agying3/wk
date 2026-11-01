@@ -3,6 +3,7 @@ module workbuddy2api
 go 1.26
 
 require (
+	github.com/andybalholm/brotli v1.0.6
 	github.com/jackc/pgx/v5 v5.7.3
 	github.com/klauspost/compress v1.17.4
 	github.com/redis/go-redis/v9 v9.18.0
@@ -14,7 +15,6 @@ require (
 )
 
 require (
-	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect

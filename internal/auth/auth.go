@@ -203,6 +203,11 @@ func Parse(raw []byte) (*Auth, error) {
 			Nickname:     f.Nickname,
 		}
 	}
+	// Official credential exports may use Unix milliseconds. Internally and
+	// when saving, keep the existing Unix-second contract.
+	if a.ExpiresAt > 100_000_000_000 {
+		a.ExpiresAt /= 1000
+	}
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}

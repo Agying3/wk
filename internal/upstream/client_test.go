@@ -215,7 +215,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	var outbound []byte
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+		case r.URL.Path == "/v3/config":
 			return jsonResp(200, `{"code":0,"data":{"models":[
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":["low","high"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
@@ -293,7 +293,7 @@ func TestFetchModelsCanonicalizesKimiIDs(t *testing.T) {
 func TestUserResourceAggregation(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
-			return nil, errors.New("wrong path: " + r.URL.Path)
+			return jsonResp(404, `{"code":404}`), nil
 		}
 		if r.Method != http.MethodPost {
 			return nil, errors.New("want POST")
