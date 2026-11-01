@@ -360,6 +360,8 @@ curl http://localhost:7863/v1/messages \
 
 也可以直接调用登录辅助程序：`./login url global` 获取海外版授权链接，浏览器完成授权后执行 `./login poll global`。中国区仍可使用原来的 `./login url` / `./login poll` 用法。两种区域使用独立的临时 state 文件，交替登录不会互相覆盖。
 
+正常浏览器授权采用产品登录流程：中国区 `platform=workbuddy`，海外版 `platform=workbuddy-ai`；中国区用 `/v2/plugin/account` 读取账号。升级前已经发起的 CLI 授权会话仍可继续完成。辅助程序以 `workbuddy2api-login` 标识自身，不生成设备令牌或官方客户端观测标识。短信直登和自动加号继续使用原有链路。面板仅在明确返回“等待授权”时继续轮询，授权被拒或接口失败会显示错误；错误只包含阶段、HTTP 状态和业务码，不回显凭据或上游响应体。
+
 **注意**：`cooldown.hard_credit` / `cooldown.err_threshold` / `cooldown.err_cooldown` 三个历史键已退役。硬冷却固定为**次日 04:00**（本地时区，`CooldownUntilTomorrow4AM`），连续错误语义并入熔断器（`pool.breaker_threshold` 触发指数退避）。旧配置中的这些键因 JSON 未知字段被自然忽略，不报错。
 
 ### 上报设备与标识

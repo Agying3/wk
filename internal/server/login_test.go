@@ -3,9 +3,13 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -27,6 +31,36 @@ func TestLoginRegionSelection(t *testing.T) {
 	got, err = h.loginRegion(httptest.NewRequest("POST", "/admin/account/url", nil))
 	if err != nil || got != "global" {
 		t.Fatalf("configured global region=%q err=%v", got, err)
+	}
+}
+
+func TestLoginCommandFailureClassification(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses the Linux helper process contract")
+	}
+	for _, tc := range []struct {
+		name, payload string
+		status        int
+		message       string
+	}{
+		{"waiting", `{"stage":"token","status":200,"code":11217}`, http.StatusConflict, "登录尚未完成"},
+		{"seat_full", `{"stage":"authorization","status":403,"code":12005}`, http.StatusBadGateway, "席位已满"},
+		{"transport", `{"stage":"token"}`, http.StatusBadGateway, "获取登录令牌失败"},
+		{"unstructured", `secret-test-value`, http.StatusBadGateway, "登录请求失败"},
+		{"unknown_stage", `{"stage":"secret-test-value"}`, http.StatusBadGateway, "登录请求失败"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("sh", "-c", `printf '%s' "$LOGIN_TEST_ERROR" >&2; exit 1`)
+			cmd.Env = setCommandEnv(os.Environ(), "LOGIN_TEST_ERROR", tc.payload)
+			_, err := cmd.Output()
+			if err == nil {
+				t.Fatal("helper should fail")
+			}
+			status, message := loginCommandFailure(err)
+			if status != tc.status || !strings.Contains(message, tc.message) || strings.Contains(message, "secret-test-value") {
+				t.Fatalf("status=%d message=%q", status, message)
+			}
+		})
 	}
 }
 

@@ -80,8 +80,12 @@ export default function AccountSettings({ api, refresh, region }) {
             added = true;
             break;
           }
-        } catch {
-          // 单次失败（含 HTTP 409「尚未授权」）继续轮询，不打断。
+        } catch (error) {
+          // Only an explicit pending authorization should keep polling.
+          if (error.status !== 409) {
+            message.error(error.message || '授权请求失败，请稍后重试。');
+            return;
+          }
         }
       }
       if (!added && !loginPollAbort.current) {

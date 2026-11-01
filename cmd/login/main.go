@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,7 +25,9 @@ const (
 	upstreamBaseGlobal  = endpoints.Global
 	originRefererCN     = endpoints.LegacyBillingCN
 	originRefererGlobal = endpoints.Global
-	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	legacyClientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
+	clientUA            = "workbuddy2api-login"
+	desktopFlow         = "desktop"
 	legacyStateFile     = "/tmp/wb2api-login-state.json"
 	maxResponseBytes    = 1 << 20
 )
@@ -104,6 +107,7 @@ type apiEnvelope struct {
 type loginState struct {
 	State  string `json:"state"`
 	Region string `json:"region,omitempty"`
+	Flow   string `json:"flow,omitempty"`
 }
 
 func main() {
@@ -122,57 +126,97 @@ func main() {
 	if err != nil {
 		fatal("create cookie jar: %v", err)
 	}
-	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
+	client := &http.Client{Timeout: 30 * time.Second, Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
 	switch os.Args[1] {
 	case "url":
-		startLogin(client, cfg)
+		loginURL, err := startLogin(client, cfg)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Println(loginURL)
 	case "poll":
-		pollLogin(client, cfg)
+		result, err := pollLogin(client, cfg)
+		if err != nil {
+			fail(err)
+		}
+		out, err := json.Marshal(result)
+		if err != nil {
+			fatal("encode result failed")
+		}
+		fmt.Println(string(out))
 	default:
 		fatal("unknown subcommand %q (want url|poll)", os.Args[1])
 	}
 }
 
-func startLogin(client *http.Client, cfg loginRegion) {
-	data, _, err := doJSON(client, cfg, http.MethodPost, cfg.endpoint("/v2/plugin/auth/state?platform=CLI"), nil, bytes.NewReader([]byte("{}")))
+func (r loginRegion) platform() string {
+	if r.Name == "global" {
+		return "workbuddy-ai"
+	}
+	return "workbuddy"
+}
+
+func (r loginRegion) loginDomain() string {
+	u, err := url.Parse(r.Origin)
+	if err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return r.DefaultDomain
+}
+
+func startLogin(client *http.Client, cfg loginRegion) (string, error) {
+	data, status, err := doJSON(client, cfg, http.MethodPost, cfg.endpoint("/v2/plugin/auth/state?platform=")+cfg.platform(), func(req *http.Request) {
+		anonymousHeaders(req, cfg)
+		req.Header.Set("X-Domain", cfg.loginDomain())
+	}, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		fatal("auth state failed: %v", err)
+		return "", failureAt("authorization", status, err)
 	}
 	var state struct {
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
 	if err := json.Unmarshal(data, &state); err != nil || state.State == "" || state.AuthURL == "" {
-		fatal("auth state response is missing state or authUrl")
+		return "", &auth.LoginFailure{Stage: "authorization"}
 	}
-	raw, err := json.Marshal(loginState{State: state.State, Region: cfg.Name})
+	authorization, err := url.Parse(state.AuthURL)
+	if err != nil || authorization.Host == "" || authorization.User != nil || (authorization.Scheme != "https" && authorization.Scheme != "http") {
+		return "", &auth.LoginFailure{Stage: "authorization"}
+	}
+	raw, err := json.Marshal(loginState{State: state.State, Region: cfg.Name, Flow: desktopFlow})
 	if err != nil {
-		fatal("encode state: %v", err)
+		return "", fmt.Errorf("encode authorization state failed")
 	}
 	if dir := filepath.Dir(cfg.StateFile); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			fatal("create state directory: %v", err)
+			return "", fmt.Errorf("create authorization state directory failed")
 		}
 	}
 	if err := os.WriteFile(cfg.StateFile, raw, 0o600); err != nil {
-		fatal("write state: %v", err)
+		return "", fmt.Errorf("write authorization state failed")
 	}
 	_ = os.Chmod(cfg.StateFile, 0o600)
-	fmt.Println(state.AuthURL)
+	return authorization.String(), nil
 }
 
-func pollLogin(client *http.Client, cfg loginRegion) {
+func pollLogin(client *http.Client, cfg loginRegion) (map[string]any, error) {
 	state, statePath, err := readLoginState(cfg)
 	if err != nil {
-		fatal("%v (run login url first)", err)
+		return nil, &auth.LoginFailure{Stage: "state"}
 	}
 	escapedState := url.QueryEscape(state.State)
-	tokenRaw, status, err := doJSON(client, cfg, http.MethodGet, cfg.endpoint("/v2/plugin/auth/token?state=")+escapedState, nil, nil)
-	if err != nil {
-		if status == 0 || status >= 500 {
-			fatal("token endpoint error: %v", err)
+	requestHeaders := func(req *http.Request) {
+		if state.Flow == desktopFlow {
+			anonymousHeaders(req, cfg)
+		} else {
+			legacyHeaders(req, cfg)
 		}
-		fatal("login is not complete; finish authorization in the browser and retry")
+	}
+	tokenRaw, status, err := doJSON(client, cfg, http.MethodGet, cfg.endpoint("/v2/plugin/auth/token?state=")+escapedState, requestHeaders, nil)
+	if err != nil {
+		return nil, failureAt("token", status, err)
 	}
 	var token struct {
 		AccessToken  string `json:"accessToken"`
@@ -182,24 +226,46 @@ func pollLogin(client *http.Client, cfg loginRegion) {
 		TokenType    string `json:"tokenType"`
 	}
 	if err := json.Unmarshal(tokenRaw, &token); err != nil || token.AccessToken == "" {
-		fatal("login is not complete; finish authorization in the browser and retry")
+		return nil, &auth.LoginFailure{Stage: "token"}
 	}
 
 	headers := func(req *http.Request) {
-		commonHeaders(req, cfg)
+		if state.Flow == desktopFlow {
+			commonHeaders(req, cfg)
+			req.Header.Set("X-Domain", firstNonEmpty(token.Domain, cfg.loginDomain()))
+			if cfg.Name == "global" {
+				for _, key := range []string{"X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
+					req.Header.Set(key, "true")
+				}
+			}
+		} else {
+			legacyHeaders(req, cfg)
+		}
 		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	}
-	accountRaw, _, accountErr := doJSON(client, cfg, http.MethodGet, cfg.endpoint("/v2/plugin/login/account?state=")+escapedState, headers, nil)
+	accountPath := "/v2/plugin/login/account?state=" + escapedState
+	if state.Flow == desktopFlow && cfg.Name == "cn" {
+		accountPath = "/v2/plugin/account"
+	}
+	accountRaw, accountStatus, accountErr := doJSON(client, cfg, http.MethodGet, cfg.endpoint(accountPath), headers, nil)
 	if accountErr != nil {
-		fatal("account lookup failed: %v", accountErr)
+		return nil, failureAt("account", accountStatus, accountErr)
 	}
 	account, err := auth.ParseLoginAccount(accountRaw)
 	if err != nil {
-		fatal("account response is invalid: %v", err)
+		return nil, &auth.LoginFailure{Stage: "account"}
 	}
 	uid, enterpriseID, nickname := account.UID, account.EnterpriseID, account.Nickname
 	if uid == "" {
-		fatal("account response is missing uid")
+		return nil, &auth.LoginFailure{Stage: "account"}
+	}
+	if state.Flow == desktopFlow && cfg.Name == "global" {
+		// This snapshot is optional and must not replace the selected account.
+		snapshotClient := *client
+		if snapshotClient.Timeout == 0 || snapshotClient.Timeout > 5*time.Second {
+			snapshotClient.Timeout = 5 * time.Second
+		}
+		_, _, _ = doJSON(&snapshotClient, cfg, http.MethodGet, cfg.endpoint("/v2/plugin/accounts"), headers, nil)
 	}
 
 	domain := strings.TrimSpace(token.Domain)
@@ -218,12 +284,8 @@ func pollLogin(client *http.Client, cfg loginRegion) {
 		"account_type": account.AccountType, "oneid_account_id": account.OneIDAccountID,
 		"idp": account.IDP, "department_full_name": account.DepartmentFullName, "token_type": token.TokenType,
 	}
-	out, err := json.Marshal(result)
-	if err != nil {
-		fatal("encode result: %v", err)
-	}
-	fmt.Println(string(out))
 	_ = os.Remove(statePath)
+	return result, nil
 }
 
 func readLoginState(cfg loginRegion) (loginState, string, error) {
@@ -248,6 +310,9 @@ func readLoginState(cfg loginRegion) (loginState, string, error) {
 		if state.Region != "" && !strings.EqualFold(state.Region, cfg.Name) {
 			return loginState{}, "", fmt.Errorf("state belongs to %s login, current request is %s", state.Region, cfg.Name)
 		}
+		if state.Flow != "" && state.Flow != desktopFlow {
+			return loginState{}, "", fmt.Errorf("unsupported authorization flow; run login url again")
+		}
 		return state, path, nil
 	}
 	if lastErr == nil {
@@ -268,42 +333,81 @@ func firstNonEmpty(values ...string) string {
 func doJSON(client *http.Client, cfg loginRegion, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("create upstream request failed")
 	}
 	if headers == nil {
 		commonHeaders(req, cfg)
 	} else {
 		headers(req)
 	}
-	resp, err := client.Do(req)
+	apiClient := *client
+	apiClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := apiClient.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("upstream connection failed")
 	}
 	defer resp.Body.Close()
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if readErr != nil {
-		return nil, resp.StatusCode, readErr
+		return nil, resp.StatusCode, fmt.Errorf("read upstream response failed")
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, resp.StatusCode, fmt.Errorf("upstream status %d", resp.StatusCode)
+	if len(raw) > maxResponseBytes {
+		return nil, resp.StatusCode, fmt.Errorf("upstream response too large")
 	}
 	var envelope apiEnvelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("parse response: %w", err)
+	parseErr := json.Unmarshal(raw, &envelope)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || (parseErr == nil && envelope.Code != 0) {
+		return nil, resp.StatusCode, &auth.LoginFailure{Status: resp.StatusCode, Code: envelope.Code}
 	}
-	if envelope.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", envelope.Code, envelope.Msg)
+	if parseErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("invalid upstream response")
 	}
 	return envelope.Data, resp.StatusCode, nil
 }
 
 func commonHeaders(req *http.Request, cfg loginRegion) {
-	req.Header.Set("Content-Type", "application/json")
+	if req.Body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", clientUA)
+}
+
+func anonymousHeaders(req *http.Request, cfg loginRegion) {
+	commonHeaders(req, cfg)
+	for _, key := range []string{"X-No-Authorization", "X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
+		req.Header.Set(key, "true")
+	}
+}
+
+func legacyHeaders(req *http.Request, cfg loginRegion) {
+	commonHeaders(req, cfg)
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Origin", cfg.Origin)
 	req.Header.Set("Referer", strings.TrimRight(cfg.Origin, "/")+"/")
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("User-Agent", legacyClientUA)
+}
+
+func failureAt(stage string, status int, err error) error {
+	failure := &auth.LoginFailure{Stage: stage, Status: status}
+	var upstreamFailure *auth.LoginFailure
+	if errors.As(err, &upstreamFailure) {
+		failure.Code = upstreamFailure.Code
+	}
+	return failure
+}
+
+func fail(err error) {
+	var failure *auth.LoginFailure
+	if errors.As(err, &failure) {
+		_ = json.NewEncoder(os.Stderr).Encode(failure)
+		if failure.Pending() {
+			os.Exit(2)
+		}
+		os.Exit(1)
+	}
+	fatal("%v", err)
 }
 
 func fatal(format string, args ...any) {

@@ -2970,6 +2970,20 @@ func setCommandEnv(env []string, key, value string) []string {
 	return env
 }
 
+func loginCommandFailure(err error) (int, string) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		var failure auth.LoginFailure
+		if len(exitErr.Stderr) <= 4096 && json.Unmarshal(exitErr.Stderr, &failure) == nil && failure.Valid() {
+			if failure.Pending() {
+				return http.StatusConflict, failure.Error()
+			}
+			return http.StatusBadGateway, failure.Error()
+		}
+	}
+	return http.StatusBadGateway, "登录请求失败，请重新生成授权链接或稍后重试"
+}
+
 func (h *Handler) accountURL(w http.ResponseWriter, r *http.Request) {
 	region, err := h.loginRegion(r)
 	if err != nil {
@@ -2978,7 +2992,8 @@ func (h *Handler) accountURL(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.loginCommand(r.Context(), "url", region)
 	if err != nil {
-		writeJSON(w, 502, map[string]string{"error": fmt.Sprintf("登录初始化失败: %v", err)})
+		status, message := loginCommandFailure(err)
+		writeJSON(w, status, map[string]string{"error": message})
 		return
 	}
 	loginURL := strings.TrimSpace(string(out))
@@ -2997,7 +3012,8 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.loginCommand(r.Context(), "poll", region)
 	if err != nil {
-		writeJSON(w, 409, map[string]string{"error": "登录尚未完成，请先在浏览器完成授权"})
+		status, message := loginCommandFailure(err)
+		writeJSON(w, status, map[string]string{"error": message})
 		return
 	}
 	var result struct {
@@ -3016,7 +3032,7 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		TokenType          string `json:"token_type"`
 	}
 	if json.Unmarshal(out, &result) != nil || result.AccessToken == "" || result.UID == "" {
-		writeJSON(w, 409, map[string]string{"error": "登录尚未完成，请完成授权后重试"})
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "登录凭据响应无效，请重新授权"})
 		return
 	}
 	if result.Region != "" {
