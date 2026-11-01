@@ -5422,6 +5422,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			setRequestError(st, kind.String(), bodyText)
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: bodyText}
 			h.applyErrorPolicy(acct.UID, routeModel, kind, bodyText)
+			if kind == upstream.ErrAccountDisabled {
+				// An explicit account restriction is a stop signal for this
+				// request. Do not expose another account to the same payload.
+				fail(acct.UID)
+				writeOpenAIError(w, status, "upstream_account_restricted", bodyText)
+				setRequestError(st, "upstream_account_restricted", bodyText)
+				return
+			}
 			if kind == upstream.ErrUnauthorized {
 				h.recoverUnauthorized(acct)
 				fail(acct.UID)

@@ -116,7 +116,11 @@ func (m *captureManager) initLocked() {
 func (m *captureManager) expireLocked(now time.Time) {
 	for len(m.records) > 0 && !m.records[0].expires.After(now) {
 		m.bytes -= len(m.records[0].data)
+		m.records[0] = nil // release payloads held by the slice's backing array
 		m.records = m.records[1:]
+	}
+	if len(m.records) == 0 {
+		m.records = nil
 	}
 }
 
@@ -234,6 +238,7 @@ func (s *captureSession) finish() {
 	m.expireLocked(time.Now())
 	for len(m.records) > 0 && (len(m.records) >= captureRecordLimit || m.bytes+len(data) > captureStoreLimit) {
 		m.bytes -= len(m.records[0].data)
+		m.records[0] = nil
 		m.records = m.records[1:]
 		m.evicted++
 	}

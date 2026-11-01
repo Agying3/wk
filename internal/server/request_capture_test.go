@@ -57,12 +57,29 @@ func captureStoredData(t *testing.T, m *captureManager) []byte {
 	return append([]byte(nil), m.records[0].data...)
 }
 
-func TestErrorCapturePreservesEarlierRestrictionAfterSuccessfulRetry(t *testing.T) {
+func TestErrorCaptureExpiryReleasesBackingReferences(t *testing.T) {
+	now := time.Now()
+	backing := []*storedCapture{
+		{data: []byte("expired payload"), expires: now.Add(-time.Second)},
+		{data: []byte("current payload"), expires: now.Add(time.Minute)},
+	}
+	m := &captureManager{records: backing, bytes: len(backing[0].data) + len(backing[1].data)}
+	m.expireLocked(now)
+	if backing[0] != nil || len(m.records) != 1 || m.bytes != len("current payload") {
+		t.Fatal("expired payload remains reachable from backing array")
+	}
+	m.expireLocked(now.Add(2 * time.Minute))
+	if backing[1] != nil || m.records != nil || m.bytes != 0 {
+		t.Fatal("expired store retains payload references")
+	}
+}
+
+func TestErrorCapturePreservesEarlierErrorAfterSuccessfulRetry(t *testing.T) {
 	calls := 0
 	h := captureTestHandler(t, func(string) (int, string, bool) {
 		calls++
 		if calls == 1 {
-			return 403, `{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity"}}`, false
+			return 403, `{"code":11140,"msg":"request illegal"}`, false
 		}
 		return 200, routingSSE, true
 	}, 2)
@@ -236,6 +253,7 @@ func TestErrorCaptureStoreByteLimit(t *testing.T) {
 	m := &captureManager{}
 	t.Cleanup(m.clear)
 	m.records = []*storedCapture{{data: make([]byte, captureStoreLimit), expires: time.Now().Add(time.Hour)}}
+	backing := m.records
 	m.bytes = captureStoreLimit
 	s := m.begin(httptest.NewRequest("POST", "/v1/responses", nil))
 	s.match([]byte(`{"code":11140}`))
@@ -244,6 +262,9 @@ func TestErrorCaptureStoreByteLimit(t *testing.T) {
 	defer m.mu.Unlock()
 	if m.bytes > captureStoreLimit || len(m.records) != 1 || m.evicted != 1 {
 		t.Fatal("byte limit was not enforced")
+	}
+	if backing[0] != nil {
+		t.Fatal("evicted payload remains reachable from backing array")
 	}
 }
 
