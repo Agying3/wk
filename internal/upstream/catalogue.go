@@ -94,9 +94,7 @@ func (c *Client) FetchModelsContext(ctx context.Context, a *auth.Auth) ([]ModelI
 			cache[row.ID] = append([]string(nil), row.Efforts...)
 		}
 	}
-	c.effortsMu.Lock()
-	c.efforts = cache
-	c.effortsMu.Unlock()
+	c.storeCapabilities(account, cache)
 	return primary.rows, nil
 }
 

@@ -19,6 +19,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -301,6 +302,9 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
+	if _, handled, err := c.websiteJSON(context.Background(), a, http.MethodPost, "/v2/report", raw, true); handled {
+		return err
+	}
 	req, err := http.NewRequest(http.MethodPost, c.webBase()+"/v2/report", bytes.NewReader(raw))
 	if err != nil {
 		return err
@@ -395,12 +399,15 @@ func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEven
 
 // MarketExpert 专家市场的单个专家（/portal/operation-platform/market/expert/list 响应子集）。
 type MarketExpert struct {
-	ExpertID      string `json:"expert_id"`
-	ExpertType    string `json:"expert_type"`
-	DisplayNameZH string `json:"display_name_zh"`
-	ProfessionZH  string `json:"profession_zh"`
-	Version       string `json:"version"`
-	Categories    []any  `json:"categories"`
+	IsCloud       int             `json:"is_cloud"`
+	NeedPay       int             `json:"need_pay"`
+	PayDetail     json.RawMessage `json:"pay_detail"`
+	ExpertID      string          `json:"expert_id"`
+	ExpertType    string          `json:"expert_type"`
+	DisplayNameZH string          `json:"display_name_zh"`
+	ProfessionZH  string          `json:"profession_zh"`
+	Version       string          `json:"version"`
+	Categories    []any           `json:"categories"`
 }
 
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
@@ -461,6 +468,13 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 }
 
 func (c *Client) DesktopChatWithExpertObserved(a *auth.Auth, expertID string) (result DesktopChatResult, err error) {
+	return c.DesktopChatWithExpertInfoObserved(a, MarketExpert{ExpertID: expertID})
+}
+
+// The caller must pass the selected market entry. An ID alone does not prove
+// team membership, payment or cloud execution, so those flags stay absent.
+func (c *Client) DesktopChatWithExpertInfoObserved(a *auth.Auth, expert MarketExpert) (result DesktopChatResult, err error) {
+	expertID := expert.ExpertID
 	creds := a.Snapshot()
 	const prompt = "1+1等于几？直接回答。"
 	result = DesktopChatResult{ConversationID: NewEventID(), ModelID: "fast-model", InputLength: utf8.RuneCountInString(prompt)}
@@ -506,6 +520,12 @@ func (c *Client) DesktopChatWithExpertObserved(a *auth.Auth, expertID string) (r
 	c.privacyHeaders(req, a)
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
+		if expert.ExpertType == "team" {
+			h.Set("X-Expert-Team-Task", "true")
+		}
+		if expert.requiresProtection() {
+			h.Set("X-Moderation-Type", `["protected"]`)
+		}
 	}
 	// 账号级统一路由（reqproxy）：经钩子取该账号 client。
 	cli, err := c.proxyClientFor(a)

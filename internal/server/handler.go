@@ -2947,6 +2947,11 @@ func (h *Handler) loginCommand(ctx context.Context, arg, region string) ([]byte,
 	cmd := exec.CommandContext(ctx, bin, arg)
 	cmd.Dir = filepath.Dir(h.cfg.ConfigPath)
 	cmd.Env = setCommandEnv(os.Environ(), "WB2A_LOGIN_REGION", region)
+	if up := h.cfg.Upstream; up != nil {
+		for key, value := range map[string]string{"WB2A_ENDPOINT_PROFILE": up.EndpointProfile, "WB2A_CHAT_BASE_CN": up.ChatBaseCN, "WB2A_CHAT_BASE_GLOBAL": up.ChatBaseGlobal, "WB2A_WEB_BASE_CN": up.WebBaseCN, "WB2A_LOGIN_ORIGIN_CN": up.LoginOriginCN} {
+			cmd.Env = setCommandEnv(cmd.Env, key, value)
+		}
+	}
 	return cmd.Output()
 }
 
@@ -2996,14 +3001,19 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var result struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-		Domain       string `json:"domain"`
-		Region       string `json:"region"`
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterprise_id"`
-		Nickname     string `json:"nickname"`
+		AccessToken        string `json:"access_token"`
+		RefreshToken       string `json:"refresh_token"`
+		ExpiresIn          int64  `json:"expires_in"`
+		Domain             string `json:"domain"`
+		Region             string `json:"region"`
+		UID                string `json:"uid"`
+		EnterpriseID       string `json:"enterprise_id"`
+		Nickname           string `json:"nickname"`
+		AccountType        string `json:"account_type"`
+		OneIDAccountID     string `json:"oneid_account_id"`
+		IDP                string `json:"idp"`
+		DepartmentFullName string `json:"department_full_name"`
+		TokenType          string `json:"token_type"`
 	}
 	if json.Unmarshal(out, &result) != nil || result.AccessToken == "" || result.UID == "" {
 		writeJSON(w, 409, map[string]string{"error": "登录尚未完成，请完成授权后重试"})
@@ -3022,6 +3032,7 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 		result.Domain = "www.workbuddy.ai"
 	}
 	response, status, err := h.persistAccount(accountCredential{
+		Authority:    auth.Authority{AccountType: result.AccountType, OneIDAccountID: result.OneIDAccountID, IDP: result.IDP, DepartmentFullName: result.DepartmentFullName, TokenType: result.TokenType},
 		UID:          result.UID,
 		Nickname:     result.Nickname,
 		EnterpriseID: result.EnterpriseID,
@@ -3039,6 +3050,7 @@ func (h *Handler) accountPoll(w http.ResponseWriter, r *http.Request) {
 
 // accountCredential 是新增账号的落盘输入，OAuth 与短信直登共用。
 type accountCredential struct {
+	auth.Authority
 	UID          string
 	Nickname     string
 	EnterpriseID string
@@ -3080,7 +3092,11 @@ func (h *Handler) persistAccount(cred accountCredential, region string) (map[str
 		},
 	}
 	metadata.AddDeviceMetadata(doc)
+	(auth.Credentials{Authority: cred.Authority}).AddAuthorityMetadata(doc["auth"].(map[string]any), doc["account"].(map[string]any))
 	raw, _ := json.MarshalIndent(doc, "", "  ")
+	if _, err := auth.Parse(raw); err != nil {
+		return nil, http.StatusBadGateway, errors.New("授权返回的凭证字段无效")
+	}
 	if err := writeFileAtomic(path, append(raw, '\n'), 0600); err != nil {
 		return nil, 500, err
 	}
@@ -3110,6 +3126,7 @@ func (h *Handler) persistAccount(cred accountCredential, region string) (map[str
 			log.Printf("account add: reload auths failed: %v", loadErr)
 		}
 		h.cfg.Pool.Add(&auth.Auth{
+			Authority:   cred.Authority,
 			AccessToken: cred.AccessToken, RefreshToken: cred.RefreshToken, ExpiresAt: expiresAt,
 			Domain: cred.Domain, UID: cred.UID, EnterpriseID: cred.EnterpriseID,
 			Nickname: cred.Nickname, FilePath: path, DeviceID: metadata.DeviceID, DeviceProfile: metadata.DeviceProfile,
@@ -3290,6 +3307,7 @@ func (h *Handler) accountSMSVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response, status, err := h.persistAccount(accountCredential{
+		Authority:    creds.Authority,
 		UID:          creds.UID,
 		Nickname:     creds.Nickname,
 		EnterpriseID: creds.EnterpriseID,

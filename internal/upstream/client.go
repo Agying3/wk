@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/endpoints"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -71,6 +72,7 @@ func (k ErrKind) String() string {
 
 // Error 带分类的上游错误。
 type Error struct {
+	Code       int // provider business code, separate from HTTP status
 	Kind       ErrKind
 	Status     int
 	Msg        string
@@ -209,7 +211,7 @@ func isRiskFlag11140(body string) bool {
 
 // apiEnvelope 上游统一信封。
 type apiEnvelope struct {
-	Code int             `json:"code"`
+	Code responseCode    `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
 }
@@ -218,7 +220,12 @@ type apiEnvelope struct {
 type Client struct {
 	HTTP *http.Client
 	ClientSettings
-	refreshes singleflight.Group
+	EndpointProfile string
+	LoginOriginCN   string
+	refreshes       singleflight.Group
+	webMu           sync.Mutex
+	webSessions     map[string]websiteSession
+	webLogins       singleflight.Group
 	// Network options are fixed before serving; changing them requires restart.
 	TLSFingerprint          bool
 	SharedConversationTrace bool
@@ -236,9 +243,10 @@ type Client struct {
 	// RequestPolicy/ChatStreamContextWithHeaders 里读快照。
 	Stream StreamPolicy
 
-	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
+	// Model capabilities belong to an account/region/enterprise, not the
+	// most recently collected account. Unknown capabilities pass through.
 	effortsMu sync.RWMutex
-	efforts   map[string][]string
+	efforts   map[capabilityScope]capabilityEntry
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	// 运行时经 SetSanitizeFingerprints 修改（WebUI 特性开关）；并发请求路径
@@ -285,10 +293,10 @@ func New() *Client {
 		// 生产默认：流式不限总时长（长回答不被掐断），但守 120s 空闲。
 		// 显式给出，避免零值悄悄退化成"既不限总时长也不查空闲"。
 		Stream:          StreamPolicy{Total: 0, Idle: 120 * time.Second},
-		ChatBaseCN:      "https://copilot.tencent.com",
-		BillingBaseCN:   "https://www.codebuddy.cn",
-		ChatBaseGlobal:  "https://www.workbuddy.ai",
-		BillingBaseGlob: "https://www.workbuddy.ai",
+		ChatBaseCN:      endpoints.LegacyChatCN,
+		BillingBaseCN:   endpoints.LegacyBillingCN,
+		ChatBaseGlobal:  endpoints.Global,
+		BillingBaseGlob: endpoints.Global,
 	}
 }
 
@@ -303,8 +311,8 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // 返回错误表示请求体无法解码——此时必须拒绝请求而不是原样转发，
 // 否则内容脱敏会被一个畸形 body 绕过（见 ErrUnprocessableBody）。
 func (c *Client) prepareBody(body []byte) ([]byte, error) {
-	if c.RewriteSystem == nil && !c.LegacyPromptRulesManaged || len(body) == 0 {
-		return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), c.effortsSnapshot())
+	if (c.RewriteSystem == nil && !c.LegacyPromptRulesManaged && !c.ReasoningSummaryAuto) || len(body) == 0 {
+		return PrepareBodyOptWithEfforts(body, c.sanitizeEnabled(), nil)
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
@@ -328,11 +336,14 @@ func (c *Client) PrepareChatBodyWithRewrite(obj map[string]any, rewrite func(map
 			return nil, fmt.Errorf("%w: %v", ErrUnprocessableBody, err)
 		}
 	}
-	return prepareBodyFromMap(obj, c.sanitizeEnabled(), c.effortsSnapshot(), c.LegacyPromptRulesManaged)
+	if c.ReasoningSummaryAuto {
+		addReasoningSummary(obj)
+	}
+	return prepareBodyFromMap(obj, c.sanitizeEnabled(), nil, c.LegacyPromptRulesManaged)
 }
 
-// PrepareChatBody normalizes the document once, before cache routing, and
-// returns the exact bytes reused for every account attempt.
+// PrepareChatBody normalizes the document once, before cache routing. The
+// canonical bytes stay immutable; effort compatibility is account-scoped.
 func (c *Client) PrepareChatBody(obj map[string]any) ([]byte, error) {
 	return c.prepareBodyFromObj(obj)
 }
@@ -381,20 +392,6 @@ func (c *Client) streamPolicySnapshot() StreamPolicy {
 	return c.Stream
 }
 
-// effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
-func (c *Client) effortsSnapshot() map[string][]string {
-	c.effortsMu.RLock()
-	defer c.effortsMu.RUnlock()
-	if len(c.efforts) == 0 {
-		return nil
-	}
-	cp := make(map[string][]string, len(c.efforts))
-	for k, v := range c.efforts {
-		cp[k] = v
-	}
-	return cp
-}
-
 func (c *Client) billingBase(a *auth.Auth) string {
 	if a != nil && a.Region() == "global" {
 		return c.BillingBaseGlob
@@ -405,10 +402,33 @@ func (c *Client) billingBase(a *auth.Auth) string {
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // 账号级统一路由（reqproxy）：a 非 nil 且 DialProxy 已配置时经该账号槽位出站。
 func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	if c.websiteEnabled() && websiteBusinessPath(req.URL.Path) {
+		var body []byte
+		var err error
+		if req.Body != nil {
+			body, err = readControlBody(req.Body)
+			req.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		requestURI := req.URL.EscapedPath()
+		if req.URL.RawQuery != "" {
+			requestURI += "?" + req.URL.RawQuery
+		}
+		if data, handled, err := c.websiteJSON(req.Context(), a, req.Method, requestURI, body, false); handled {
+			return data, err
+		}
+	}
 	cli, err := c.proxyClientFor(a)
 	if err != nil {
 		return nil, err // D4：无可用节点，不回退直连
 	}
+	return doJSONWithClient(cli, req)
+}
+
+func doJSONWithClient(cli *http.Client, req *http.Request) (json.RawMessage, error) {
 	resp, err := doUpstream(cli, req)
 	if err != nil {
 		return nil, err
@@ -420,18 +440,19 @@ func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error
 	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
+		return nil, &Error{Kind: kind, Code: BusinessCode(raw), Status: resp.StatusCode, Msg: truncate(string(raw), 200), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
+		return nil, fmt.Errorf("parse failed: %w", err)
 	}
 	if env.Code != 0 {
-		kind := Classify(resp.StatusCode, env.Msg)
+		classification, _ := json.Marshal(map[string]any{"code": env.Code, "msg": env.Msg})
+		kind := Classify(resp.StatusCode, string(classification))
 		if kind == ErrNone {
 			kind = ErrClient
 		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160)), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
+		return nil, &Error{Kind: kind, Code: BusinessCode(raw), Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160)), RetryAfter: retryAfter(resp.Header.Get("Retry-After"))}
 	}
 	return env.Data, nil
 }
@@ -545,6 +566,10 @@ func (c *Client) ChatStreamWithPolicyObj(ctx context.Context, a *auth.Auth, obj 
 
 // chatStreamPrepared 发送已改写完毕的出站请求体并处理响应。
 func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody []byte, policy StreamPolicy) (rc io.ReadCloser, status int, respBody []byte, headers http.Header, err error) {
+	outBody, err = c.accountEffortBody(a, outBody)
+	if err != nil {
+		return nil, 0, nil, nil, err
+	}
 	url := c.chatBase(a) + "/v2/chat/completions"
 	// Total（可为 0=不限）覆盖全程：等响应头 + 读响应体。
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -778,9 +803,7 @@ func (c *Client) fetchLegacyModels(ctx context.Context, a *auth.Auth) ([]ModelIn
 			cache[mi.ID] = mi.Efforts
 		}
 	}
-	c.effortsMu.Lock()
-	c.efforts = cache
-	c.effortsMu.Unlock()
+	c.storeCapabilities(a, cache)
 	return out, nil
 }
 

@@ -41,6 +41,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/auth"
 )
 
 const (
@@ -117,6 +119,7 @@ type CaptchaPrompt struct {
 
 // Credentials 是一次成功短信登录换到的账号凭证，形状与 OAuth 登录一致。
 type Credentials struct {
+	auth.Authority
 	UID          string
 	Nickname     string
 	EnterpriseID string
@@ -539,6 +542,7 @@ func (s *session) finishAfterBroker(ctx context.Context, m *Manager) (Credential
 		domain = consoleDomain
 	}
 	return Credentials{
+		Authority:    auth.Authority{AccountType: account.AccountType, OneIDAccountID: account.OneIDAccountID, IDP: account.IDP, DepartmentFullName: account.DepartmentFullName, TokenType: ticket.TokenType},
 		UID:          account.UID,
 		Nickname:     account.Nickname,
 		EnterpriseID: account.EnterpriseID,
@@ -1141,6 +1145,7 @@ func isTicketWrittenLocation(loc string) bool {
 }
 
 type ticket struct {
+	TokenType    string `json:"tokenType"`
 	AccessToken  string `json:"accessToken"`
 	RefreshToken string `json:"refreshToken"`
 	ExpiresIn    int64  `json:"expiresIn"`
@@ -1339,29 +1344,17 @@ func (s *session) lookupAccount(ctx context.Context, ep Endpoints, accessToken s
 	req.Header.Set("User-Agent", cliUA)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	var account struct {
-		UID          string `json:"uid"`
-		UserID       string `json:"userId"`
-		ID           string `json:"id"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-		Name         string `json:"name"`
-		Account      struct {
-			UID          string `json:"uid"`
-			UserID       string `json:"userId"`
-			ID           string `json:"id"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
-			Name         string `json:"name"`
-		} `json:"account"`
-	}
-	if err := s.doEnvelope(s.cliHTTP, req, &account); err != nil {
+	var raw json.RawMessage
+	if err := s.doEnvelope(s.cliHTTP, req, &raw); err != nil {
 		return Credentials{}, stepErr("读取账号", "无法获取账号信息", err)
 	}
+	account, err := auth.ParseLoginAccount(raw)
+	if err != nil {
+		return Credentials{}, stepErr("读取账号", "无法解析账号信息", err)
+	}
 	return Credentials{
-		UID:          firstNonEmpty(account.UID, account.UserID, account.ID, account.Account.UID, account.Account.UserID, account.Account.ID),
-		EnterpriseID: firstNonEmpty(account.EnterpriseID, account.Account.EnterpriseID),
-		Nickname:     firstNonEmpty(account.Nickname, account.Name, account.Account.Nickname, account.Account.Name),
+		Authority: account.Authority,
+		UID:       account.UID, EnterpriseID: account.EnterpriseID, Nickname: account.Nickname,
 	}, nil
 }
 

@@ -18,15 +18,20 @@ type ClientSettings struct {
 	CLIVersion           string `json:"cli_version"`
 	ModelOptimization    bool   `json:"model_optimization"`
 	RefreshIdentityCheck string `json:"refresh_identity_check"`
+	WebAuthMode          string `json:"web_auth_mode"`
+	ReasoningSummaryAuto bool   `json:"reasoning_summary_auto"`
 }
 
 func DefaultClientSettings() ClientSettings {
-	return ClientSettings{HeaderProfile: "desktop", ClientVersionCN: "5.9.3", ClientVersionGlobal: "5.9.4", CLIVersion: "2.165.0", RefreshIdentityCheck: "best_effort"}
+	return ClientSettings{HeaderProfile: "desktop", ClientVersionCN: "5.9.3", ClientVersionGlobal: "5.9.4", CLIVersion: "2.165.0", RefreshIdentityCheck: "best_effort", WebAuthMode: "auto", ReasoningSummaryAuto: true}
 }
 
 var clientVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$`)
 
 func (s ClientSettings) Validate() error {
+	if s.WebAuthMode != "" && s.WebAuthMode != "auto" && s.WebAuthMode != "cookie" && s.WebAuthMode != "bearer" {
+		return fmt.Errorf("upstream.web_auth_mode must be auto, cookie or bearer")
+	}
 	if s.HeaderProfile != "" && s.HeaderProfile != "desktop" && s.HeaderProfile != "legacy" {
 		return fmt.Errorf("upstream.header_profile must be desktop or legacy")
 	}

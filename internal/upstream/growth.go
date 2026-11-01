@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/endpoints"
 )
 
 // growth 域路径（实测）。
@@ -328,7 +329,7 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 }
 
 // WebBaseCN Web 域（任务领奖类接口）默认值。字段化便于测试注入。
-const webBaseCN = "https://www.workbuddy.cn"
+const webBaseCN = endpoints.ProductCN
 
 // webBase 返回 Web 域（领奖/页面事件上报）。global 账号无 CN 任务体系，
 // 领奖本就不会对 global 账号发起；这里恒返回 CN 域（WebBaseCN 零值回落默认）。

@@ -1485,6 +1485,7 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 		if verr == nil {
 			// 6) 落盘。
 			acc := accountCredential{
+				Authority:    creds.Authority,
 				UID:          creds.UID,
 				Nickname:     creds.Nickname,
 				EnterpriseID: creds.EnterpriseID,

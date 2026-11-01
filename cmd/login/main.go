@@ -16,13 +16,14 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/endpoints"
 )
 
 const (
-	upstreamBaseCN      = "https://copilot.tencent.com"
-	upstreamBaseGlobal  = "https://www.workbuddy.ai"
-	originRefererCN     = "https://www.codebuddy.cn"
-	originRefererGlobal = "https://www.workbuddy.ai"
+	upstreamBaseCN      = endpoints.LegacyChatCN
+	upstreamBaseGlobal  = endpoints.Global
+	originRefererCN     = endpoints.LegacyBillingCN
+	originRefererGlobal = endpoints.Global
 	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
 	legacyStateFile     = "/tmp/wb2api-login-state.json"
 	maxResponseBytes    = 1 << 20
@@ -45,6 +46,17 @@ func (r loginRegion) endpoint(path string) string {
 // server passes WB2A_LOGIN_REGION; the standalone command also accepts an
 // optional third argument: login <url|poll> [cn|global].
 func resolveLoginRegion(raw string) (loginRegion, error) {
+	settings, err := (endpoints.Settings{EndpointProfile: os.Getenv("WB2A_ENDPOINT_PROFILE"), ChatBaseCN: os.Getenv("WB2A_CHAT_BASE_CN"), ChatBaseGlobal: os.Getenv("WB2A_CHAT_BASE_GLOBAL"), WebBaseCN: os.Getenv("WB2A_WEB_BASE_CN")}).Resolve()
+	if err != nil {
+		return loginRegion{}, err
+	}
+	cnOrigin := originRefererCN
+	if settings.EndpointProfile == "product" || os.Getenv("WB2A_WEB_BASE_CN") != "" {
+		cnOrigin = settings.WebBaseCN
+	}
+	if override := os.Getenv("WB2A_LOGIN_ORIGIN_CN"); override != "" {
+		cnOrigin = override
+	}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		raw = strings.TrimSpace(os.Getenv("WB2A_LOGIN_REGION"))
@@ -59,9 +71,9 @@ func resolveLoginRegion(raw string) (loginRegion, error) {
 	}
 	switch strings.ToLower(raw) {
 	case "", "cn", "china":
-		return newLoginRegion("cn", upstreamBaseCN, originRefererCN, ""), nil
+		return newLoginRegion("cn", settings.ChatBaseCN, cnOrigin, ""), nil
 	case "global", "overseas", "international", "intl":
-		return newLoginRegion("global", upstreamBaseGlobal, originRefererGlobal, "www.workbuddy.ai"), nil
+		return newLoginRegion("global", settings.ChatBaseGlobal, originRefererGlobal, "www.workbuddy.ai"), nil
 	case "all", "mixed":
 		return loginRegion{}, fmt.Errorf("login region must be cn or global, not %q", raw)
 	default:
@@ -167,27 +179,12 @@ func pollLogin(client *http.Client, cfg loginRegion) {
 		RefreshToken string `json:"refreshToken"`
 		ExpiresIn    int64  `json:"expiresIn"`
 		Domain       string `json:"domain"`
+		TokenType    string `json:"tokenType"`
 	}
 	if err := json.Unmarshal(tokenRaw, &token); err != nil || token.AccessToken == "" {
 		fatal("login is not complete; finish authorization in the browser and retry")
 	}
 
-	var account struct {
-		UID          string `json:"uid"`
-		UserID       string `json:"userId"`
-		ID           string `json:"id"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-		Name         string `json:"name"`
-		Account      struct {
-			UID          string `json:"uid"`
-			UserID       string `json:"userId"`
-			ID           string `json:"id"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
-			Name         string `json:"name"`
-		} `json:"account"`
-	}
 	headers := func(req *http.Request) {
 		commonHeaders(req, cfg)
 		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
@@ -196,12 +193,11 @@ func pollLogin(client *http.Client, cfg loginRegion) {
 	if accountErr != nil {
 		fatal("account lookup failed: %v", accountErr)
 	}
-	if err := json.Unmarshal(accountRaw, &account); err != nil {
+	account, err := auth.ParseLoginAccount(accountRaw)
+	if err != nil {
 		fatal("account response is invalid: %v", err)
 	}
-	uid := firstNonEmpty(account.UID, account.UserID, account.ID, account.Account.UID, account.Account.UserID, account.Account.ID)
-	enterpriseID := firstNonEmpty(account.EnterpriseID, account.Account.EnterpriseID)
-	nickname := firstNonEmpty(account.Nickname, account.Name, account.Account.Nickname, account.Account.Name)
+	uid, enterpriseID, nickname := account.UID, account.EnterpriseID, account.Nickname
 	if uid == "" {
 		fatal("account response is missing uid")
 	}
@@ -219,6 +215,8 @@ func pollLogin(client *http.Client, cfg loginRegion) {
 		"access_token": token.AccessToken, "refresh_token": token.RefreshToken,
 		"expires_in": token.ExpiresIn, "domain": domain, "region": cfg.Name,
 		"uid": uid, "enterprise_id": enterpriseID, "nickname": nickname,
+		"account_type": account.AccountType, "oneid_account_id": account.OneIDAccountID,
+		"idp": account.IDP, "department_full_name": account.DepartmentFullName, "token_type": token.TokenType,
 	}
 	out, err := json.Marshal(result)
 	if err != nil {

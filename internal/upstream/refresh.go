@@ -177,7 +177,7 @@ func (c *Client) verifyRefreshedIdentity(ctx context.Context, before, next auth.
 	if err != nil {
 		var upstreamErr *Error
 		if errors.As(err, &upstreamErr) && (upstreamErr.Status == 401 || upstreamErr.Status == 403) {
-			return next, &Error{Kind: upstreamErr.Kind, Status: upstreamErr.Status, Msg: "refreshed token identity rejected"}
+			return next, &Error{Kind: upstreamErr.Kind, Code: upstreamErr.Code, Status: upstreamErr.Status, Msg: "refreshed token identity rejected"}
 		}
 		return c.identityUnavailable(ctx, next, "endpoint unavailable")
 	}

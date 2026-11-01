@@ -317,7 +317,7 @@ func (h *Handler) expertChain(a *auth.Auth, e upstream.MarketExpert) error {
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
 		return fmt.Errorf("召唤链: %w", err)
 	}
-	observed, err := h.cfg.Upstream.DesktopChatWithExpertObserved(a, e.ExpertID)
+	observed, err := h.cfg.Upstream.DesktopChatWithExpertInfoObserved(a, e)
 	if err != nil {
 		return fmt.Errorf("真实对话: %w", err)
 	}
@@ -399,7 +399,7 @@ func runExpertLighthouse(h *Handler, a *auth.Auth) (string, error) {
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(lh)...); err != nil {
 		return "", fmt.Errorf("召唤链: %w", err)
 	}
-	observed, err := h.cfg.Upstream.DesktopChatWithExpertObserved(a, lhID)
+	observed, err := h.cfg.Upstream.DesktopChatWithExpertInfoObserved(a, lh)
 	if err != nil {
 		return "", fmt.Errorf("真实对话: %w", err)
 	}

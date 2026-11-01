@@ -81,6 +81,7 @@ type Config struct {
 
 	Upstream struct {
 		upstream.ClientSettings
+		upstream.EndpointSettings
 		// Restart required. Both options retain an explicit legacy opt-out.
 		TLSFingerprint          bool `json:"tls_fingerprint"`
 		SharedConversationTrace bool `json:"shared_conversation_trace"`
@@ -571,6 +572,9 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	if err := c.Upstream.ClientSettings.Validate(); err != nil {
+		return err
+	}
+	if _, err := c.Upstream.EndpointSettings.Resolve(); err != nil {
 		return err
 	}
 	var err error
