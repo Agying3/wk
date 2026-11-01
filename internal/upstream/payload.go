@@ -69,6 +69,7 @@ func prepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]
 		return nil, fmt.Errorf("%w: body is not a JSON object", ErrUnprocessableBody)
 	}
 	obj["stream"] = true
+	translateMaxCompletionTokens(obj)
 	if model, ok := obj["model"].(string); ok {
 		obj["model"] = NormalizeModelID(model)
 	}
