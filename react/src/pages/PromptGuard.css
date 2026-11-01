@@ -1,4 +1,6 @@
 .pg-page { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; min-width: 0; width: 100%; }
+.pg-variants { display: grid; gap: 12px; margin-bottom: 24px; min-width: 0; }
+.pg-variant-summary { display: grid; gap: 10px; max-width: 380px; }
 .pg-page > *, .pg-stats > *, .pg-page .ant-tabs-tabpane { min-width: 0; }
 .pg-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
 .pg-setting-state { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }

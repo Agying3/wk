@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -20,13 +20,17 @@ import (
 )
 
 type Rule struct {
-	ID                 string `json:"id"`
-	Name               string `json:"name"`
-	Match              string `json:"match"`
-	Replacement        string `json:"replacement"`
-	Enabled            bool   `json:"enabled"`
-	RequireEndBoundary bool   `json:"require_end_boundary,omitempty"`
-	Source             string `json:"source,omitempty"`
+	ID                 string     `json:"id"`
+	Name               string     `json:"name"`
+	Match              string     `json:"match"`
+	Replacement        string     `json:"replacement"`
+	Enabled            bool       `json:"enabled"`
+	RequireEndBoundary bool       `json:"require_end_boundary,omitempty"`
+	Source             string     `json:"source,omitempty"`
+	Variants           []Variant  `json:"variants,omitempty"`
+	WeightRefreshHours int        `json:"weight_refresh_hours,omitempty"`
+	EffectiveWeights   []float64  `json:"effective_weights,omitempty"`
+	NextWeightRefresh  *time.Time `json:"next_weight_refresh,omitempty"`
 }
 type Settings struct {
 	AutoLocate    bool `json:"auto_locate"`
@@ -91,8 +95,10 @@ type Case struct {
 	Job                *Job          `json:"job,omitempty"`
 }
 type diskState struct {
-	Config Config           `json:"config"`
-	Cases  map[string]*Case `json:"cases"`
+	Config         Config                   `json:"config"`
+	Cases          map[string]*Case         `json:"cases"`
+	SelectionSeed  []byte                   `json:"selection_seed,omitempty"`
+	PromptSessions map[string]promptSession `json:"prompt_sessions,omitempty"`
 }
 type Summary struct {
 	Pending      int    `json:"pending"`
@@ -148,6 +154,15 @@ func Open(path, secret string) (*Manager, error) {
 				return nil, errors.New("invalid prompt guard store")
 			}
 		}
+	}
+	if len(m.state.SelectionSeed) == 0 {
+		m.state.SelectionSeed = make([]byte, 32)
+		if _, err := rand.Read(m.state.SelectionSeed); err != nil {
+			return nil, err
+		}
+	}
+	if m.state.PromptSessions == nil {
+		m.state.PromptSessions = map[string]promptSession{}
 	}
 	for _, c := range m.state.Cases {
 		if c.Job != nil && (c.Job.Status == "running" || c.Job.Status == "queued") {
@@ -209,12 +224,26 @@ func copyJSON[T any](v T) T {
 	_ = json.Unmarshal(b, &out)
 	return out
 }
-func (m *Manager) Config() Config { m.mu.Lock(); defer m.mu.Unlock(); return copyJSON(m.state.Config) }
-func (m *Manager) Apply(doc map[string]any) error {
+func (m *Manager) Config() Config {
 	m.mu.Lock()
-	rules := append([]Rule{}, m.state.Config.Rules...)
-	m.mu.Unlock()
-	return ApplyToDocument(doc, rules)
+	defer m.mu.Unlock()
+	c := copyJSON(m.state.Config)
+	now := time.Now()
+	for i := range c.Rules {
+		r := &c.Rules[i]
+		if len(r.Variants) > 0 {
+			r.EffectiveWeights = variantWeights(*r, m.state.SelectionSeed, now)
+			if r.WeightRefreshHours > 0 {
+				period := int64(r.WeightRefreshHours) * 3600
+				next := time.Unix((now.Unix()/period+1)*period, 0).UTC()
+				r.NextWeightRefresh = &next
+			}
+		}
+	}
+	return c
+}
+func (m *Manager) Apply(doc map[string]any) error {
+	return m.ApplySession(doc, "")
 }
 
 // Invalidate also covers changes to the legacy compatibility pipeline.
@@ -252,6 +281,11 @@ func (m *Manager) Update(c Config) error {
 			return errors.New("规则 ID 重复")
 		}
 		ids[r.ID] = true
+		if err := validateVariants(r); err != nil {
+			return err
+		}
+		r.EffectiveWeights = nil
+		r.NextWeightRefresh = nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -261,9 +295,18 @@ func (m *Manager) Update(c Config) error {
 	old := copyJSON(m.state)
 	// This is a durable migration marker, not an administrator-editable setting.
 	c.LegacyMigrationVersion = m.state.Config.LegacyMigrationVersion
-	rulesChanged := !slices.Equal(c.Rules, m.state.Config.Rules)
+	rulesChanged := !reflect.DeepEqual(c.Rules, m.state.Config.Rules)
 	c.Revision++
 	m.state.Config = copyJSON(c)
+	// Rule churn must not grow each session's choice map without a bound.
+	for key, session := range m.state.PromptSessions {
+		for ruleID := range session.Choices {
+			if !ids[ruleID] {
+				delete(session.Choices, ruleID)
+			}
+		}
+		m.state.PromptSessions[key] = session
+	}
 	// Retention and diagnostic budgets do not change outbound prompt content.
 	if rulesChanged {
 		for _, item := range m.state.Cases {

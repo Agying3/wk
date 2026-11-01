@@ -89,12 +89,18 @@ export default function PromptGuardPage({ api }) {
     catch (e) { setError(e.message); message.error(e.message); return null; }
     finally { setBusy(false); }
   };
-  const edit = rule => { setEditor(rule || {}); ruleForm.setFieldsValue({ name: '', match: '', replacement: '', enabled: true, require_end_boundary: false, ...rule }); };
+  const edit = rule => {
+    setEditor(rule || {});
+    ruleForm.resetFields();
+    ruleForm.setFieldsValue({ name: '', match: '', enabled: true, require_end_boundary: false, weight_refresh_hours: 0, ...rule,
+      variants: rule?.variants?.length ? rule.variants : [{ replacement: rule?.replacement || '', weight: 1 }] });
+  };
   const saveRule = async () => {
     const values = await ruleForm.validateFields().catch(() => null); if (!values) return;
     const rules = [...(config.rules || [])];
     const i = rules.findIndex(r => r.id === editor.id);
-    const rule = { ...editor, ...values };
+    if (!values.variants?.some(v => v.weight > 0)) { message.error('至少一个候选的权重须大于 0'); return; }
+    const rule = { ...editor, ...values, replacement: '' };
     if (i < 0) rules.push(rule); else rules[i] = rule;
     if (await saveConfig({ rules })) setEditor(null);
   };
@@ -117,7 +123,7 @@ export default function PromptGuardPage({ api }) {
   const rulesColumns = [
     { title: '顺序', width: 100, render: (_, r, i) => <Space><Text>{i + 1}</Text><Button aria-label="上移规则" size="small" disabled={busy || i === 0} icon={<ArrowUpOutlined />} onClick={() => move(i, -1)} /><Button aria-label="下移规则" size="small" disabled={busy || i === config.rules.length - 1} icon={<ArrowDownOutlined />} onClick={() => move(i, 1)} /></Space> },
     { title: '规则', dataIndex: 'name', render: (v, r) => <div><Text strong>{v || '未命名规则'}</Text>{['legacy_codex', 'legacy_dsh'].includes(r.source) && <Tag color="blue" style={{ marginLeft: 6 }}>{r.source === 'legacy_codex' ? 'Codex 迁移' : 'DSH 迁移'}</Tag>}{r.require_end_boundary && <Tag>末尾边界</Tag>}<div className="pg-snippet">{r.match}</div></div> },
-    { title: '替换为', dataIndex: 'replacement', render: v => <div className="pg-snippet">{v || <Text type="secondary">删除匹配内容</Text>}</div> },
+    { title: '替换为 / 新会话占比', dataIndex: 'replacement', render: (v, r) => r.variants?.length ? <div className="pg-variant-summary">{r.variants.map((item, i) => <div key={item.id}><Text type="secondary">候选 {i + 1} · 基础权重 {item.weight} · 当前 {((r.effective_weights?.[i] || 0) * 100).toFixed(1)}%</Text><div className="pg-snippet">{item.replacement || <Text type="secondary">删除匹配内容</Text>}</div></div>)}<Text type="secondary">{r.weight_refresh_hours ? `每 ${r.weight_refresh_hours} 小时刷新 · 下次 ${time(r.next_weight_refresh)}` : '固定权重'} · 同会话保持选择</Text></div> : <div className="pg-snippet">{v || <Text type="secondary">删除匹配内容</Text>}</div> },
     { title: '启用', dataIndex: 'enabled', width: 80, render: (v, r) => <Switch aria-label={`启用 ${r.name || '规则'}`} checked={v} disabled={busy} onChange={enabled => saveConfig({ rules: config.rules.map(rule => rule.id === r.id ? { ...rule, enabled } : rule) })} /> },
     { title: '操作', width: 140, render: (_, r) => <Space><Button size="small" icon={<EditOutlined />} disabled={busy} onClick={() => edit(r)}>编辑</Button><Button size="small" danger disabled={busy} onClick={() => modal.confirm({ title: '删除替换规则？', okText: '删除', cancelText: '取消', onOk: () => saveConfig({ rules: config.rules.filter(rule => rule.id !== r.id) }) })}>删除</Button></Space> },
   ];
@@ -142,7 +148,7 @@ export default function PromptGuardPage({ api }) {
         </> },
         { key: 'rules', label: '替换规则', children: <>
           {!!config?.legacy_migration_version && <Alert type="success" showIcon message="旧 Codex / DSH 配置已自动迁移" description="规则保留了旧开关的启停状态，可在此修改、关闭或删除。重启不会重新导入，也不会再执行旧兼容替换。" style={{ marginBottom: 12 }} />}
-          <Alert type="info" showIcon message="按顺序对每个 system / developer 文本块执行精确、区分大小写的全量替换；后面的规则可以匹配前面的替换结果。" description="支持任意多行内容与空替换，可设置匹配末尾边界，不支持正则。用户消息、工具内容和图片保持原样。" />
+          <Alert type="info" showIcon message="每条规则可设置多个候选，按权重为新会话选择，同一会话保持相同提示词。" description="支持定时均衡随机刷新权重，只影响新会话。同一请求内的全部匹配共用一个候选；规则仍按顺序执行，只改写 system / developer 文本。请转发稳定的 conversation_id、prompt_cache_key 或会话请求头；缺少时尝试首条用户消息识别，相同开场可能合并，裁剪历史可能视为新会话。会话选择加密保留，闲置 30 天后过期。" />
           <div className="pg-toolbar"><Text type="secondary">保存后立即生效。修改规则后，旧验证结果需要重新验证。</Text><Button type="primary" icon={<PlusOutlined />} disabled={!config} onClick={() => edit()}>新增规则</Button></div>
           <Table rowKey="id" columns={rulesColumns} dataSource={config?.rules || []} pagination={false} scroll={{ x: 850 }} locale={{ emptyText: '添加任意需要替换的系统提示词内容' }} />
         </> },
@@ -160,7 +166,7 @@ export default function PromptGuardPage({ api }) {
       {!detail ? <Empty description="正在加载记录" /> : <Space direction="vertical" size={18} style={{ width: '100%' }}>
         <Descriptions size="small" column={2} items={[{ key: 'model', label: '模型', children: detail.model }, { key: 'status', label: '状态', children: detail.resolved ? '完整提示词已验证通过' : '待处理' }, { key: 'count', label: '拦截次数', children: detail.occurrences }, { key: 'seen', label: '最近拦截', children: time(detail.last_seen) },{key:'scope',label:'原请求范围',children:accountScopeLabel(detail.account_scope)}]} />
         <Space wrap><Button type="primary" disabled={detailActive || active > 0} onClick={() => launch('locate')}>{detail.job ? '重新二分定位' : '开始二分定位'}</Button><Button disabled={detailActive || active > 0} onClick={() => launch('verify')}>验证当前替换</Button><Button onClick={async () => { try { const v = await api(`${root}cases/${detailId}/preview`, { method: 'POST' }); setPreview(v.messages); } catch (e) { message.error(e.message); } }}>本地替换预览</Button>{detailActive && <Button danger onClick={cancel}>取消诊断</Button>}</Space>
-        <Alert type="info" showIcon message="验证包含完整系统提示词，但不包含历史用户对话和工具调用；通过只代表本次模型与账号下的这次检测。" />
+        <Alert type="info" showIcon message="验证包含完整系统提示词，但不包含历史用户对话和工具调用；通过只代表本次模型、账号和所选候选组合，其他候选仍需分别检查。" />
         {detail.job && <DiagnosticJob item={detail} />}
         {candidate && <Card size="small" className="pg-history" title={candidate.title} extra={<Button onClick={() => edit({ match: detail.candidate.includes('[…]') ? '' : detail.candidate })}>设为替换规则</Button>}><Alert type={candidate.historical ? 'warning' : 'info'} showIcon message={candidate.description} /><div className="pg-job-time"><Text type="secondary">定位时间：{time(detail.candidate_located_at)}</Text><Text type="secondary">配置版本：{detail.candidate_revision || '旧记录未保存'}</Text></div><pre className="pg-candidate">{detail.candidate}</pre><Text type="secondary">若包含 […]，表示不相邻句子的组合，请分别选取原文设置规则。可能还有其他触发片段，需验证完整提示词。</Text></Card>}
         {preview && <PromptText title="按当前规则及兼容处理后的预览（未发送上游）" messages={preview} />}
@@ -171,7 +177,22 @@ export default function PromptGuardPage({ api }) {
       </Space>}
     </Drawer>
     <Modal title={editor?.id ? '编辑替换规则' : '新增替换规则'} open={editor !== null} onCancel={() => setEditor(null)} onOk={saveRule} confirmLoading={busy} width={760} okText="保存规则" cancelText="取消" destroyOnHidden>
-      <Form form={ruleForm} layout="vertical"><Form.Item name="name" label="规则名称"><Input maxLength={200} placeholder="例如：路径说明同义改写" /></Form.Item><Form.Item name="match" label="匹配原文（精确匹配）" rules={[{ required: true, message: '请输入要替换的原文' }]}><Input.TextArea rows={6} spellCheck={false} /></Form.Item><Form.Item name="replacement" label="替换内容" extra="留空会删除匹配内容。请自行确认改写前后的语义。"><Input.TextArea rows={6} spellCheck={false} /></Form.Item><Form.Item name="require_end_boundary" label="检查匹配末尾边界" valuePropName="checked" extra="匹配内容之后须为英文句点、空格、制表符、换行或文本结尾；迁移的 DSH 身份规则默认开启，避免误改更长的名称。"><Switch /></Form.Item><Form.Item name="enabled" label="启用规则" valuePropName="checked"><Switch /></Form.Item><Alert type="info" showIcon message="保存规则不会自动验证。保存后可在拦截详情点击“验证当前替换”，确认后发送请求。" /></Form>
+      <Form form={ruleForm} layout="vertical">
+        <Form.Item name="name" label="规则名称"><Input maxLength={200} placeholder="例如：路径说明同义改写" /></Form.Item>
+        <Form.Item name="match" label="匹配原文（精确匹配）" rules={[{ required: true, message: '请输入要替换的原文' }]}><Input.TextArea rows={6} spellCheck={false} /></Form.Item>
+        <Form.List name="variants">{(fields, { add, remove }) => <div className="pg-variants">
+          {fields.map((field, i) => <Card size="small" key={field.key} title={`替换候选 ${i + 1}`} extra={<Button danger size="small" disabled={fields.length <= 1} onClick={() => remove(field.name)}>移除候选</Button>}>
+            <Form.Item name={[field.name, 'id']} hidden><Input /></Form.Item>
+            <Form.Item name={[field.name, 'replacement']} label="替换内容" extra="留空会删除匹配内容。请自行确认语义。"><Input.TextArea rows={4} spellCheck={false} /></Form.Item>
+            <Form.Item name={[field.name, 'weight']} label="基础权重" rules={[{ required: true, message: '请输入基础权重' }]} extra="0 表示不分配给新会话；已绑定的会话继续沿用。"><InputNumber min={0} max={1000000} precision={0} aria-label={`候选 ${i + 1} 基础权重`} /></Form.Item>
+          </Card>)}
+          <Button block icon={<PlusOutlined />} disabled={fields.length >= 32} onClick={() => add({ replacement: '', weight: 1 })}>添加替换候选（最多 32 个）</Button>
+        </div>}</Form.List>
+        <Form.Item name="weight_refresh_hours" label="自动刷新权重" extra="关闭时严格按基础权重分配新会话；开启后限制基础偏好、加入随机扰动，再将每项概率约束在平均份额的 0.5～1.5 倍。刷新按固定时间窗口生效，保留已有会话选择。"><Select options={[{ value: 0, label: '关闭，使用固定权重' }, { value: 6, label: '每 6 小时' }, { value: 12, label: '每 12 小时' }, { value: 24, label: '每天' }, { value: 48, label: '每 2 天' }, { value: 168, label: '每周' }]} /></Form.Item>
+        <Form.Item name="require_end_boundary" label="检查匹配末尾边界" valuePropName="checked" extra="匹配内容之后须为英文句点、空格、制表符、换行或文本结尾。"><Switch /></Form.Item>
+        <Form.Item name="enabled" label="启用规则" valuePropName="checked"><Switch /></Form.Item>
+        <Alert type="info" showIcon message="保存规则不会自动验证。编辑或删除候选内容会影响已绑定会话；仅调整权重或刷新间隔不会切换其选择。" />
+      </Form>
     </Modal>
   </div>;
 }

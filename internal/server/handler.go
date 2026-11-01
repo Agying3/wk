@@ -5228,7 +5228,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.status = http.StatusServiceUnavailable
 		return
 	}
-	preparedBody, err := h.cfg.Upstream.PrepareChatBody(bodyDoc)
+	preparedBody, err := h.preparePromptBody(bodyDoc, r)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		st.status = http.StatusBadRequest

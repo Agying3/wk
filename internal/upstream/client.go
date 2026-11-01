@@ -309,8 +309,14 @@ func (c *Client) prepareBody(body []byte) ([]byte, error) {
 // 做过一次全量 map 解码（校验/统计/路由共用），传进来可省掉对大请求体的
 // 第二次 map[string]any 解码。fail-closed 语义与 prepareBody 完全一致。
 func (c *Client) prepareBodyFromObj(obj map[string]any) ([]byte, error) {
-	if obj != nil && c.RewriteSystem != nil {
-		if err := c.RewriteSystem(obj); err != nil {
+	return c.PrepareChatBodyWithRewrite(obj, c.RewriteSystem)
+}
+
+// PrepareChatBodyWithRewrite accepts a request-scoped rewriter; the resulting
+// bytes are reused for all retries and normalized through the usual pipeline.
+func (c *Client) PrepareChatBodyWithRewrite(obj map[string]any, rewrite func(map[string]any) error) ([]byte, error) {
+	if obj != nil && rewrite != nil {
+		if err := rewrite(obj); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrUnprocessableBody, err)
 		}
 	}

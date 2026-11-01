@@ -51,7 +51,7 @@ func (m *Manager) MigrateLegacy(c LegacyConfig) (bool, error) {
 	for _, preset := range legacyRules(c) {
 		duplicate := false
 		for _, r := range m.state.Config.Rules {
-			if r.Match == preset.Match && r.Replacement == preset.Replacement && r.Enabled == preset.Enabled && r.RequireEndBoundary == preset.RequireEndBoundary {
+			if len(r.Variants) == 0 && r.Match == preset.Match && r.Replacement == preset.Replacement && r.Enabled == preset.Enabled && r.RequireEndBoundary == preset.RequireEndBoundary {
 				duplicate = true
 				break
 			}

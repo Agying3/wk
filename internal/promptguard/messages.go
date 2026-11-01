@@ -78,6 +78,10 @@ func Text(messages []Message) string {
 // ApplyToDocument runs each rule once in list order; later rules may match an
 // earlier replacement. It cannot loop, and does not touch other message roles.
 func ApplyToDocument(doc map[string]any, rules []Rule) error {
+	return applyToDocument(doc, rules, nil)
+}
+
+func applyToDocument(doc map[string]any, rules []Rule, choose func(Rule) (string, error)) error {
 	if len(rules) == 0 {
 		return nil
 	}
@@ -102,6 +106,17 @@ func ApplyToDocument(doc map[string]any, rules []Rule) error {
 			for _, r := range rules {
 				if r.Enabled && r.Match != "" {
 					count := literalMatchCount(s, r.Match, r.RequireEndBoundary)
+					if count == 0 {
+						continue
+					}
+					if choose != nil {
+						var err error
+						r.Replacement, err = choose(r)
+						if err != nil {
+							rewriteErr = err
+							return s
+						}
+					}
 					delta := len(r.Replacement) - len(r.Match)
 					if len(s) > limit-total || delta > 0 && count > (limit-total-len(s))/delta {
 						rewriteErr = errors.New("system prompt replacement exceeds 128 MiB limit")

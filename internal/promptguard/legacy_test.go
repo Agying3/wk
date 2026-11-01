@@ -23,7 +23,7 @@ func TestLegacyMigrationPreservesSwitches(t *testing.T) {
 			t.Fatalf("migration %v: %v", flags, err)
 		}
 		got := m.Config()
-		if got.LegacyMigrationVersion != 1 || len(got.Rules) != 5 || got.Rules[0] != before.Rules[0] || got.Settings != before.Settings {
+		if got.LegacyMigrationVersion != 1 || len(got.Rules) != 5 || !reflect.DeepEqual(got.Rules[0], before.Rules[0]) || got.Settings != before.Settings {
 			t.Fatalf("lost existing configuration: %+v", got)
 		}
 		for _, r := range got.Rules[1:] {
@@ -118,7 +118,7 @@ func TestLegacyMigrationReusesExactRulesAndPreservesOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := m.Config()
-	if len(got.Rules) != 4 || got.Rules[0] != existing {
+	if len(got.Rules) != 4 || !reflect.DeepEqual(got.Rules[0], existing) {
 		t.Fatal("duplicate added or existing rule overwritten")
 	}
 }

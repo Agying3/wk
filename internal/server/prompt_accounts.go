@@ -153,7 +153,7 @@ func (h *Handler) promptSession(parent context.Context, item promptguard.Case) p
 					var body []byte
 					var err error
 					if rewrite {
-						body, err = h.cfg.Upstream.PrepareChatBody(doc)
+						body, err = h.prepareDiagnosticBody(doc, item)
 					} else {
 						body, err = json.Marshal(doc)
 					}
