@@ -19,7 +19,7 @@ func (r *Router) Export() ([]byte, error) {
 	out := map[string]bindingWire{}
 	for k, v := range r.entries {
 		if !expired(v, time.Now(), r.cfg.TTL) {
-			out[k] = bindingWire{v.uid, v.lastActive, v.version}
+			out[k] = bindingWire{v.Value, v.LastSeen, v.Version}
 		}
 	}
 	return json.Marshal(out)
@@ -35,7 +35,7 @@ func (r *Router) Import(raw []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for k, v := range in {
-		e := entry{uid: v.UID, lastActive: v.LastActive, version: v.Version}
+		e := entry{Value: v.UID, LastSeen: v.LastActive, Version: v.Version}
 		if len(k) != 64 || expired(e, time.Now(), r.cfg.TTL) {
 			continue
 		}

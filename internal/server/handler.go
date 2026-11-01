@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -208,6 +209,7 @@ type ResponseStore interface {
 // Handler 主路由。
 type Handler struct {
 	cacheRouter       *cacheroute.Router
+	sessionResolver   *session.Resolver
 	cfg               Config
 	mux               *http.ServeMux
 	sessionsMu        sync.Mutex
@@ -311,6 +313,20 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sessions: make(map[string]time.Time), responseHistory: make(map[string]*storedResponse), unlockAttempts: make(map[string]unlockAttempt)}
+	if cfg.Session != nil {
+		h.sessionResolver = cfg.Session.Resolver()
+	} else {
+		secret := cfg.APIKey
+		if secret == "" {
+			secret = cfg.FrontendPassword
+		}
+		var salt []byte
+		if secret != "" {
+			sum := sha256.Sum256([]byte("wb2api/session-salt/v1\x00" + secret))
+			salt = sum[:]
+		}
+		h.sessionResolver = session.NewResolver(salt)
+	}
 	h.accountAdminMu = cfg.AccountAdminLock
 	if h.accountAdminMu == nil {
 		h.accountAdminMu = &sync.Mutex{}
@@ -4102,7 +4118,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	currentMessages, _ := chatDoc["messages"].([]any)
 	turnMessages := responseMessages(currentMessages)
 	messages := turnMessages
-	routeKey := session.ExtractKeyFromValue(requestDoc)
+	routeKey, _ := session.ExplicitIdentity(requestDoc, r.Header)
 	previousID, _ := requestDoc["previous_response_id"].(string)
 	if previousID != "" {
 		previousMessages, previousRouteKey, release, historyErr := h.acquireResponseHistory(previousID)
@@ -5222,12 +5238,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	var lastKind upstream.ErrKind
 
-	rawKey, keySource := routingIdentity(bodyDoc, r, h.cacheRouter == nil)
 	if h.cfg.Upstream == nil {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", "upstream client is not configured")
 		st.status = http.StatusServiceUnavailable
 		return
 	}
+	resolved, identityErr := h.resolveSession(bodyDoc, r)
+	if identityErr != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", identityErr.Error())
+		st.status = http.StatusBadRequest
+		return
+	}
+	r = withRequestSession(r, resolved)
 	preparedBody, err := h.preparePromptBody(bodyDoc, r)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -5236,7 +5258,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	scopeAllow := h.allowSet(scopeFromRequest(r))
-	route := h.beginChatRoute(r, rawKey, keySource, routeModel, bodyDoc, scopeAllow)
+	route := h.beginResolvedChatRoute(r, resolved.Identity, routeModel, bodyDoc, scopeAllow)
 	defer route.log(st)
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。

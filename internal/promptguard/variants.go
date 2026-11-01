@@ -9,7 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"time"
+
+	"workbuddy2api/internal/session"
 )
 
 type Variant struct {
@@ -18,10 +21,7 @@ type Variant struct {
 	Weight      int    `json:"weight"`
 }
 
-type promptSession struct {
-	Choices  map[string]string `json:"choices"`
-	LastSeen time.Time         `json:"last_seen"`
-}
+type promptSession = session.Binding[map[string]string]
 
 const promptSessionLimit = 10000
 const promptSessionTTL = 30 * 24 * time.Hour
@@ -145,80 +145,80 @@ func (m *Manager) ApplySession(doc map[string]any, session string) error {
 	return m.applySessionAt(doc, session, time.Now().UTC())
 }
 
+func (m *Manager) resetBindingsLocked() {
+	m.bindings = session.NewBindingStore[map[string]string](session.BindingPolicy{TTL: promptSessionTTL, MaxEntries: promptSessionLimit, RejectWhenFull: true}, m.state.PromptSessions)
+}
+
+// LegacySessionKey is only a migration read adapter. All active identities are
+// supplied by the shared resolver at request admission, before rewriting.
+func (m *Manager) LegacySessionKey(namespace string, doc map[string]any, headers http.Header) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return session.LegacyPromptKey(m.state.SelectionSeed, namespace, doc, headers)
+}
+
+func (m *Manager) ApplyIdentity(doc map[string]any, identity session.Identity, legacy string) error {
+	return m.applyBindingAt(doc, identity.Key, legacy, time.Now().UTC())
+}
+
 func (m *Manager) applySessionAt(doc map[string]any, session string, now time.Time) error {
+	return m.applyBindingAt(doc, session, "", now)
+}
+
+func (m *Manager) applyBindingAt(doc map[string]any, identity, legacy string, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return errors.New("prompt guard closed")
 	}
 	key := ""
-	if session != "" {
-		mac := hmac.New(sha256.New, m.state.SelectionSeed)
-		mac.Write([]byte("prompt-session\x00" + session))
-		key = hex.EncodeToString(mac.Sum(nil))
-	}
-	old, exists := m.state.PromptSessions[key]
-	entry := copyJSON(old)
-	if entry.Choices == nil || now.Sub(entry.LastSeen) > promptSessionTTL {
-		entry = promptSession{Choices: map[string]string{}}
+	if identity != "" {
+		key = session.ScopedKey(identity, "prompt", "")
 	}
 	selected := map[string]string{}
 	used, changed := false, false
-	err := applyToDocument(doc, m.state.Config.Rules, func(r Rule) (string, error) {
-		if len(r.Variants) == 0 {
-			return r.Replacement, nil
+	rewrite := func(choices map[string]string) (map[string]string, bool, error) {
+		choices = copyJSON(choices)
+		if choices == nil {
+			choices = map[string]string{}
 		}
-		used = true
-		if text, ok := selected[r.ID]; ok {
-			return text, nil
-		}
-		for _, v := range r.Variants {
-			if key != "" && entry.Choices[r.ID] == v.ID {
-				selected[r.ID] = v.Replacement
-				return v.Replacement, nil
+		err := applyToDocument(doc, m.state.Config.Rules, func(r Rule) (string, error) {
+			if len(r.Variants) == 0 {
+				return r.Replacement, nil
 			}
-		}
-		var b [8]byte
-		if _, err := rand.Read(b[:]); err != nil {
-			return "", err
-		}
-		unit := float64(binary.BigEndian.Uint64(b[:])>>11) / (1 << 53)
-		v := pickVariant(r, variantWeights(r, m.state.SelectionSeed, now), unit)
-		if v.ID == "" {
-			return "", errors.New("no eligible prompt variant")
-		}
-		selected[r.ID] = v.Replacement
-		entry.Choices[r.ID] = v.ID
-		changed = true
-		return v.Replacement, nil
-	})
-	if err != nil || !used || key == "" {
+			used = true
+			if text, ok := selected[r.ID]; ok {
+				return text, nil
+			}
+			for _, v := range r.Variants {
+				if key != "" && choices[r.ID] == v.ID {
+					selected[r.ID] = v.Replacement
+					return v.Replacement, nil
+				}
+			}
+			var b [8]byte
+			if _, err := rand.Read(b[:]); err != nil {
+				return "", err
+			}
+			unit := float64(binary.BigEndian.Uint64(b[:])>>11) / (1 << 53)
+			v := pickVariant(r, variantWeights(r, m.state.SelectionSeed, now), unit)
+			if v.ID == "" {
+				return "", errors.New("no eligible prompt variant")
+			}
+			selected[r.ID] = v.Replacement
+			choices[r.ID] = v.ID
+			changed = true
+			return v.Replacement, nil
+		})
+		return choices, used && changed, err
+	}
+	if key == "" {
+		_, _, err := rewrite(nil)
 		return err
 	}
-	if !changed && now.Sub(old.LastSeen) < time.Hour {
-		return nil
-	}
-	if !exists && len(m.state.PromptSessions) >= promptSessionLimit {
-		for k, v := range m.state.PromptSessions {
-			if now.Sub(v.LastSeen) > promptSessionTTL {
-				delete(m.state.PromptSessions, k)
-			}
-		}
-		if len(m.state.PromptSessions) >= promptSessionLimit {
-			return errors.New("prompt session capacity reached; existing sessions are preserved")
-		}
-	}
-	entry.LastSeen = now
-	m.state.PromptSessions[key] = entry
-	if err := m.saveLocked(); err != nil {
-		if exists {
-			m.state.PromptSessions[key] = old
-		} else {
-			delete(m.state.PromptSessions, key)
-		}
-		return err
-	}
-	return nil
+	return m.bindings.UpdateAlias(key, legacy, now, time.Hour, func(choices map[string]string, _ bool) (map[string]string, bool, error) {
+		return rewrite(choices)
+	}, m.saveLocked)
 }
 
 // Diagnostic rewrites use a deterministic choice per case, revision and job

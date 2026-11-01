@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"workbuddy2api/internal/session"
 )
 
 func variantDocument() map[string]any {
@@ -183,7 +184,7 @@ func TestVariantEmptyDeletionChainingAndCandidateRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, s := range m.state.PromptSessions {
-		if _, exists := s.Choices["delete"]; exists {
+		if _, exists := s.Value["delete"]; exists {
 			t.Fatal("deleted rule retained in session map")
 		}
 	}
@@ -314,5 +315,51 @@ func TestVariantExpiryCapacityAndDiagnosticIsolation(t *testing.T) {
 	b2, _ := json.Marshal(doc2)
 	if string(b1) != string(b2) || len(m.state.PromptSessions) != 1 {
 		t.Fatal("diagnostic choice unstable or used business capacity")
+	}
+}
+
+func TestVariantLegacyBindingsMigrateWithoutReselection(t *testing.T) {
+	for _, explicit := range []bool{true, false} {
+		t.Run(fmt.Sprint(explicit), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "guard.enc")
+			m, err := Open(path, "fixture-secret")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := m.Config()
+			r := variantRule()
+			r.WeightRefreshHours = 0
+			r.Variants[0].Weight = 0
+			c.Rules = []Rule{r}
+			if err := m.Update(c); err != nil {
+				t.Fatal(err)
+			}
+			doc := variantDocument()
+			doc["messages"] = append(doc["messages"].([]any), map[string]any{"role": "user", "content": "task"})
+			if explicit {
+				doc["conversation_id"] = "old-conversation"
+			}
+			legacy := m.LegacySessionKey("tenant", doc, nil)
+			m.state.PromptSessions[legacy] = promptSession{Value: map[string]string{"rule": "a"}, LastSeen: time.Now()}
+			if err := m.saveLocked(); err != nil {
+				t.Fatal(err)
+			}
+			m.Close()
+			m, err = Open(path, "fixture-secret")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			id := session.NewResolver([]byte("fixed-new-shared-salt")).Resolve("tenant", doc, doc, nil)
+			if err := m.ApplyIdentity(doc, id, legacy); err != nil {
+				t.Fatal(err)
+			}
+			if Text(Extract(doc)) != "alpha alpha\nalpha" {
+				t.Fatal("zero-weight legacy choice rerolled during migration")
+			}
+			if _, ok := m.state.PromptSessions[legacy]; ok || len(m.state.PromptSessions) != 1 {
+				t.Fatal("migration duplicated binding capacity")
+			}
+		})
 	}
 }

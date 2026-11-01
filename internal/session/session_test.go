@@ -115,7 +115,7 @@ func TestExtractKeyPriority(t *testing.T) {
 	}{
 		{`{"metadata":{"conversation_id":"mc","user_id":"mu"},"conversation_id":"top"}`, "mc"}, // metadata.conversation_id 优先
 		{`{"conversation_id":"top"}`, "top"},                                                   // 顶层 conversation_id
-		{`{"metadata":{"user_id":"mu"}}`, "mu"},                                                // metadata.user_id 兜底
+		{`{"metadata":{"user_id":"mu"}}`, ""},                                                  // user_id does not identify a conversation
 		{`{"metadata":{"conversation_id":123}}`, ""},                                           // 非字符串 → 空
 		{`not-json`, ""}, // 非法 JSON → 空
 	}
@@ -169,7 +169,7 @@ func (r *Router) boundUID(key string) (string, bool) {
 	r.mu.RLock()
 	e, ok := r.entries[r.normalizeKey(key)]
 	r.mu.RUnlock()
-	return e.uid, ok
+	return e.Value, ok
 }
 
 func TestBindOverridesAndMirrors(t *testing.T) {

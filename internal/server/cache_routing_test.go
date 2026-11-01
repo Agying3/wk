@@ -20,6 +20,11 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
+func (h *Handler) beginChatRoute(r *http.Request, raw, source, model string, doc map[string]any, allow map[string]bool) *chatRoute {
+	identity := h.sessionResolver.Resolve(routeNamespace(r), map[string]any{"conversation_id": raw}, doc, r.Header)
+	return h.beginResolvedChatRoute(r, identity, model, doc, allow)
+}
+
 func TestCacheRouteOtherSessionsUseSlotsWithoutDisplacingWarmPrimary(t *testing.T) {
 	p := routingPool()
 	p.SetMaxInFlight(3)

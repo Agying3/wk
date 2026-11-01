@@ -376,7 +376,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("%v", err)
 		}
-		if len(salt) == 0 && *controlPath != "" {
+		if len(salt) == 0 && (cfg.APIKey != "" || cfg.FrontendPassword != "") {
 			secret := cfg.APIKey
 			if secret == "" {
 				secret = cfg.FrontendPassword

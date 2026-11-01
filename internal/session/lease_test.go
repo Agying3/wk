@@ -52,7 +52,7 @@ func TestLeaseDoesNotReviveRemovedOrExpiredBinding(t *testing.T) {
 	newer, _ := r.ResolveLease("c", nil, "A")
 	r.mu.Lock()
 	e := r.entries[newer.Hash]
-	e.lastActive = time.Now().Add(-2 * time.Minute)
+	e.LastSeen = time.Now().Add(-2 * time.Minute)
 	r.entries[newer.Hash] = e
 	r.mu.Unlock()
 	if r.TouchIfCurrent("c", newer) {

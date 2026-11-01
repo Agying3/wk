@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"workbuddy2api/internal/session"
 )
 
 type Rule struct {
@@ -127,6 +128,7 @@ type Manager struct {
 	wg             sync.WaitGroup
 	storageError   string
 	stop           chan struct{}
+	bindings       *session.BindingStore[map[string]string]
 }
 
 func Open(path, secret string) (*Manager, error) {
@@ -164,6 +166,7 @@ func Open(path, secret string) (*Manager, error) {
 	if m.state.PromptSessions == nil {
 		m.state.PromptSessions = map[string]promptSession{}
 	}
+	m.resetBindingsLocked()
 	for _, c := range m.state.Cases {
 		if c.Job != nil && (c.Job.Status == "running" || c.Job.Status == "queued") {
 			c.Job.Status = "interrupted"
@@ -300,9 +303,9 @@ func (m *Manager) Update(c Config) error {
 	m.state.Config = copyJSON(c)
 	// Rule churn must not grow each session's choice map without a bound.
 	for key, session := range m.state.PromptSessions {
-		for ruleID := range session.Choices {
+		for ruleID := range session.Value {
 			if !ids[ruleID] {
-				delete(session.Choices, ruleID)
+				delete(session.Value, ruleID)
 			}
 		}
 		m.state.PromptSessions[key] = session
@@ -316,6 +319,7 @@ func (m *Manager) Update(c Config) error {
 	m.pruneLocked()
 	if err := m.saveLocked(); err != nil {
 		m.state = old
+		m.resetBindingsLocked()
 		return err
 	}
 	if !c.Settings.AutoLocate {

@@ -2,12 +2,14 @@ package server
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/promptguard"
+	"workbuddy2api/internal/upstream"
 )
 
 func TestPromptVariantsChatResponsesShareSessionAndIgnoreOtherRoles(t *testing.T) {
@@ -51,20 +53,28 @@ func TestPromptVariantsChatResponsesShareSessionAndIgnoreOtherRoles(t *testing.T
 }
 
 func TestPromptSessionIdentityFallbackAndExplicitIsolation(t *testing.T) {
+	h := newTestHandler(t, Config{Upstream: upstream.New(), APIKey: "test-secret"})
+	identity := func(doc map[string]any, r *http.Request) string {
+		resolved, err := h.resolveSession(doc, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resolved.Identity.Key
+	}
 	r := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	doc := func(system, first string) map[string]any {
 		return map[string]any{"messages": []any{map[string]any{"role": "system", "content": system}, map[string]any{"role": "user", "content": first}}}
 	}
-	a := promptSessionIdentity(doc("dynamic1", "hello"), r)
-	if a == "" || a != promptSessionIdentity(doc("dynamic2", "hello"), r) {
-		t.Fatal("dynamic system changed fallback identity")
+	a := identity(doc("system-a", "hello"), r)
+	if a == "" || a == identity(doc("system-b", "hello"), r) {
+		t.Fatal("different system prompts merged by fallback identity")
 	}
-	if a == promptSessionIdentity(doc("dynamic1", "different"), r) {
+	if a == identity(doc("system-a", "different"), r) {
 		t.Fatal("different first messages merged")
 	}
 	r.Header.Set("X-Session-ID", "explicit")
-	b := promptSessionIdentity(doc("dynamic", "hello"), r)
-	if a == b || b != promptSessionIdentity(doc("new", "different"), r) {
+	b := identity(doc("dynamic", "hello"), r)
+	if a == b || b != identity(doc("new", "different"), r) {
 		t.Fatal("explicit session not preferred")
 	}
 	if strings.Contains(a, "hello") {

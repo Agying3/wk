@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"log"
 	"sort"
-	"sync"
 	"time"
 
 	"workbuddy2api/internal/redisstore"
@@ -27,11 +26,7 @@ import (
 const defaultMaxEntries = 10000
 
 // entry 单条会话绑定。
-type entry struct {
-	uid        string
-	lastActive time.Time
-	version    uint64
-}
+type entry = Binding[string]
 
 // Config 路由依赖；Available 返回未占满在途的可用账号，Healthy 校验绑定时忽略暂时满载。
 // 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
@@ -53,11 +48,9 @@ type Config struct {
 
 // Router 会话粘性路由器。
 type Router struct {
-	mu      sync.RWMutex
-	entries map[string]entry
-	cfg     Config
-	stop    chan struct{}
-	version uint64
+	*BindingStore[string]
+	cfg  Config
+	stop chan struct{}
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -80,7 +73,9 @@ func New(cfg Config) *Router {
 		// 内存有界，但不提供抗预计算能力。main 会生成随机盐并告警。
 		log.Printf("[session] sticky salt is empty; session keys are not keyed (set session_sticky.salt)")
 	}
-	return &Router{entries: map[string]entry{}, cfg: cfg}
+	bindings := NewBindingStore[string](BindingPolicy{TTL: cfg.TTL, MaxEntries: cfg.MaxEntries}, nil)
+	bindings.onDelete = cfg.Store.DelBind
+	return &Router{BindingStore: bindings, cfg: cfg}
 }
 
 // normalizeKey 把客户端提供的会话键转成实际用作 map/redis key 的定长标识。
@@ -100,25 +95,8 @@ func (r *Router) normalizeKey(raw string) string {
 
 // evictLocked 在写入前保证表不超上限。调用方必须已持有写锁。
 // 淘汰最久未活跃的条目（与 GC 的过期语义一致，只是提前触发）。
-func (r *Router) evictLocked(now time.Time) {
-	if r.cfg.MaxEntries <= 0 || len(r.entries) < r.cfg.MaxEntries {
-		return
-	}
-	// 一次淘汰 1/8，避免每个请求都在这里做 O(n) 扫描。
-	target := len(r.entries) - r.cfg.MaxEntries + r.cfg.MaxEntries/8 + 1
-	type kv struct {
-		key string
-		at  time.Time
-	}
-	all := make([]kv, 0, len(r.entries))
-	for k, e := range r.entries {
-		all = append(all, kv{k, e.lastActive})
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
-	for i := 0; i < target && i < len(all); i++ {
-		delete(r.entries, all[i].key)
-		r.cfg.Store.DelBind(all[i].key)
-	}
+func (r *Router) evictLocked(key string, now time.Time) {
+	_ = r.BindingStore.roomLocked(key, now)
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -170,8 +148,8 @@ func (r *Router) LoadFromStore() {
 		if _, exists := r.entries[key]; exists {
 			continue
 		}
-		r.version++
-		r.entries[key] = entry{uid: uid, lastActive: now, version: r.version}
+		r.evictLocked(key, now)
+		r.BindingStore.setLocked(key, uid, now)
 		loaded++
 	}
 	r.mu.Unlock()
@@ -211,7 +189,7 @@ func (r *Router) LookupLease(raw string) (Lease, bool) {
 	if !ok || expired(e, time.Now(), r.cfg.TTL) {
 		return Lease{}, false
 	}
-	return Lease{e.uid, e.version, key}, true
+	return Lease{e.Value, e.Version, key}, true
 }
 
 // ResolveLease keeps a healthy primary even when all its slots are occupied.
@@ -249,11 +227,10 @@ func (r *Router) ResolveLeaseWithCandidates(raw string, allow map[string]bool, p
 	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.entries[key]; ok && !expired(e, now, r.cfg.TTL) && healthy[e.uid] {
-		e.lastActive = now
-		r.entries[key] = e
-		r.cfg.Store.SetBind(key, e.uid, r.cfg.TTL)
-		return Lease{e.uid, e.version, key}, true
+	if e, ok := r.entries[key]; ok && !expired(e, now, r.cfg.TTL) && healthy[e.Value] {
+		r.BindingStore.touchCurrentLocked(key, e.Version, now)
+		r.cfg.Store.SetBind(key, e.Value, r.cfg.TTL)
+		return Lease{e.Value, e.Version, key}, true
 	}
 	if len(healthy) == 0 {
 		return Lease{}, false
@@ -275,7 +252,7 @@ func (r *Router) ResolveLeaseWithCandidates(raw string, allow map[string]bool, p
 		bound := map[string]bool{}
 		for _, e := range r.entries {
 			if !expired(e, now, r.cfg.TTL) {
-				bound[e.uid] = true
+				bound[e.Value] = true
 			}
 		}
 		var idle []string
@@ -289,15 +266,13 @@ func (r *Router) ResolveLeaseWithCandidates(raw string, allow map[string]bool, p
 		}
 		uid = uids[hashIndex(key, len(uids))]
 	}
-	r.evictLocked(now)
-	e := r.setLocked(key, uid, now)
-	return Lease{e.uid, e.version, key}, true
+	r.evictLocked(key, now)
+	e := r.assignLocked(key, uid, now)
+	return Lease{e.Value, e.Version, key}, true
 }
 
-func (r *Router) setLocked(key, uid string, now time.Time) entry {
-	r.version++
-	e := entry{uid: uid, lastActive: now, version: r.version}
-	r.entries[key] = e
+func (r *Router) assignLocked(key, uid string, now time.Time) entry {
+	e := r.BindingStore.setLocked(key, uid, now)
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 	return e
 }
@@ -311,8 +286,8 @@ func (r *Router) Bind(raw, uid string) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.evictLocked(time.Now())
-	r.setLocked(key, uid, time.Now())
+	r.evictLocked(key, time.Now())
+	r.assignLocked(key, uid, time.Now())
 }
 
 func (r *Router) BindIfAbsent(raw, uid string) (Lease, bool) {
@@ -324,11 +299,11 @@ func (r *Router) BindIfAbsent(raw, uid string) (Lease, bool) {
 	defer r.mu.Unlock()
 	now := time.Now()
 	if e, ok := r.entries[key]; ok && !expired(e, now, r.cfg.TTL) {
-		return Lease{e.uid, e.version, key}, false
+		return Lease{e.Value, e.Version, key}, false
 	}
-	r.evictLocked(now)
-	e := r.setLocked(key, uid, now)
-	return Lease{e.uid, e.version, key}, true
+	r.evictLocked(key, now)
+	e := r.assignLocked(key, uid, now)
+	return Lease{e.Value, e.Version, key}, true
 }
 
 func (r *Router) ReplaceIfCurrent(raw string, old Lease, uid string) (Lease, bool) {
@@ -339,11 +314,15 @@ func (r *Router) ReplaceIfCurrent(raw string, old Lease, uid string) (Lease, boo
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.entries[key]
-	if !ok || e.uid != old.UID || e.version != old.Version || expired(e, time.Now(), r.cfg.TTL) {
+	if !ok || e.Value != old.UID {
 		return Lease{}, false
 	}
-	e = r.setLocked(key, uid, time.Now())
-	return Lease{e.uid, e.version, key}, true
+	e, ok = r.BindingStore.replaceCurrentLocked(key, old.Version, uid, time.Now())
+	if !ok {
+		return Lease{}, false
+	}
+	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	return Lease{e.Value, e.Version, key}, true
 }
 
 func (r *Router) TouchIfCurrent(raw string, old Lease) bool {
@@ -351,12 +330,10 @@ func (r *Router) TouchIfCurrent(raw string, old Lease) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.entries[key]
-	if !ok || e.uid != old.UID || e.version != old.Version || expired(e, time.Now(), r.cfg.TTL) {
+	if !ok || e.Value != old.UID || !r.BindingStore.touchCurrentLocked(key, old.Version, time.Now()) {
 		return false
 	}
-	e.lastActive = time.Now()
-	r.entries[key] = e
-	r.cfg.Store.SetBind(key, e.uid, r.cfg.TTL)
+	r.cfg.Store.SetBind(key, e.Value, r.cfg.TTL)
 	return true
 }
 
@@ -365,12 +342,10 @@ func (r *Router) UnbindIfCurrent(raw string, old Lease) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.entries[key]
-	if !ok || e.uid != old.UID || e.version != old.Version {
+	if !ok || e.Value != old.UID {
 		return false
 	}
-	delete(r.entries, key)
-	r.cfg.Store.DelBind(key)
-	return true
+	return r.BindingStore.removeCurrentLocked(key, old.Version)
 }
 
 func (r *Router) Unbind(raw string) bool {
@@ -379,8 +354,7 @@ func (r *Router) Unbind(raw string) bool {
 	defer r.mu.Unlock()
 	_, found := r.entries[key]
 	if found {
-		delete(r.entries, key)
-		r.cfg.Store.DelBind(key)
+		r.BindingStore.deleteLocked(key)
 	}
 	return found
 }
@@ -395,20 +369,9 @@ func (r *Router) Count() int {
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
 func (r *Router) gcOnce(now time.Time) int {
 	r.mu.Lock()
-	var expiredKeys []string
-	for key, e := range r.entries {
-		if now.Sub(e.lastActive) > r.cfg.TTL {
-			expiredKeys = append(expiredKeys, key)
-		}
-	}
-	for _, key := range expiredKeys {
-		delete(r.entries, key)
-	}
-	for _, key := range expiredKeys {
-		r.cfg.Store.DelBind(key)
-	}
+	n := r.BindingStore.pruneLocked(now)
 	r.mu.Unlock()
-	return len(expiredKeys)
+	return n
 }
 
 // availableSet 把 Available() 的有序列表转集合（快路径命中校验用）。
@@ -430,7 +393,7 @@ func (r *Router) availableSlice() []string {
 }
 
 func expired(e entry, now time.Time, ttl time.Duration) bool {
-	return now.Sub(e.lastActive) > ttl
+	return e.Expired(now, ttl)
 }
 
 // hashIndex FNV-1a 哈希取模（antigravity 双段分配的稳定散列）。
@@ -448,7 +411,6 @@ func hashIndex(key string, n int) int {
 //  2. conversation_id
 //  3. conversation（Responses API 的会话键）
 //  4. prompt_cache_key（Responses API 的显式缓存分区键）
-//  5. metadata.user_id
 func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -464,31 +426,6 @@ func ExtractKey(body []byte) string {
 // 请求入口已经做过一次全量 map 解码，传进来可省掉第二次解码。键的优先级
 // 与 ExtractKey 完全一致。
 func ExtractKeyFromValue(obj map[string]any) string {
-	if obj == nil {
-		return ""
-	}
-	if meta, ok := obj["metadata"].(map[string]any); ok {
-		if v := strOrEmpty(meta["conversation_id"]); v != "" {
-			return v
-		}
-	}
-	if v := strOrEmpty(obj["conversation_id"]); v != "" {
-		return v
-	}
-	if v := strOrEmpty(obj["conversation"]); v != "" {
-		return v
-	}
-	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
-		return v
-	}
-	if meta, ok := obj["metadata"].(map[string]any); ok {
-		return strOrEmpty(meta["user_id"])
-	}
-	return ""
-}
-
-// strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。
-func strOrEmpty(v any) string {
-	s, _ := v.(string)
-	return s
+	raw, _ := ExplicitIdentity(obj, nil)
+	return raw
 }

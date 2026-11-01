@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/session"
 )
 
 type Config struct {
@@ -152,9 +153,7 @@ func (r *Router) Hash(value string) string {
 // ScopedKey hashes the entire identity before session's normalization. Model,
 // key identity and authorization namespace cannot collide with client IDs.
 func ScopedKey(namespace, model, raw string) string {
-	b, _ := json.Marshal([]string{namespace, model, raw})
-	v := sha256.Sum256(b)
-	return hex.EncodeToString(v[:])
+	return session.ScopedKey(namespace, model, raw)
 }
 
 // Build consumes the already normalized outbound document. It never hashes

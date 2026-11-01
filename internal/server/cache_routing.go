@@ -47,58 +47,32 @@ func (c *chatRoute) release(uid string) {
 	}
 }
 
-func routingIdentity(doc map[string]any, r *http.Request, allowUserID bool) (string, string) {
-	if meta, ok := doc["metadata"].(map[string]any); ok {
-		if v, ok := meta["conversation_id"].(string); ok && v != "" {
-			return v, "metadata.conversation_id"
-		}
-	}
-	for _, key := range []string{"conversation_id", "conversation", "prompt_cache_key"} {
-		if v, ok := doc[key].(string); ok && v != "" {
-			return v, key
-		}
-	}
-	for _, key := range []string{"X-WorkBuddy-Session-ID", "X-Session-ID", "X-Conversation-ID"} {
-		if v := r.Header.Get(key); v != "" {
-			return v, key
-		}
-	}
-	if allowUserID {
-		if meta, ok := doc["metadata"].(map[string]any); ok {
-			if v, ok := meta["user_id"].(string); ok && v != "" {
-				return v, "metadata.user_id"
-			}
-		}
-	}
-	return "", "none"
-}
-
 func routeNamespace(r *http.Request) string {
 	s := scopeFromRequest(r)
 	return fmt.Sprintf("%q/%q/%q", s.kind, s.group, s.keyID)
 }
 
-func (h *Handler) beginChatRoute(r *http.Request, raw, source, model string, doc map[string]any, allow map[string]bool) *chatRoute {
-	c := &chatRoute{h: h, source: source, model: model, reason: "rotation"}
+func (h *Handler) beginResolvedChatRoute(r *http.Request, identity session.Identity, model string, doc map[string]any, allow map[string]bool) *chatRoute {
+	c := &chatRoute{h: h, source: identity.Source, model: model, reason: "rotation"}
 	preferred := ""
 	states := h.cfg.Pool.RoutingStates(model, allow)
 	if h.cacheRouter != nil {
 		c.tenant = h.cacheRouter.Hash(routeNamespace(r))
 		c.trace = h.cacheRouter.Build(routeNamespace(r), model, doc)
-		if raw == "" && c.trace.Root != "" && !h.cacheRouter.Config().Shadow {
-			raw = "prefix:" + c.trace.Root
-			c.source = "prefix"
-		}
 		if plans := h.cacheRouter.Plans("", c.trace, states, nil); len(plans) > 0 && !h.cacheRouter.Config().Shadow {
 			preferred = plans[0].UID
 		}
 	}
-	if raw == "" || h.cfg.Session == nil {
+	if identity.Empty() || h.cfg.Session == nil || identity.Source == "prefix" && (h.cacheRouter == nil || h.cacheRouter.Config().Shadow) {
 		return c
 	}
-	c.key = cacheroute.ScopedKey(routeNamespace(r), model, raw)
-	if _, exists := h.cfg.Session.LookupLease(c.key); !exists && c.source != "prefix" {
-		if legacy, ok := h.cfg.Session.LookupLease(raw); ok {
+	c.key = identity.AccountKey(model)
+	if _, exists := h.cfg.Session.LookupLease(c.key); !exists {
+		legacyKey := identity.LegacyRaw()
+		if identity.Source == "prefix" {
+			legacyKey = session.ScopedKey(routeNamespace(r), model, "prefix:"+c.trace.Root)
+		}
+		if legacy, ok := h.cfg.Session.LookupLease(legacyKey); ok {
 			for _, state := range states {
 				if state.UID == legacy.UID && state.Healthy {
 					preferred = legacy.UID

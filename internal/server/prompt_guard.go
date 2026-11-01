@@ -3,9 +3,7 @@ package server
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -15,39 +13,16 @@ import (
 	"workbuddy2api/internal/promptguard"
 )
 
-func promptSessionIdentity(doc map[string]any, r *http.Request) string {
-	raw, source := routingIdentity(doc, r, false)
-	if raw == "" {
-		// A stable first user message is a best-effort fallback, never a user
-		// ID or the changing system prompt. Explicit session IDs are preferred.
-		msgs, _ := doc["messages"].([]any)
-		for _, v := range msgs {
-			msg, _ := v.(map[string]any)
-			if msg["role"] == "user" {
-				b, err := json.Marshal(msg["content"])
-				if err == nil && len(b) > 0 && string(b) != "null" && string(b) != `""` {
-					raw = fmt.Sprintf("%x", sha256.Sum256(b))
-					source = "first-user"
-				}
-				break
-			}
-		}
-	}
-	if raw == "" {
-		return ""
-	}
-	// Same namespace across Chat/Responses; do not include account identity,
-	// route health, weight epoch or request ID in the prompt-session key.
-	return fmt.Sprintf("%q/%t/%q", routeNamespace(r), source == "first-user", raw)
-}
-
 func (h *Handler) preparePromptBody(doc map[string]any, r *http.Request) ([]byte, error) {
 	if h.cfg.PromptGuard == nil {
 		return h.cfg.Upstream.PrepareChatBody(doc)
 	}
-	key := promptSessionIdentity(doc, r)
+	resolved, err := h.resolveSession(doc, r)
+	if err != nil {
+		return nil, err
+	}
 	return h.cfg.Upstream.PrepareChatBodyWithRewrite(doc, func(d map[string]any) error {
-		return h.cfg.PromptGuard.ApplySession(d, key)
+		return h.cfg.PromptGuard.ApplyIdentity(d, resolved.Identity, resolved.LegacyPrompt)
 	})
 }
 

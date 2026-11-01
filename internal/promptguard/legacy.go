@@ -67,6 +67,7 @@ func (m *Manager) MigrateLegacy(c LegacyConfig) (bool, error) {
 	}
 	if len(m.state.Config.Rules) > 256 {
 		m.state = old
+		m.resetBindingsLocked()
 		return false, errors.New("not enough room to migrate legacy prompt rules")
 	}
 	m.state.Config.LegacyMigrationVersion = 1
@@ -76,6 +77,7 @@ func (m *Manager) MigrateLegacy(c LegacyConfig) (bool, error) {
 	}
 	if err := m.saveLocked(); err != nil {
 		m.state = old
+		m.resetBindingsLocked()
 		return false, err
 	}
 	return true, nil
