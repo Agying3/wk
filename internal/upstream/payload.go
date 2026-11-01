@@ -85,6 +85,7 @@ func prepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]
 	// 单独生效的结果会被原 slice 覆盖丢失。放在 normalizeMessageRoles 之后：
 	// developer→system 已完成，插入物按最终角色参与重排。
 	if msgs, ok := obj["messages"].([]any); ok {
+		msgs, _ = mergeAdjacentAssistantCalls(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
 		obj["messages"] = msgs

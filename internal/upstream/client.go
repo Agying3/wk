@@ -115,6 +115,11 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusUnauthorized {
 		return ErrUnauthorized
 	}
+	// 11128 is a request/content rejection even when the envelope says
+	// "request illegal". It must not accrue account risk strikes.
+	if (status == http.StatusBadRequest || status == http.StatusForbidden) && BusinessCode([]byte(body)) == 11128 {
+		return ErrClient
+	}
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
@@ -131,6 +136,10 @@ func Classify(status int, body string) ErrKind {
 	// code=6004 is the upstream's deterministic rate-limit response. Some
 	// gateway paths wrap the original 429 as HTTP 503, so inspect the body too.
 	if status == http.StatusTooManyRequests || isRateLimit6004(body) {
+		return ErrSoftRate
+	}
+	if status == http.StatusForbidden && isRiskFlag11140(body) &&
+		(strings.Contains(lower, "model provider is rate-limiting requests") || strings.Contains(lower, "model provider is rate limiting requests")) {
 		return ErrSoftRate
 	}
 	// 11140 是账号级风控标记（403 "request illegal"），必须在通用 4xx 兜底
