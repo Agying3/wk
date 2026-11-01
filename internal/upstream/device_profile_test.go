@@ -29,13 +29,14 @@ func TestAccountDeviceStableAcrossCredentialAndClientChanges(t *testing.T) {
 	if before["username"] == after["username"] {
 		t.Fatal("account nickname should still reflect the current credentials")
 	}
+	// 小程序通道是 iOS web-view：它与桌面端共用账号身份（machineId 按账号派生），
+	// 但 os/arch 描述的是小程序自己的运行时，不能拿桌面端的值去比。
 	mp := mpEventBase(reloaded)
-	major := "11"
-	if before["osVersion"] == "10.0.19045" {
-		major = "10"
+	if mp["machineId"] != mpEventBase(first)["machineId"] {
+		t.Fatal("mini-program identity changed across reload")
 	}
-	if mp["osVersion"] != major || mp["arch"] != before["arch"] {
-		t.Fatalf("desktop and mini-program disagree about the device: %v / %v", before, mp)
+	if mp["os"] != "ios" || mp["arch"] != "arm64" || mp["osVersion"] != mpIOSVersion {
+		t.Fatalf("unexpected mini-program platform: %v", mp)
 	}
 }
 

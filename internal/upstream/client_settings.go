@@ -114,6 +114,8 @@ func (c *Client) commonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("X-Request-ID", NewEventID())
 	req.Header.Set("X-Product", "SaaS")
+	// 请求框架（axios）的声明；官方没有在哪个请求上改写这个头。
+	applyEncoding(req, acceptEncodingAxios)
 	accountHeaders(req, a)
 	// Department text is optional and must not inject a header delimiter.
 	if value := a.Snapshot().DepartmentFullName; value != "" && strings.IndexFunc(value, func(r rune) bool { return r < 32 || r == 127 }) < 0 {
@@ -177,6 +179,8 @@ func (c *Client) billingHeaders(req *http.Request, a *auth.Auth) {
 	case "/v2/billing/meter/get-user-resource", "/v2/billing/meter/daily-checkin":
 		req.Header.Set("User-Agent", "axios/1.16.1")
 		req.Header.Set("X-Request-ID", NewEventID())
+		req.Header.Set("Accept", "application/json")
+		applyEncoding(req, acceptEncodingAxios)
 		if req.URL.Path == "/v2/billing/meter/get-user-resource" {
 			language := "zh-CN,zh;q=0.9"
 			if a.Region() == auth.RegionGlobal {
@@ -186,6 +190,8 @@ func (c *Client) billingHeaders(req *http.Request, a *auth.Auth) {
 		}
 	case resourceSummaryAPI, resourceFreeAPI, resourcePaidAPI:
 		req.Header.Set("User-Agent", "axios/1.16.1")
+		req.Header.Set("Accept", "application/json")
+		applyEncoding(req, acceptEncodingAxios)
 		language := "zh"
 		if a.Region() == auth.RegionGlobal {
 			language = "en"
@@ -193,6 +199,7 @@ func (c *Client) billingHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("Accept-Language", language)
 	default:
 		req.Header.Set("User-Agent", c.desktopUserAgent(a, false))
+		applyEncoding(req, acceptEncodingAxios)
 	}
 }
 

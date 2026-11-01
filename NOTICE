@@ -1,0 +1,57 @@
+WorkBuddy2API — https://github.com/gao-gao-zai/wk
+
+Copyright (c) 2026 gao-gao-zai and contributors, for their original contributions.
+Copyright in third-party portions remains with their respective authors.
+
+Starting with this migration (2026-11-01), this project's original contributions
+and the combined modified work are offered under GNU AGPL version 3 only
+(SPDX: AGPL-3.0-only). See LICENSE. This does not revoke earlier MIT grants or
+replace the licenses and copyright notices applicable to third-party portions.
+No non-commercial restriction or additional attribution condition is introduced
+by this project's own license grant.
+
+This is a separately maintained, modified project, not an official WorkBuddy,
+Tencent, Sliverkiss, linguo2625469, or yreidev release. No endorsement is implied.
+
+Provenance and retained notices
+-------------------------------
+1. The original WorkBuddy2API project and MIT upstream portions:
+   https://github.com/Sliverkiss/workbuddy2api
+   https://github.com/linguo2625469/workbuddy2api-panel
+   Copyright (c) 2026 Sliverkiss and linguo2625469.
+   The full retained MIT notice is in LICENSES/upstream-MIT.txt.
+   Existing per-file provenance comments are retained.
+
+2. This project contains material from workbuddy2api-panel:
+   https://github.com/yreidev/workbuddy2api-panel
+   Reference revision: 39049fcc479c1240d0d80d0404e0308f651424de.
+   This includes the ClientHello sample in
+   internal/upstream/testdata/workbuddy_clienthello.hex. Protocol research and
+   implementation ideas from that project are also acknowledged in README.md.
+   Copyright (c) 2026 yreidev and that project's contributors.
+   Its original NOTICE, including upstream MIT notices and its Section 7 terms,
+   is retained verbatim in LICENSES/yreidev-NOTICE.txt. Those terms apply to
+   material to which that upstream grant applies, not to unrelated dependencies.
+
+3. Responses event sequencing includes adaptations acknowledged in
+   internal/server/handler.go from CallOrRet/responses-proxy:
+   https://github.com/CallOrRet/responses-proxy (author: CallOrRet).
+   Those adaptations are modified Go implementations, not the original Rust
+   release. Its Apache-2.0 license is retained in
+   LICENSES/responses-proxy-Apache-2.0.txt.
+
+4. Go and JavaScript dependencies retain their own licenses. Release preparation
+   generates LICENSES/dependencies.txt from the exact installed dependencies,
+   preserving their license/notice texts and package versions. The corresponding
+   source archive includes Go vendor sources and the frontend source and lockfile.
+
+Network users and binary recipients
+-----------------------------------
+The public /legal page supplies this notice, license texts, and a download of
+the corresponding source archive. API responses advertise /legal using a Link
+header. The release source archive must match the running binary, including
+local changes, and must include the source, dependency notices, and necessary
+build/install scripts. Never substitute a moving branch link for missing source.
+Do not include credentials, account files, databases, private logs, or backups.
+
+This program is provided WITHOUT ANY WARRANTY. See LICENSE for the full terms.

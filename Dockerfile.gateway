@@ -1,7 +1,11 @@
 # Build handoff-gateway on the tdog host; this image only packages the artifact.
 FROM alpine:3.20
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/gao-gao-zai/wk"
 RUN adduser -D -u 10001 app
 USER app
 WORKDIR /app
 COPY handoff-gateway /app/handoff-gateway
+COPY source.tar.gz LICENSE NOTICE /app/
+COPY LICENSES /app/LICENSES
 ENTRYPOINT ["/app/handoff-gateway"]

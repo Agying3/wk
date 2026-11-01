@@ -1,5 +1,9 @@
 # 构建、部署与运维手册
 
+> **2026-11-01 AGPL 迁移更新：下文旧的容器内编译、临时 rootfs 打包和不带源码的发布示例已经过时，不用于新发行版。** 编译和测试只在 SSH `tdog` 宿主机执行。加载 `/srv/build-server/env/workbuddy2api.sh` 后运行 `bash scripts/build-release.sh /srv/build-server/artifacts/workbuddy2api/<run-id>`，以输出目录作为 Docker 构建上下文。Dockerfile 只复制预编译产物。
+>
+> 发布和升级必须将同次构建的 `source.tar.gz`、`LICENSE`、`NOTICE`、`LICENSES/` 与二进制一起安装，源码归档位于可执行文件旁。反向代理须放行 `/legal` 和 `/legal/*` 给 API 及网页用户。发布前验证 `/legal/source` 返回归档且与发行校验和一致。归档包含 React/Go 源码、锁文件、Go vendor 和构建脚本，不含账号与运行配置。详细说明见 README 的 License 部分。
+
 面向**开发者**的构建与部署流程。面向使用者的快速启动（docker compose）见 [README.md](README.md)。
 
 本文的部署目标是一个**通用的 Linux 服务器**（下文以 `srv` 代指，SSH 别名；实际示例中的 `007` 即此角色）。

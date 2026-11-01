@@ -2,6 +2,8 @@
 
 ## 快速开始
 
+本修改版采用 **AGPL-3.0-only**。基于 / 包含了 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)、[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 和 [workbuddy2api-panel](https://github.com/yreidev/workbuddy2api-panel) 的代码或材料；这是独立维护的修改版，不代表原作者或腾讯官方。版权与第三方授权见 [NOTICE](NOTICE) 和 [LICENSES](LICENSES)。
+
 ### 上游读取兼容
 
 账号能力与认证补充：模型思考档位按区域、UID、企业及账号类型隔离缓存，只在账号选定后应用，未知或过期能力保持透传。OAuth 与短信登录保留上游实际返回的账号类型、OneID、身份提供方、部门和令牌类型；重新登录不沿用旧授权的身份字段，设备档案继续保留。错误对象增加独立业务码，兼容数字及字符串形式，已知错误沿用现有分类，未知码不引入新的换号或冷却规则。
@@ -30,7 +32,7 @@
 
 这是**短时排队的单写交接**。请求必须在客户端、NewAPI、各层反代与 gateway 的共同等待预算内完成；队满或等待到期返回 503。无限长流、数据库重大迁移、宿主机/gateway 自身升级和崩溃恢复不承诺无中断。首次接入入口及首次从不支持本协议的旧版本迁移，需单独安排。
 
-构建与测试按工作区要求在 SSH `tdog` 宿主机执行，先检查连通性，加载 `/srv/build-server/env/workbuddy2api.sh`，使用隔离源码目录。运行镜像只打包宿主机产物：应用用 `Dockerfile.local`，稳定入口用 `Dockerfile.gateway`。不使用主 Dockerfile 的容器内编译路径。
+构建与测试按工作区要求在 SSH `tdog` 宿主机执行，先检查连通性，加载 `/srv/build-server/env/workbuddy2api.sh`，使用隔离源码目录。发布时使用下文「宿主机发布构建与许可打包」的完整流程；运行镜像只打包宿主机产物：应用用 `Dockerfile` / `Dockerfile.local`，稳定入口用 `Dockerfile.gateway`。
 
 宿主机构建命令（在 tdog 项目环境内）：
 
@@ -124,7 +126,7 @@ python3 scripts/seamless-upgrade.py \
 ### 1. 克隆 & 配置
 
 ```bash
-git clone https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/gao-gao-zai/wk.git workbuddy2api
 cd workbuddy2api
 cp config.example.json config.json
 # 编辑 config.json，把 api_key 改成一个你自己生成的强随机值
@@ -132,7 +134,7 @@ cp config.example.json config.json
 ```
 
 > `config.example.json` 里是**占位符**，服务会拒绝用它们启动。请务必替换成真实值。
-> 也可以完全不写配置文件，直接用环境变量：`WB2A_API_KEY=... docker compose up -d --build`。
+> 程序也支持通过环境变量配置凭据；现有 compose 仍挂载 `config.json`，使用纯环境变量时应相应调整挂载与容器环境。
 
 ### 2. 添加账号
 
@@ -146,7 +148,10 @@ cp config.example.json config.json
 
 ### 3. 启动服务
 
+先按「宿主机发布构建与许可打包」在 tdog 生成完整发行包，将产物复制到部署机器的独立目录，再设置 `WB2A_RELEASE_DIR` 指向该目录。它必须包含 `wb2api`、`login`、`frontend/`、`source.tar.gz`、许可证与 `Dockerfile.local`，不能将源码仓库直接当作镜像构建上下文。
+
 ```bash
+export WB2A_RELEASE_DIR=/absolute/path/to/release
 docker compose up -d --build
 
 # 使用 PostgreSQL（首次使用前请在 .env 里设置 POSTGRES_PASSWORD）
@@ -360,7 +365,7 @@ curl http://localhost:7863/v1/messages \
 
 也可以直接调用登录辅助程序：`./login url global` 获取海外版授权链接，浏览器完成授权后执行 `./login poll global`。中国区仍可使用原来的 `./login url` / `./login poll` 用法。两种区域使用独立的临时 state 文件，交替登录不会互相覆盖。
 
-正常浏览器授权采用产品登录流程：中国区 `platform=workbuddy`，海外版 `platform=workbuddy-ai`；中国区用 `/v2/plugin/account` 读取账号。升级前已经发起的 CLI 授权会话仍可继续完成。辅助程序以 `workbuddy2api-login` 标识自身，不生成设备令牌或官方客户端观测标识。短信直登和自动加号继续使用原有链路。面板仅在明确返回“等待授权”时继续轮询，授权被拒或接口失败会显示错误；错误只包含阶段、HTTP 状态和业务码，不回显凭据或上游响应体。
+正常浏览器授权采用产品登录流程：中国区 `platform=workbuddy`，海外版 `platform=workbuddy-ai`；中国区用 `/v2/plugin/account` 读取账号。升级前已经发起的 CLI 授权会话仍可继续完成。辅助程序按官方后台服务的形状发请求——UA 为 `<应用名>/<版本> <应用名>/<版本> CLI/<cli>`（国内 `WorkBuddy/…`、国际 `workbuddy-ai/…`），带请求框架公共头与 `X-Custom-Channel-Id: unknown`，不发 `Origin`/`Referer`；每次登录生成 `loginSessionId` 与链路头，国内版发起授权另在授权链接上追加 `version`、`traceparent`、`loginSessionId`。`X-Device-Token` 来自腾讯图灵盾原生 SDK（只有 macOS/Windows 实现），网关做不出来，不伪造。短信直登和自动加号继续使用原有链路，仍是旧形状。面板仅在明确返回“等待授权”时继续轮询，授权被拒或接口失败会显示错误；错误只包含阶段、HTTP 状态和业务码，不回显凭据或上游响应体。
 
 **注意**：`cooldown.hard_credit` / `cooldown.err_threshold` / `cooldown.err_cooldown` 三个历史键已退役。硬冷却固定为**次日 04:00**（本地时区，`CooldownUntilTomorrow4AM`），连续错误语义并入熔断器（`pool.breaker_threshold` 触发指数退避）。旧配置中的这些键因 JSON 未知字段被自然忽略，不报错。
 
@@ -647,7 +652,7 @@ Tokens prefixed with @ are paths the user explicitly referenced. Relative paths 
 
 | 脚本 | 用途 |
 |---|---|
-| `./login.sh` | OAuth 登录，落盘 auth 文件 |
+| `./login.sh` | OAuth 登录，落盘 auth 文件（落盘交给 `./login save`：已有账号沿用设备档案，新账号建 Mac 档案） |
 | `./credit.sh` | 积分日报（美化输出） |
 | `./credit.sh -json` | 积分原始 JSON |
 | `./signin.sh` | 批量签到（遍历 auths/ 下所有账号） |
@@ -772,6 +777,8 @@ ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
 
 ### 测试
 
+以下命令在 SSH `tdog` 的隔离源码目录、加载项目环境后执行；发行包使用 `scripts/build-release.sh`，不以单独编译代替源码及许可打包。
+
 ```bash
 go build ./...
 go test ./... -count=20  # 20 次全绿（无 flake）
@@ -797,11 +804,36 @@ internal/
 
 ## 免责声明
 
-本项目仅供学习和研究使用。使用者需遵守 WorkBuddy / CodeBuddy 的服务条款，自行承担使用风险。作者不对任何因使用本项目产生的直接或间接损失负责。
+本项目按下述开源许可提供。使用者需遵守 WorkBuddy / CodeBuddy 的服务条款，自行承担使用风险。作者不对任何因使用本项目产生的直接或间接损失负责。
 
 ## License
 
-MIT
+**GNU Affero General Public License v3.0 only (`AGPL-3.0-only`)**，完整文本见 [LICENSE](LICENSE)。本项目从 2026-11-01 本次迁移起按此许可提供自有新增内容及组合修改版；此前已合法取得的 MIT 授权继续有效。第三方原有版权与许可保留，不将第三方内容统一改署本项目版权。
+
+本许可允许商业使用。分发程序或修改版时须满足对应源码等义务；修改版通过网络向用户提供服务时，须按 AGPL 第 13 条向这些用户显著提供该版本的完整对应源码，不收取源码获取费用。不能以「仅供学习」「禁止商用」等文字增加与 AGPL 冲突的许可限制。上方使用提示和免责声明不改变 LICENSE 授予的权利。
+
+### 网络用户取得对应源码
+
+- 无需管理员登录即可访问 `/legal`（法律声明）、`/legal/license`（许可证）、`/legal/notice`（版权与来源）、`/legal/third-party`（第三方许可）及 `/legal/source`（对应源码归档）。API 响应中的 `Link` 头指向许可证和法律声明；管理界面与解锁窗口均提供入口。反向代理须允许所有远程使用者访问这些路径，不能仅将 `/v1/*` 暴露给 API 用户。
+- 将同一次构建的 `source.tar.gz` 安装在服务端可执行文件旁边。服务只读取这一个固定归档，不扫描运行目录、不即时打包账号或配置。缺失时 `/legal/source` 明确返回 503；这表示部署尚未配齐源码，仓库主页或不断变化的 `main` 分支不能代替它。
+- 对应源码包含本次实际工作树（含未提交源码）、Go vendor 源码及许可、React 源码与锁文件、npm 生产依赖、构建与安装脚本、文件哈希清单。压缩后的 `frontend/` 不能代替 React 源码。归档不包含凭据、账号池、真实配置、数据库、日志、备份或 `.git`；新增源码文件仍须检查是否含秘密。
+
+### 宿主机发布构建与许可打包
+
+构建和验证继续只在 SSH `tdog` 宿主机执行，先检查连通性并显式加载项目环境。使用隔离源码目录，保留当前工作树的全部必要源码。源码快照没有 `.git` 时，提供由本地 `git ls-files --cached --others --exclude-standard` 生成并经过筛选的文件清单，通过 `SOURCE_FILES_MANIFEST` 指定；从发行源码归档重建时自动使用归档中的 `SOURCE_FILES.txt`。
+
+```bash
+source /srv/build-server/env/workbuddy2api.sh
+bash scripts/build-release.sh /srv/build-server/artifacts/workbuddy2api/<run-id>
+```
+
+脚本按锁文件恢复前端依赖并构建，收集确切依赖版本的许可文本，生成 Go vendor 与 `source.tar.gz`，再构建 server/login/handoff-gateway。缺少依赖许可文本时停止，先核查该依赖再补齐，不静默跳过。输出包含许可证、来源声明、第三方许可、源码、二进制、前端和 SHA256SUMS；测试在发布前单独执行。
+
+GitHub 的验证工作流改为手动触发，并要求配置标记为 `self-hosted, tdog` 的构建机 runner；未配置 runner 时使用上述 SSH 流程，不在 GitHub 托管机器编译。
+
+Docker 仅打包宿主机产物：以输出目录作为构建上下文，使用 `Dockerfile.local` 或 `Dockerfile.gateway`。主 `Dockerfile` 同样改为宿主机产物打包入口，不再在容器内编译。源码归档与二进制必须配套分发和升级；反向代理切换程序时也要同步切换对应归档。手动 `go build` 不会自动生成发布源码，不能直接当作完整发行包。
+
+Go/JavaScript 依赖各按其许可使用，完整文本由发布脚本写入 `LICENSES/dependencies.txt`，并随源码、镜像和 `/legal/third-party` 提供。上游 MIT 文本及 yreidev 的原始 NOTICE 分别保存在 `LICENSES/upstream-MIT.txt`、`LICENSES/yreidev-NOTICE.txt`；其适用材料的署名等要求继续保留。
 
 
 ### 接码平台与任务选择

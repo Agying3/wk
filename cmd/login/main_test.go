@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"workbuddy2api/internal/auth"
@@ -44,11 +48,27 @@ func TestResolveLoginRegion(t *testing.T) {
 }
 
 func TestCommonHeadersUseRegion(t *testing.T) {
-	cfg := loginRegion{Origin: "https://www.workbuddy.ai"}
+	cfg := loginRegion{Name: "global", Origin: "https://www.workbuddy.ai"}
 	req := httptest.NewRequest(http.MethodGet, "https://example.test", nil)
 	commonHeaders(req, cfg)
-	if req.Header.Get("Origin") != "" || req.Header.Get("Referer") != "" || req.Header.Get("User-Agent") != "workbuddy2api-login" {
-		t.Fatalf("headers=%v", req.Header)
+	// 官方后台服务的这两类登录请求不发 Origin/Referer，UA 是后台服务形状。
+	if req.Header.Get("Origin") != "" || req.Header.Get("Referer") != "" {
+		t.Fatalf("login must not send browser provenance headers: %v", req.Header)
+	}
+	if got, want := req.Header.Get("User-Agent"), cfg.userAgent(); got != want {
+		t.Fatalf("ua=%q want %q", got, want)
+	}
+	if !strings.HasPrefix(req.Header.Get("User-Agent"), "workbuddy-ai/") || !strings.Contains(req.Header.Get("User-Agent"), " CLI/") {
+		t.Fatalf("ua shape=%q", req.Header.Get("User-Agent"))
+	}
+	if req.Header.Get("X-Requested-With") != "XMLHttpRequest" || req.Header.Get("X-Product") != "SaaS" {
+		t.Fatalf("framework headers=%v", req.Header)
+	}
+	if id := req.Header.Get("X-Request-ID"); len(id) != 32 || strings.Contains(id, "-") {
+		t.Fatalf("request id=%q", id)
+	}
+	if req.Header.Get("Accept-Encoding") != loginAcceptEncoding {
+		t.Fatalf("encoding=%q", req.Header.Get("Accept-Encoding"))
 	}
 }
 
@@ -97,11 +117,18 @@ func TestDesktopLoginLifecycle(t *testing.T) {
 	for _, region := range []string{"cn", "global"} {
 		t.Run(region, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "state.json")
+			var cfg loginRegion
 			var requests []string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				requests = append(requests, r.URL.Path)
-				if r.Header.Get("User-Agent") != clientUA || r.Header.Get("Origin") != "" || r.Header.Get("Referer") != "" || r.Header.Get("X-Refresh-Token") != "" {
+				if r.Header.Get("User-Agent") != cfg.userAgent() || r.Header.Get("Origin") != "" || r.Header.Get("Referer") != "" || r.Header.Get("X-Refresh-Token") != "" {
 					t.Error("unexpected login request headers")
+				}
+				if r.Header.Get("X-Requested-With") != "XMLHttpRequest" || r.Header.Get("X-Product") != "SaaS" || len(r.Header.Get("X-Request-ID")) != 32 {
+					t.Errorf("framework headers missing: %v", r.Header)
+				}
+				if r.Header.Get("traceparent") == "" {
+					t.Error("login request lost its trace context")
 				}
 				w.Header().Set("Content-Type", "application/json")
 				switch r.URL.Path {
@@ -112,6 +139,16 @@ func TestDesktopLoginLifecycle(t *testing.T) {
 					}
 					if r.Method != "POST" || r.URL.Query().Get("platform") != platform || r.Header.Get("X-Domain") != "login.example.test" {
 						t.Error("incorrect authorization request")
+					}
+					if r.Header.Get("X-Custom-Channel-Id") != "unknown" {
+						t.Error("authorization request lost its custom channel id")
+					}
+					// 国内版发起授权带根 span 的头；国际版官方不发这几个头。
+					if region == "cn" && r.Header.Get("X-Trace-ID") == "" {
+						t.Error("CN authorization should carry the root span")
+					}
+					if region == "global" && r.Header.Get("X-Trace-ID") != "" {
+						t.Error("global authorization must not send root span headers")
 					}
 					for _, key := range []string{"X-No-Authorization", "X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
 						if r.Header.Get(key) != "true" {
@@ -152,14 +189,31 @@ func TestDesktopLoginLifecycle(t *testing.T) {
 				}
 			}))
 			defer srv.Close()
-			cfg := loginRegion{Name: region, BaseURL: srv.URL, Origin: "https://login.example.test", StateFile: path}
+			cfg = loginRegion{Name: region, BaseURL: srv.URL, Origin: "https://login.example.test", StateFile: path}
 			gotURL, err := startLogin(srv.Client(), cfg)
-			if err != nil || gotURL != "https://login.example.test/auth?state=s" {
+			if err != nil {
 				t.Fatalf("start: %v", err)
+			}
+			loginURL, err := url.Parse(gotURL)
+			if err != nil || loginURL.Host != "login.example.test" || loginURL.Path != "/auth" || loginURL.Query().Get("state") != "s" {
+				t.Fatalf("start url=%q err=%v", gotURL, err)
+			}
+			if loginURL.Query().Get("version") != cfg.clientVersion() {
+				t.Fatalf("authorization url lost client version: %q", gotURL)
+			}
+			if region == "cn" {
+				if loginURL.Query().Get("loginSessionId") == "" || loginURL.Query().Get("traceparent") == "" || loginURL.Query().Get("login_owner_id") == "" {
+					t.Fatalf("CN authorization url lost login observation: %q", gotURL)
+				}
+			} else if loginURL.Query().Get("loginSessionId") != "" || loginURL.Query().Get("traceparent") != "" || loginURL.Query().Get("login_owner_id") != "" {
+				t.Fatalf("global authorization url must omit login observation: %q", gotURL)
 			}
 			state, _, err := readLoginState(cfg)
 			if err != nil || state.Flow != desktopFlow || state.Region != region {
 				t.Fatalf("state=%+v err=%v", state, err)
+			}
+			if state.LoginSessionID == "" || state.LoginOwnerID == "" || len(state.RootSpanID) != 16 {
+				t.Fatalf("state lost login trace fields: %+v", state)
 			}
 			result, err := pollLogin(srv.Client(), cfg)
 			if err != nil {
@@ -283,5 +337,135 @@ func TestLoginAPIWillNotFollowRedirects(t *testing.T) {
 	_, status, err := doJSON(source.Client(), loginRegion{}, "GET", source.URL, func(r *http.Request) { r.Header.Set("Authorization", "Bearer test-at") }, nil)
 	if err == nil || status != 307 || redirected {
 		t.Fatalf("status=%d redirected=%v err=%v", status, redirected, err)
+	}
+}
+
+// 我们显式声明了 Accept-Encoding，Go 不再自动解压，所以压缩响应必须自己解开。
+func TestLoginDecodesCompressedResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept-Encoding") != loginAcceptEncoding {
+			t.Errorf("encoding=%q", r.Header.Get("Accept-Encoding"))
+		}
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write([]byte(`{"code":0,"data":{"uid":"u-zip"}}`)); err != nil {
+			t.Error(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Error(err)
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+	data, status, err := doJSON(srv.Client(), loginRegion{}, http.MethodGet, srv.URL, nil, nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if !strings.Contains(string(data), `"u-zip"`) {
+		t.Fatalf("data=%s", data)
+	}
+}
+
+func TestLoginUserAgentFollowsRegionAndEnv(t *testing.T) {
+	cn, global := loginRegion{Name: "cn"}, loginRegion{Name: "global"}
+	if ua := cn.userAgent(); !strings.HasPrefix(ua, "WorkBuddy/") || !strings.Contains(ua, " CLI/") {
+		t.Fatalf("cn ua=%q", ua)
+	}
+	// 国际版后台服务的两段都是应用名 workbuddy-ai。
+	if ua := global.userAgent(); !strings.HasPrefix(ua, "workbuddy-ai/") || strings.Contains(ua, "WorkBuddy/") {
+		t.Fatalf("global ua=%q", ua)
+	}
+	t.Setenv("WB2A_CLIENT_VERSION_CN", "9.9.9")
+	t.Setenv("WB2A_CLI_VERSION", "1.2.3")
+	if ua := cn.userAgent(); ua != "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/1.2.3" {
+		t.Fatalf("env override ua=%q", ua)
+	}
+}
+
+// 每次登录一条根 span：登录各请求都带同一组根 span 头，traceparent 是每类请求
+// 自己的子 span（与根 span 不同、彼此不同），打开授权页另有自己的子 span。
+func TestLoginTraceRootAndChildSpans(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	type seen struct {
+		path string
+		h    http.Header
+	}
+	var mu sync.Mutex
+	var reqs []seen
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reqs = append(reqs, seen{r.URL.Path, r.Header.Clone()})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v2/plugin/auth/state":
+			io.WriteString(w, `{"code":0,"data":{"state":"s","authUrl":"https://login.example.test/auth"}}`)
+		case "/v2/plugin/auth/token":
+			io.WriteString(w, `{"code":0,"data":{"accessToken":"at","domain":"www.codebuddy.cn"}}`)
+		default:
+			io.WriteString(w, `{"code":0,"data":{"uid":"u1"}}`)
+		}
+	}))
+	defer srv.Close()
+	cfg := loginRegion{Name: "cn", BaseURL: srv.URL, Origin: "https://login.example.test", StateFile: statePath}
+	authURL, err := startLogin(srv.Client(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := readLoginState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pollLogin(srv.Client(), cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	traceID := strings.ReplaceAll(state.LoginSessionID, "-", "")
+	headers := map[string]http.Header{}
+	mu.Lock()
+	for _, s := range reqs {
+		headers[s.path] = s.h
+	}
+	mu.Unlock()
+	// 根 span 的头在每类登录请求上都是同一组，父 span 为空。
+	for _, path := range []string{"/v2/plugin/auth/state", "/v2/plugin/auth/token", "/v2/plugin/account"} {
+		h := headers[path]
+		if h == nil {
+			t.Fatalf("missing request %s", path)
+		}
+		if h.Get("X-Trace-ID") != traceID || h.Get("X-B3-SpanId") != state.RootSpanID {
+			t.Errorf("%s root span=%q/%q", path, h.Get("X-Trace-ID"), h.Get("X-B3-SpanId"))
+		}
+		if h.Get("b3") != traceID+"-"+state.RootSpanID+"-1-" || h.Get("X-B3-ParentSpanId") != "" || h.Get("X-B3-Sampled") != "1" {
+			t.Errorf("%s b3 headers=%v", path, h)
+		}
+	}
+	child := func(path string) string {
+		parts := strings.Split(headers[path].Get("traceparent"), "-")
+		if len(parts) != 4 || parts[0] != "00" || parts[1] != traceID || parts[3] != "01" {
+			t.Fatalf("%s traceparent=%q", path, headers[path].Get("traceparent"))
+		}
+		return parts[2]
+	}
+	authSpan, tokenSpan, accountSpan := child("/v2/plugin/auth/state"), child("/v2/plugin/auth/token"), child("/v2/plugin/account")
+	if authSpan == tokenSpan || tokenSpan == accountSpan || authSpan == accountSpan {
+		t.Fatalf("child spans not distinct: %s %s %s", authSpan, tokenSpan, accountSpan)
+	}
+	if authSpan == state.RootSpanID || tokenSpan == state.RootSpanID || accountSpan == state.RootSpanID {
+		t.Fatal("traceparent reused the root span")
+	}
+	// 打开授权页是另一类请求，用自己的子 span，且不等于发起授权的子 span。
+	parsed, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageParts := strings.Split(parsed.Query().Get("traceparent"), "-")
+	if len(pageParts) != 4 || pageParts[0] != "00" || pageParts[1] != traceID || pageParts[3] != "01" {
+		t.Fatalf("auth page traceparent=%q", parsed.Query().Get("traceparent"))
+	}
+	if pageParts[2] == authSpan || pageParts[2] == state.RootSpanID {
+		t.Fatalf("auth page reused another span: %q", pageParts[2])
 	}
 }

@@ -145,27 +145,29 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 		return 0, 0, err
 	}
 	creds := a.Snapshot()
-	// Web 端请求头形状（对照浏览器实际请求）：Origin/Referer 指向 workbuddy.cn 成长中心，
-	// 带 x-client-platform: web 标记来源端。
+	// Web 端请求头形状（见 web_headers.go）：网页靠 Cookie 认人，这里的 Bearer 只用于
+	// 退回 bearer 鉴权的情况。企业号只带 X-Enterprise-Id。
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "https://www.workbuddy.cn")
-	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
-	req.Header.Set("x-client-platform", "web")
-	req.Header.Set("User-Agent", clientUA)
 	if c.desktopHeaders() {
-		req.Header.Set("User-Agent", browserUserAgent(a))
-	}
-	if creds.UID != "" {
-		req.Header.Set("X-User-Id", creds.UID)
-	}
-	if creds.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", creds.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", creds.EnterpriseID)
-	}
-	if creds.Domain != "" {
-		req.Header.Set("X-Domain", creds.Domain)
+		c.applyWebHeaders(req, a, req.URL.Path, "")
+	} else {
+		// 旧兼容实现保持历史形状，不随本次对齐改动。
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "https://www.workbuddy.cn")
+		req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
+		req.Header.Set("x-client-platform", "web")
+		req.Header.Set("User-Agent", clientUA)
+		if creds.UID != "" {
+			req.Header.Set("X-User-Id", creds.UID)
+		}
+		if creds.EnterpriseID != "" {
+			req.Header.Set("X-Enterprise-Id", creds.EnterpriseID)
+			req.Header.Set("X-Tenant-Id", creds.EnterpriseID)
+		}
+		if creds.Domain != "" {
+			req.Header.Set("X-Domain", creds.Domain)
+		}
 	}
 
 	data, err := c.doJSON(req, a)

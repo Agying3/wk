@@ -17,8 +17,10 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -27,9 +29,26 @@ import (
 
 const schoolBase = "/portal/activity/school"
 
-// schoolJSON 学院活动 API 请求（billing 域 + BillingHeaders，剥信封）。
+// schoolJSON 学院活动 API 请求（billing 域 + 小程序请求类别，剥信封）。
+// 开学季只在小程序 web-view 里跑，所以用小程序那组的 UA 与头，而不是请求框架的。
 func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]any, out any) error {
-	data, err := c.billingJSON(a, method, schoolBase+path, body)
+	var rdr io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rdr = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, c.billingBase(a)+schoolBase+path, rdr)
+	if err != nil {
+		return err
+	}
+	c.applyMPHeaders(req, a, schoolBase+path)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return err
 	}
@@ -116,9 +135,10 @@ func (c *Client) SchoolDraw(a *auth.Auth) (string, error) {
 // + 小程序指纹（appservice wQ()+Ao() 对齐，panel 逆向）。
 
 // mpEventBase 小程序埋点公共指纹。
+// 平台字段必须与请求头一致：小程序 web-view 是 iPhone 微信，所以 os/osVersion/arch
+// 报 iOS 的值，不能一边发 iPhone UA 一边在正文里写 windows/x64。
 func mpEventBase(a *auth.Auth) map[string]any {
 	creds := a.Snapshot()
-	device := deviceProfileForUID(creds.UID)
 	return map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
 		"ideType":      "WorkBuddy_MP",
@@ -128,9 +148,9 @@ func mpEventBase(a *auth.Auth) map[string]any {
 		"product":      "SaaS",
 		"ideName":      "wx_app_cloud",
 		"platform":     "mini_program",
-		"os":           "windows",
-		"osVersion":    device.windowsMajor(),
-		"arch":         "x64",
+		"os":           "ios",
+		"osVersion":    mpIOSVersion,
+		"arch":         "arm64",
 		"machineId":    deriveID(a, "mpmachine"),
 		"timezone":     "Asia/Shanghai",
 		"userId":       creds.UID,
@@ -148,8 +168,18 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	for _, ev := range events {
 		arr = append(arr, mergeReportEvent(base, ev))
 	}
-	// billingJSON 对任意 body 原样序列化（含顶层数组）。
-	_, err := c.billingJSON(a, http.MethodPost, "/v2/report", arr)
+	// 小程序通道：平台标 miniprogram、Bearer 认人、iOS WebKit 的编码组。
+	raw, err := json.Marshal(arr)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.billingBase(a)+reportPath, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	c.applyMPHeaders(req, a, reportPath)
+	req.Header.Set("Content-Type", "application/json")
+	_, err = c.doJSON(req, a)
 	return err
 }
 

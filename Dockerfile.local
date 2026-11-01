@@ -1,10 +1,14 @@
 FROM alpine:3.20
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/gao-gao-zai/wk"
 RUN apk add --no-cache wget ca-certificates tzdata && adduser -D -u 10001 app && mkdir -p /app/auths /app/data && chown -R app:app /app
 ENV WB2A_LISTEN=:7863
 WORKDIR /app
 COPY wb2api /app/wb2api
 COPY login /app/login
 COPY frontend /app/frontend
+COPY source.tar.gz LICENSE NOTICE /app/
+COPY LICENSES /app/LICENSES
 RUN chmod 755 /app/frontend /app/frontend/assets && chmod 644 /app/frontend/index.html /app/frontend/assets/*
 USER app
 # 不预置 config.json（同 Dockerfile）：缺配置时走 env，占位符会被拒绝启动。

@@ -29,10 +29,14 @@ func TestClientHeaderProfiles(t *testing.T) {
 			if region == "global" && req.Header.Get("X-Domain") != "www.workbuddy.ai" {
 				t.Fatal("global chat domain")
 			}
-			for _, key := range []string{"Origin", "Referer", "X-CodeBuddy-Request", "X-Machine-ID", "X-Session-ID", "X-Refresh-Token", "Accept-Encoding", "X-Stainless-OS"} {
+			for _, key := range []string{"Origin", "Referer", "X-CodeBuddy-Request", "X-Machine-ID", "X-Session-ID", "X-Refresh-Token", "X-Stainless-OS"} {
 				if req.Header.Get(key) != "" {
 					t.Errorf("unexpected %s", key)
 				}
+			}
+			// 请求框架（axios）那组声明，按请求类别给，不再由 doUpstream 统一补。
+			if got := req.Header.Get("Accept-Encoding"); got != acceptEncodingAxios {
+				t.Errorf("chat encoding=%q want %q", got, acceptEncodingAxios)
 			}
 			firstID := req.Header.Get("X-Request-ID")
 			refresh, _ := http.NewRequest("POST", "https://example.test/v2/plugin/auth/token/refresh", strings.NewReader("{}"))

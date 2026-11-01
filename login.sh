@@ -142,27 +142,15 @@ else
     echo "新账号（uid=$USER_ID），新增 auth 文件"
     ACTION="新增"
 fi
-WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" WB2A_LOGIN_USER_ID="$USER_ID" WB2A_LOGIN_ENT_ID="$ENT_ID" WB2A_LOGIN_NICKNAME="$NICKNAME" WB2A_LOGIN_TOKEN="$TOKEN" WB2A_LOGIN_REFRESH="$REFRESH" WB2A_LOGIN_EXPIRES_AT="$EXPIRES_AT" WB2A_LOGIN_DOMAIN="$DOMAIN" python3 - <<'PYEOF'
-import json, os
-
-auth = {
-    "account": {
-        "uid": os.environ["WB2A_LOGIN_USER_ID"],
-        "enterpriseId": os.environ.get("WB2A_LOGIN_ENT_ID", ""),
-        "nickname": os.environ.get("WB2A_LOGIN_NICKNAME", "")
-    },
-    "auth": {
-        "accessToken": os.environ["WB2A_LOGIN_TOKEN"],
-        "refreshToken": os.environ.get("WB2A_LOGIN_REFRESH", ""),
-        "expiresAt": int(os.environ["WB2A_LOGIN_EXPIRES_AT"]),
-        "domain": os.environ.get("WB2A_LOGIN_DOMAIN", "")
-    }
-}
-with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
-    json.dump(auth, f, indent=1)
-PYEOF
-chmod 600 "$AUTH_FILE"
-echo "已保存（$ACTION）: $AUTH_FILE"
+# 落盘交给 `login save`：已有账号沿用磁盘上的 _device_identity / _device_profile
+# 与授权元数据，新账号建立 Mac 档案，写入按 0600 原子替换。不要在 shell 里重新
+# 构造整个文件——那会把既有设备档案丢掉（旧实现只写 account/auth 两个键）。
+if printf '%s' "$RESULT" | WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" "$LOGIN_BIN" save "$REGION"; then
+    echo "已保存（$ACTION）: $AUTH_FILE"
+else
+    echo "保存凭证失败，未覆盖原文件: $AUTH_FILE" >&2
+    exit 1
+fi
 
 # Dockerfile 以 UID/GID 10001 运行服务。脚本常由 root 执行时，修正新文件
 # 的所有权，否则容器会因 600 权限无法读取海外或中国区凭证。

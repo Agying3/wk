@@ -71,7 +71,7 @@
 
 - `cmd/login/main.go`：新授权按国内/国际区域使用产品授权平台；国内读取 `/v2/plugin/account`，国际保留对应 state 账号读取，并执行有时限的可选账号快照读取。
 - 新 state 保存 `flow=desktop`。升级前没有 flow 的 state 继续使用原 CLI 请求及账号读取方式，不强迫重新开始。
-- 新登录辅助程序 UA 明确为 `workbuddy2api-login`，没有复制官方客户端 UA 或生成官方登录观测标识。
+- 新登录辅助程序**当时**自报 `workbuddy2api-login`；2026-11-01 已按官方后台服务形状对齐（UA、请求框架头、登录观测链路头），见第 11 节。
 - API 请求不自动跟随重定向；错误不回显上游响应体、授权 URL、令牌或任意上游消息。
 - `internal/auth/login_failure.go` 定义辅助程序与服务端之间的非敏感错误格式。
 - 只有获取令牌阶段明确返回等待授权码时，才作为待授权结果；其他错误保留失败阶段、HTTP 状态及业务码。
@@ -91,9 +91,9 @@
 
 | 类别 | 本项目当前情况 | 参考项目固定版本的情况 |
 | --- | --- | --- |
-| 扫码登录身份 | 自报第三方程序身份；只迁移授权协议 | 模拟更多官方客户端身份及登录观测字段 |
-| 网页请求 | Cookie 隔离已完成；浏览器元数据头较少，来源页面基本固定 | 区分业务来源页面，并补充更多浏览器元数据；其中部分字段作者注明未抓包确认 |
-| 压缩协商 | 主服务通常统一声明已实现的压缩能力 | 按不同请求客户端类别分别声明 |
+| 扫码登录身份 | 2026-11-01 起按官方后台服务形状发（UA、框架头、登录观测）；`X-Device-Token` 仍缺 | 模拟更多官方客户端身份及登录观测字段 |
+| 网页请求 | 2026-11-01 起按业务分来源页并补浏览器元数据头；`Sec-CH-UA` 为推算值 | 区分业务来源页面，并补充更多浏览器元数据；其中部分字段作者注明未抓包确认 |
+| 压缩协商 | 2026-11-01 起按请求类别分别声明，并支持 `compress` 解码 | 按不同请求客户端类别分别声明 |
 | 构建信息上报 | 现代模式省略尚未核实的构建哈希和日期 | 填写其研究提取的构建信息 |
 | 设备档案 | 保留旧 Windows，新账号持久 Mac 档案，允许硬件组合重复 | 统一选择一套 Mac 硬件配置，标识按账号固定 |
 | 兼容事件 | 部分未真实执行任务仍有历史兼容事件和固定数值 | 不能据其说明假定所有事件都来自真实动作；要逐个验证 |
@@ -151,7 +151,7 @@ frontend.tar.gz   fe6e583d0e5891248d88a451c51c80cca6475c87eda8548d4a72b002026fc2
 
 ### P0：审计独立 `login.sh` 的凭据保存一致性
 
-这是编写本文时的静态检查发现，尚未修改或执行脚本：
+这是编写本文时的静态检查发现，**已于 2026-11-01 晚按第 161 行的验收要求修复**（见第 11.6 节第 1 条）：落盘改走 `login save`，设备档案与授权元数据由 Go 侧沿用，并有隔离联调记录。以下保留当时的原始记录：
 
 - `login.sh` 目前重新构造只含 `auth` 和 `account` 的文档，然后覆盖原授权文件。
 - 该路径可能丢失既有 `_device_identity`、`_device_profile`，也未完整保存辅助程序返回的授权元数据。
@@ -213,11 +213,84 @@ frontend.tar.gz   fe6e583d0e5891248d88a451c51c80cca6475c87eda8548d4a72b002026fc2
 6. 不上传真实凭据、运行配置、账号池、数据库、备份或登录态；测试使用假凭据和本地桩。
 7. 最近检查 tdog 根分区只剩约 600 MB，构建完成后情况可能变化。接手先看磁盘，不删除其他任务、项目缓存或历史产物来腾空间。
 8. 前端源码有改动时，在 tdog 构建并回传对应产物；不留下源码已改但嵌入资源未更新的提交。
-9. 不为验证登录协议而擅自操作真实账号，不启动短信、签到、成长任务或测速流量。需要真实联调时，明确账号范围、实际请求及副作用，再与用户确认本次操作范围。
-10. 不在交接、日志或命令输出中包含令牌、Cookie、验证码、原始账号凭据或手机号。构建哈希和源码提交哈希可以记录。
-11. 纯文档变更无需编译测试。新增可复用 `tools/` 脚本需要用户明确要求；临时文件放 `tmp/` 并在使用后清理。
-12. 部署保持暂停；恢复部署须有新的明确请求，并读取 `server-deploy` 技能。生产版本、入口和持久数据都要重新核实，不能凭历史对话猜测。
+9. 不在交接、日志或命令输出中包含令牌、Cookie、验证码、原始账号凭据或手机号。构建哈希和源码提交哈希可以记录。
+10. 纯文档变更无需编译测试。新增可复用 `tools/` 脚本需要用户明确要求；临时文件放 `tmp/` 并在使用后清理。
+11. 部署保持暂停；恢复部署须有新的明确请求，并读取 `server-deploy` 技能。生产版本、入口和持久数据都要重新核实，不能凭历史对话猜测。
 
 ## 10. 给接手 agent 的简短起始任务
 
 > 先核验本地与远端提交以及本文证据。当前已推送 f47422f，正常扫码协议已迁移，短信/自动加号未迁移，生产部署暂停。优先审计 login.sh 是否丢失既有设备与授权元数据，再按用户明确的新请求推进兼容、隐私隔离或真实统计方面的工作。验证只在 tdog 使用隔离源码和本地桩执行。不要把参考项目全部外观差异直接转成待实施任务。
+
+## 11. 2026-11-01 追加：网页请求特征、登录身份与压缩协商
+
+用户明确要求同步这三项。**改动尚未提交、未部署**；仍以 `f47422f` 为已推送基线。
+
+### 11.1 改动
+
+- 新增 `internal/upstream/web_headers.go`：官网网页业务请求、网页顶层导航、网页登录码（Node 内置 fetch）、小程序通道的头集中在这里。
+  - 来源页按业务分：成长中心 `/profile/growth-center`；积分补偿、新手礼包 `/profile/usage`；参数里若出现 trial 走 `/profile`，account 走 `/profile/account-settings`。
+  - 网页业务只带 `X-Enterprise-Id`（企业号）；**不发** `X-User-Id`、`X-Tenant-Id`、`X-Domain`、`X-Product`、`X-Request-ID`、`X-Requested-With`；靠 Cookie 认人，`Authorization` 只用于退回 bearer。
+  - 补浏览器自动头：`Sec-Fetch-Site/Mode/Dest`、`Sec-CH-UA`（按 Chrome 152 推算，未抓包）、`Sec-CH-UA-Mobile/Platform`（平台跟设备档案走）、`Accept-Language`（成长中心接口显式 zh-CN/en-US，其余 Chrome 默认）。
+  - 网页登录码请求改用 undici 形状：`User-Agent: node`、`Accept: */*`、`Accept-Language: *`、`Sec-Fetch-Mode: cors`。此前该请求**没有设 UA**，实际发出的是 `Go-http-client/1.1`。
+  - 小程序通道 `applyMPHeaders`：`X-Client-Platform: miniprogram` + `Bearer`、微信 iOS web-view 的 UA、`Accept-Language: zh-CN`、iOS WebKit 编码组，不带 UA-CH / `Sec-Fetch-*`。用于 `ReportMPEvent` 与开学季接口（`schoolJSON`，此前它们走请求框架那一组）。
+- 压缩协商（`response_encoding.go`）：四组常量（axios / Node fetch / Chrome / iOS WebKit），**四类都已接到具体调用点**：axios = 对话/后台服务/billing/模型目录（`commonHeaders`、`billingHeaders`、`doUpstream` 兜底）；Node fetch = 网页登录码（`applyNodeFetchHeaders`）；Chrome = 网页业务与顶层导航（`applyWebHeaders`、`applyWebNavigationHeaders`）；iOS WebKit = 小程序上报与开学季（`applyMPHeaders`）。新增 `compress` 解码（照 axios 的 zlib.createUnzip，按头部区分 gzip 与 zlib）；`AcceptEncodingAxios` 导出给登录辅助程序共用。
+- 扫码登录身份（`cmd/login/main.go`）：UA 改为后台服务形状 `<应用名>/<版本> <应用名>/<版本> CLI/<cli>`；加 `X-Requested-With`、`X-Request-ID`、`X-Product: SaaS`、发起授权的 `X-Custom-Channel-Id: unknown`；**去掉** `Origin`/`Referer`（官方这两类请求不发）；新增登录观测：`loginSessionId` 存进 state、每次登录一条根 span（`X-Trace-ID`/`b3`/`X-B3-*`）、每类请求一个子 span 的 `traceparent`（由会话 id 派生，多次轮询共用）、授权链接追加 `version`（国内另加 `traceparent`、`loginSessionId`）。国际版发起授权按官方只带 `traceparent`。因为显式声明了 `Accept-Encoding`，`doJSON` 现在自己按 `Content-Encoding` 解码。旧 state 的 CLI 形状（`legacyHeaders`）原样保留。
+- `header_profile=legacy` 的分支一律保持历史形状，不随本次对齐改动。
+
+### 11.2 仍然没同步的（有意）
+
+- `X-Device-Token`：腾讯图灵盾原生 SDK 只有 macOS/Windows 实现，Linux 上做不出真令牌；参考项目同样不做，只在用户填了令牌时才发。不伪造 `X-Device-Token-Error`。
+- 小程序 UA：仍是微信 iOS web-view 形状，但**小程序 appid 未核实**，不带 `miniProgram/<appid>` 段；iOS 与微信版本号是挑选的近期值，未抓包。
+- 事件公共字段的 `commit`/`releaseDate`：桌面模式继续省略（未核实）；legacy 模式的硬编码旧值仍在，属遗留问题。
+- 设备配置：不改存量账号，新账号仍随机 8/16/24 GB。
+
+### 11.3 验证
+
+全部在 tdog 隔离目录执行，源码为上述未提交工作树：
+
+- 路径：`/srv/build-server/sources/workbuddy2api/web-login-sync-20261101-r1/src`
+- 日志：`/srv/build-server/logs/workbuddy2api/web-login-sync-20261101-r1`
+- 产物：`/srv/build-server/artifacts/workbuddy2api/web-login-sync-20261101-r1`
+- 源码树 SHA256：`237352af1ab2a58f2b1ac8a515b79991f418860fbee650e563d726aa646f21a0`
+- `go test ./...` exit 0（26 包）、`go vet ./...` exit 0、`-race`（upstream + cmd/login + server）exit 0、Linux amd64 CGO 关闭的 login 与 server 构建均 exit 0、`bash -n login.sh` exit 0。
+- 产物 SHA256：`login 5253d54b0843113cf3374a88f2d476282e0946d6d2d0b791dc58ba928fdd62d6`、`wb2api a11ad3255f027c53eb741337e2d8c49a69abf7cc271f40cdb885aa3acf9eef11`。
+- 隔离落盘联调（假凭据，只跑 `login save`，不触发签到/重启）：新账号得到 macos 档案且权限 0600；已有 Windows 档案重新登录后逐字段保留；uid 不匹配时拒绝写入且原文件未改。
+- 本地证据副本：`.build-out/web-login-sync-20261101-r1/`。
+- 未执行：前端构建（无前端源码改动）、真实上游请求、登录脚本的签到与容器重启步骤、部署。
+
+### 11.4 验证状态（不要当成已确认可用）
+
+| 项 | 代码 | 单元/桩测试 | 真实上游联调 |
+| --- | --- | --- | --- |
+| 压缩声明与解码（四类） | 已完成 | 已覆盖（含 `compress` 的 gzip/zlib 两种包装） | 未做 |
+| 网页业务头与来源页 | 已完成 | 已覆盖 | 未做 |
+| 网页登录码（undici 形状） | 已完成 | 已覆盖 | 未做 |
+| 小程序通道（编码/平台/UA） | 已完成 | 已覆盖 | 未做 |
+| 扫码登录身份与观测字段 | 已完成 | 已覆盖 | 未做（无真实扫码） |
+| `login.sh` 落盘一致性 | 已完成（改走 `login save`） | 已覆盖 + 隔离 shell 联调 | 未做（真实账号） |
+
+- `Sec-CH-UA`、`Sec-Fetch-*`、子 span 的 `traceparent`、小程序的 iOS/微信版本号：都来自官方代码/规范的推算，**没有抓包或真机对照**。
+- 上游是否接受新形状、登录是否照常完成，只有本地 `httptest` 桩验证，不能据此宣称"已对齐并可用"。
+
+### 11.5 本轮自查修正（2026-11-01 晚）
+
+本节初稿有两处与代码不符，已修正：
+
+1. 声称"四组常量按调用点声明"，实际当时 `acceptEncodingWebKit` 只有定义、没有任何调用点，`ReportMPEvent` 与开学季接口仍走 `billingJSON` 的 axios 组。现已补 `applyMPHeaders` 并接入这两条路径，补了三条测试（单元、上报端到端、开学季 API）。
+2. 本节 11.2 曾写"小程序编码与平台标记已是对的"，实际当时平台标记仍是 `web`、编码是 axios 组；现已改对。
+
+教训：这类"常量定义了但没接线"的缺口，`go test` 和 `go vet` 都不会报（Go 允许未使用的包级常量），只能靠逐条 grep 调用点确认。
+
+### 11.6 第二批修正（2026-11-01 深夜）
+
+用户逐条指出五处缺口，均已修：
+
+1. **独立登录脚本丢设备档案**：`login.sh` 原来用内联 Python 重建只含 `account`/`auth` 的文档后覆盖，会丢 `_device_identity`、`_device_profile`，新账号也不会建 Mac 档案。改为新增 `login save` 子命令（`cmd/login/save.go`）：已有账号沿用磁盘设备与授权元数据、新账号 `device.NewMac()`、写入走 `auth.Auth.SaveAtomic()`（0600 原子替换、空 token 拒绝、uid 不匹配拒绝）。脚本落盘段改为把 poll 结果管道给 `login save`，不再自己拼 JSON。
+2. **网页上报的来源页没贯通 Cookie 路径**：`websiteJSON` 增加 `page` 参数，`applyWebHeaders` 也接受显式来源页；`ReportWebEvent` 在 Cookie 路径与 Bearer 回退路径都用调用方给的 `pageURL`。此前 Cookie 路径被统一改写成成长中心。
+3. **扫码版本配置没贯通**：`loginCommand` 现在把 `WB2A_CLIENT_VERSION_CN`、`WB2A_CLIENT_VERSION_GLOBAL`、`WB2A_CLI_VERSION` 一起传给登录程序，配置里改版本时两处 UA 不再各说各话。
+4. **登录链路字段不完整**：按官方结构改成「每次登录一条根 span + 每类请求一个子 span」——根 span 头（`X-Trace-ID`/`b3`/`X-B3-*`，父 span 为空）每类请求都带，`traceparent` 永远是该类请求自己的子 span；打开授权页单独用 `auth-page` 子 span；补上 `login_owner_id`（每次登录一个 UUID），state 文件存 `login_session_id`/`login_owner_id`/`root_span_id`。
+5. **小程序请求内平台自相矛盾**：请求头是 iPhone 微信 UA，正文却写 `windows`/`x64`。`mpEventBase` 改为 `os: ios`、`osVersion: mpIOSVersion`、`arch: arm64`，与 UA 同源；新增测试断言 UA 与 `mpIOSVersion` 一致、正文与平台一致。这同时废掉了旧测试 `TestAccountDeviceStableAcrossCredentialAndClientChanges` 里"小程序和桌面端 os/arch 相同"的断言——小程序与桌面共用的是账号身份（`machineId`），不是平台字段。
+
+新增/调整的测试：`cmd/login/save_test.go`（保留设备、新账号建 Mac、拒绝不安全覆盖、默认路径）、`TestLoginTraceRootAndChildSpans`（根 span 一致、子 span 互不相同、授权页独立子 span）、`TestWebReportKeepsRealPageOnCookiePath`、`TestMPFingerprintMatchesRuntime`。
+
+仍未做：真实上游联调（含真实扫码）。脚本主体（签到、容器重启）按约定未执行，只做了 `bash -n` 与隔离的 `login save` 联调。

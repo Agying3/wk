@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	project "workbuddy2api"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/cacheroute"
 	"workbuddy2api/internal/collection"
@@ -405,6 +406,9 @@ func NewHandler(cfg Config) *Handler {
 	h.sanitizeHooks.setCodex = cfg.SetCodexCompat
 	h.sanitizeHooks.setDSH = cfg.SetDSHCompat
 	h.featuresMu.Unlock()
+	legal := project.ReleaseLegalHandler()
+	h.mux.Handle("/legal", legal)
+	h.mux.Handle("/legal/", legal)
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.anthropicMessages))
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
@@ -804,6 +808,7 @@ func securityHeaders(h http.Header) {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	securityHeaders(w.Header())
+	w.Header().Add("Link", `</legal/license>; rel="license", </legal>; rel="describedby"`)
 	h.mux.ServeHTTP(w, r)
 }
 
@@ -2948,7 +2953,12 @@ func (h *Handler) loginCommand(ctx context.Context, arg, region string) ([]byte,
 	cmd.Dir = filepath.Dir(h.cfg.ConfigPath)
 	cmd.Env = setCommandEnv(os.Environ(), "WB2A_LOGIN_REGION", region)
 	if up := h.cfg.Upstream; up != nil {
-		for key, value := range map[string]string{"WB2A_ENDPOINT_PROFILE": up.EndpointProfile, "WB2A_CHAT_BASE_CN": up.ChatBaseCN, "WB2A_CHAT_BASE_GLOBAL": up.ChatBaseGlobal, "WB2A_WEB_BASE_CN": up.WebBaseCN, "WB2A_LOGIN_ORIGIN_CN": up.LoginOriginCN} {
+		for key, value := range map[string]string{
+			"WB2A_ENDPOINT_PROFILE": up.EndpointProfile, "WB2A_CHAT_BASE_CN": up.ChatBaseCN, "WB2A_CHAT_BASE_GLOBAL": up.ChatBaseGlobal, "WB2A_WEB_BASE_CN": up.WebBaseCN, "WB2A_LOGIN_ORIGIN_CN": up.LoginOriginCN,
+			// 版本号必须一起传：只改配置里的 client_version 时，扫码程序的 UA
+			// 不能还停在默认值（否则两处报的版本会不一致）。
+			"WB2A_CLIENT_VERSION_CN": up.ClientVersionCN, "WB2A_CLIENT_VERSION_GLOBAL": up.ClientVersionGlobal, "WB2A_CLI_VERSION": up.CLIVersion,
+		} {
 			cmd.Env = setCommandEnv(cmd.Env, key, value)
 		}
 	}

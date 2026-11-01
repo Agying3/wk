@@ -16,12 +16,36 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// Accept-Encoding 按发请求的运行时分别声明。官方在哪个请求上都没有改写这个头：
+// 内置 CLI 与后台服务走 axios（它的 http 适配器补 "gzip, compress, deflate" 加 br，
+// zstd 开关默认关），网页登录码走 Node 内置 fetch（undici 对 https 补
+// "br, gzip, deflate"），官网网页是桌面 Chrome（"gzip, deflate, br, zstd"），
+// 小程序 web-view 是 iOS WebKit（"gzip, deflate, br"）。
+//
+// 声明必须与这里的解码能力一致：解不开的编码不声明，也不要为了像另一个运行时而声明。
+const (
+	acceptEncodingAxios     = "gzip, compress, deflate, br"
+	acceptEncodingNodeFetch = "br, gzip, deflate"
+	acceptEncodingChrome    = "gzip, deflate, br, zstd"
+	acceptEncodingWebKit    = "gzip, deflate, br"
+)
+
+// applyEncoding 显式声明本请求的 Accept-Encoding。doUpstream 只在头为空时补默认值，
+// 所以调用点先设就能按请求类别区分。
+func applyEncoding(req *http.Request, value string) {
+	req.Header.Set("Accept-Encoding", value)
+}
+
+// AcceptEncodingAxios 供独立程序（如登录辅助程序）复用同一组声明，避免各写一份漂移。
+const AcceptEncodingAxios = acceptEncodingAxios
+
 // doUpstream advertises only encodings we can decode. Decode after Do, so the
 // existing account proxy, transport, deadlines and cancellation remain in use.
 func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) {
 	if req.Header.Get("Accept-Encoding") == "" && req.Method != http.MethodHead && req.Header.Get("Range") == "" {
 		req = req.Clone(req.Context())
-		req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+		// 没指定类别的出站请求按 API 请求（axios）声明。
+		req.Header.Set("Accept-Encoding", acceptEncodingAxios)
 	}
 	resp, err := client.Do(req)
 	if err != nil || resp.Body == nil || resp.Uncompressed {
@@ -38,7 +62,7 @@ func doUpstream(client *http.Client, req *http.Request) (*http.Response, error) 
 	}
 	for _, part := range parts {
 		switch strings.TrimSpace(part) {
-		case "gzip", "x-gzip", "deflate", "br", "zstd", "identity":
+		case "gzip", "x-gzip", "compress", "x-compress", "deflate", "br", "zstd", "identity":
 		default:
 			resp.Body.Close()
 			return nil, fmt.Errorf("unsupported response content encoding")
@@ -70,6 +94,20 @@ type decodedBody struct {
 	closeErr  error
 }
 
+// DecodeResponse 按 Content-Encoding 给响应体套上惰性解压，供独立程序（如登录辅助
+// 程序）复用同一套解码规则。不需要解压或不认识的编码返回 ok=false，调用方照用 raw。
+func DecodeResponse(contentEncoding string, raw io.ReadCloser) (io.ReadCloser, bool) {
+	codec := strings.ToLower(strings.TrimSpace(contentEncoding))
+	switch codec {
+	case "", "identity":
+		return raw, false
+	case "gzip", "x-gzip", "compress", "x-compress", "deflate", "br", "zstd":
+		return &decodedBody{raw: raw, codec: codec}, true
+	default:
+		return raw, false
+	}
+}
+
 func (b *decodedBody) Read(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -89,6 +127,24 @@ func (b *decodedBody) open() {
 	switch b.codec {
 	case "gzip", "x-gzip":
 		r, err := gzip.NewReader(b.raw)
+		b.openErr = err
+		if err == nil {
+			b.reader, b.cleanup = r, func() { _ = r.Close() }
+		}
+	case "compress", "x-compress":
+		// axios 解 compress 用的是 zlib.createUnzip：按头部自动分辨 gzip 与 zlib。
+		raw := bufio.NewReader(b.raw)
+		header, err := raw.Peek(2)
+		if err != nil {
+			b.openErr = err
+			return
+		}
+		var r io.ReadCloser
+		if header[0] == 0x1f && header[1] == 0x8b {
+			r, err = gzip.NewReader(raw)
+		} else {
+			r, err = zlib.NewReader(raw)
+		}
 		b.openErr = err
 		if err == nil {
 			b.reader, b.cleanup = r, func() { _ = r.Close() }

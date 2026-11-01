@@ -137,6 +137,9 @@ func (c *Client) openWebsite(ctx context.Context, a *auth.Auth) (websiteSession,
 		return entry, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// 登录码请求由官方后台服务主进程用 Node 内置 fetch 发：账号头照发，其余是
+	// undici 自动补的（UA 是 "node"），不是请求框架那一套。
+	applyNodeFetchHeaders(req)
 	accountHeaders(req, a)
 	req.Header.Set("X-Refresh-Token", s.RefreshToken)
 	client, err := c.proxyClientForContext(ctx, a)
@@ -175,7 +178,7 @@ func (c *Client) openWebsite(ctx context.Context, a *auth.Auth) (websiteSession,
 	if err != nil {
 		return entry, err
 	}
-	nav.Header.Set("User-Agent", browserUserAgent(a))
+	applyWebNavigationHeaders(nav, a)
 	browser := *client
 	browser.Jar = jar
 	browser.CheckRedirect = func(next *http.Request, via []*http.Request) error {
@@ -211,7 +214,7 @@ func (c *Client) openWebsite(ctx context.Context, a *auth.Auth) (websiteSession,
 // handled=false means auto mode established that this API is unavailable,
 // before any business action was sent. Transport/authentication errors never
 // silently select a different authentication scheme.
-func (c *Client) websiteJSON(ctx context.Context, a *auth.Auth, method, path string, body []byte, beacon bool) (json.RawMessage, bool, error) {
+func (c *Client) websiteJSON(ctx context.Context, a *auth.Auth, method, path string, body []byte, beacon bool, page string) (json.RawMessage, bool, error) {
 	if !c.websiteEnabled() {
 		return nil, false, nil
 	}
@@ -245,25 +248,12 @@ func (c *Client) websiteJSON(ctx context.Context, a *auth.Auth, method, path str
 		if err != nil {
 			return nil, true, err
 		}
-		u, _ := url.Parse(c.websiteBase(a))
-		req.Header.Set("Accept", "application/json, text/plain, */*")
+		c.applyWebHeaders(req, a, uri.Path, page)
 		if len(requestBody) != 0 {
 			req.Header.Set("Content-Type", "application/json")
 		}
 		if beacon {
 			req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
-		}
-		req.Header.Set("User-Agent", browserUserAgent(a))
-		req.Header.Set("X-Client-Platform", "web")
-		req.Header.Set("Referer", c.websiteBase(a)+"/profile/growth-center")
-		if method != http.MethodGet && method != http.MethodHead {
-			req.Header.Set("Origin", u.Scheme+"://"+u.Host)
-		}
-		if strings.Contains(path, "/activity/growth/") {
-			req.Header.Set("Accept-Language", "zh-CN")
-		}
-		if id := a.Snapshot().EnterpriseID; id != "" {
-			req.Header.Set("X-Enterprise-Id", id)
 		}
 		client, err := c.proxyClientForContext(ctx, a)
 		if err != nil {

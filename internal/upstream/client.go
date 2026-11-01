@@ -417,7 +417,7 @@ func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error
 		if req.URL.RawQuery != "" {
 			requestURI += "?" + req.URL.RawQuery
 		}
-		if data, handled, err := c.websiteJSON(req.Context(), a, req.Method, requestURI, body, false); handled {
+		if data, handled, err := c.websiteJSON(req.Context(), a, req.Method, requestURI, body, false, ""); handled {
 			return data, err
 		}
 	}

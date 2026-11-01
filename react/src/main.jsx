@@ -1081,6 +1081,7 @@ function Console() {
               })()}
             </Space>
             <Space>
+              <Button href="/legal" target="_blank" rel="noopener noreferrer">许可证与源码</Button>
               <Button aria-label="刷新控制台" icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
               <Button aria-label="设置 API Key" icon={<KeyOutlined />} onClick={() => {
                 // setApiKey 已经足够；不再写 sessionStorage（HIGH-006）。
@@ -1186,6 +1187,7 @@ function Console() {
         </Layout>
         <Modal open={locked} title="控制台验证" onOk={unlock} onCancel={() => {}} okText="解锁" cancelButtonProps={{ style: { display: 'none' } }}>
           <Alert message="请输入管理员密钥（config 里的 api_key）。分组密钥不能解锁控制台。" type="info" showIcon style={{ marginBottom: 14 }} />
+          <Paragraph><a href="/legal" target="_blank" rel="noopener noreferrer">AGPL-3.0-only · 许可证与对应源码</a></Paragraph>
           <Input.Password prefix={<KeyOutlined />} value={apiKey} onChange={event => setApiKey(event.target.value)} onPressEnter={unlock} placeholder="输入管理员密钥" />
         </Modal>
     </Layout>

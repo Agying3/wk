@@ -1,6 +1,8 @@
 services:
   wb2api:
-    build: .
+    build:
+      context: ${WB2A_RELEASE_DIR:?set WB2A_RELEASE_DIR to the complete tdog release artifact directory}
+      dockerfile: Dockerfile.local
     container_name: workbuddy2api
     restart: unless-stopped
     init: true

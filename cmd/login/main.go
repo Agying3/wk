@@ -4,6 +4,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +21,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/endpoints"
+	"workbuddy2api/internal/upstream"
 )
 
 const (
@@ -26,11 +30,15 @@ const (
 	originRefererCN     = endpoints.LegacyBillingCN
 	originRefererGlobal = endpoints.Global
 	legacyClientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
-	clientUA            = "workbuddy2api-login"
 	desktopFlow         = "desktop"
 	legacyStateFile     = "/tmp/wb2api-login-state.json"
 	maxResponseBytes    = 1 << 20
 )
+
+// 登录请求的形状按官方后台服务发：请求框架（axios）的公共头，UA 是
+// <应用名>/<版本> <应用名>/<版本> CLI/<cli>。Accept-Encoding 与 upstream 的
+// axios 组一致，所以响应必须自己按 Content-Encoding 解码。
+const loginAcceptEncoding = upstream.AcceptEncodingAxios
 
 type loginRegion struct {
 	Name          string
@@ -108,11 +116,91 @@ type loginState struct {
 	State  string `json:"state"`
 	Region string `json:"region,omitempty"`
 	Flow   string `json:"flow,omitempty"`
+	// 登录观测：会话 id、授权页的 journey owner id、这条 trace 的根 span。
+	// 同一轮登录的发起授权/轮询/取账号共用它们，命令行 poll 时从 state 文件沿用。
+	LoginSessionID string `json:"login_session_id,omitempty"`
+	LoginOwnerID   string `json:"login_owner_id,omitempty"`
+	RootSpanID     string `json:"root_span_id,omitempty"`
+}
+
+// newSessionID 生成登录观测用的会话 id（UUID v4）。
+func newSessionID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// newRequestID 对应官方请求框架的 X-Request-ID：randomUUID 去掉连字符。
+func newRequestID() string { return strings.ReplaceAll(newSessionID(), "-", "") }
+
+// loginTrace 是一次登录的链路：登录会话 id（trace id 就是它去掉连字符）、授权页的
+// journey owner id（login_owner_id），以及这条 trace 的根 span。每次登录一条根 span，
+// 每类请求（发起授权、轮询令牌、取账号、取账号列表、打开授权页）各一个子 span。
+type loginTrace struct {
+	SessionID string
+	OwnerID   string
+	RootSpan  string
+}
+
+func newLoginTrace() loginTrace {
+	return loginTrace{SessionID: newSessionID(), OwnerID: newSessionID(), RootSpan: newRequestID()[:16]}
+}
+
+// orNew 补齐旧 state 缺的字段：没有会话 id 或根 span 时现生成一条。
+func (t loginTrace) orNew() loginTrace {
+	if strings.TrimSpace(t.SessionID) == "" || len(t.RootSpan) != 16 {
+		return newLoginTrace()
+	}
+	return t
+}
+
+// traceID 是链路 id：登录会话 id 去掉连字符（不是 32 位十六进制时取它的哈希）。
+func (t loginTrace) traceID() string {
+	id := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(t.SessionID), "-", ""))
+	if len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
+		sum := sha256.Sum256([]byte(t.SessionID))
+		id = hex.EncodeToString(sum[:16])
+	}
+	return id
+}
+
+// childSpan 由会话 id 与请求类别派生固定的子 span id，同一类请求的多次轮询共用。
+func (t loginTrace) childSpan(kind string) string {
+	sum := sha256.Sum256([]byte(t.SessionID + "\x00" + kind))
+	return hex.EncodeToString(sum[:8])
+}
+
+// setRoot 设根 span 的链路头。官方登录与刷新都用 traceService 新开的根 span、没有父
+// span，所以 b3 以空的父 span 结尾（…-1-），X-B3-ParentSpanId 是空值。
+func (t loginTrace) setRoot(req *http.Request) {
+	trace := t.traceID()
+	req.Header.Set("X-Trace-ID", trace)
+	req.Header.Set("b3", trace+"-"+t.RootSpan+"-1-")
+	req.Header.Set("X-B3-TraceId", trace)
+	req.Header.Set("X-B3-ParentSpanId", "")
+	req.Header.Set("X-B3-SpanId", t.RootSpan)
+	req.Header.Set("X-B3-Sampled", "1")
+}
+
+// apply 给一类请求加链路头：root 为真时带根 span 的头；traceparent 永远是这类请求
+// 自己的子 span（与根 span 不同），国际版发起授权按官方只发 traceparent。
+func (t loginTrace) apply(req *http.Request, kind string, root bool) {
+	if strings.TrimSpace(t.SessionID) == "" {
+		return
+	}
+	if root {
+		t.setRoot(req)
+	}
+	req.Header.Set("traceparent", "00-"+t.traceID()+"-"+t.childSpan(kind)+"-01")
 }
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fatal("usage: login <url|poll> [cn|global]")
+		fatal("usage: login <url|poll|save> [cn|global]")
 	}
 	regionArg := ""
 	if len(os.Args) == 3 {
@@ -146,8 +234,12 @@ func main() {
 			fatal("encode result failed")
 		}
 		fmt.Println(string(out))
+	case "save":
+		if err := saveLogin(os.Stdin); err != nil {
+			fail(err)
+		}
 	default:
-		fatal("unknown subcommand %q (want url|poll)", os.Args[1])
+		fatal("unknown subcommand %q (want url|poll|save)", os.Args[1])
 	}
 }
 
@@ -166,10 +258,50 @@ func (r loginRegion) loginDomain() string {
 	return r.DefaultDomain
 }
 
+// loginClientSettings 取会话客户端的版本号：默认与服务端一致，可用环境变量覆盖，
+// 以便服务端配置了非默认版本时这里不漂移。
+func loginClientSettings() upstream.ClientSettings {
+	s := upstream.DefaultClientSettings()
+	if v := strings.TrimSpace(os.Getenv("WB2A_CLIENT_VERSION_CN")); v != "" {
+		s.ClientVersionCN = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WB2A_CLIENT_VERSION_GLOBAL")); v != "" {
+		s.ClientVersionGlobal = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WB2A_CLI_VERSION")); v != "" {
+		s.CLIVersion = v
+	}
+	return s
+}
+
+func (r loginRegion) clientVersion() string {
+	s := loginClientSettings()
+	if r.Name == "global" {
+		return s.ClientVersionGlobal
+	}
+	return s.ClientVersionCN
+}
+
+// userAgent 是官方后台服务的 UA 形状：两段应用名都取产品配置的 applicationName，
+// 国内版是 WorkBuddy，国际版是 workbuddy-ai（后台服务没有 CLIENT_INFO_PLATFORM）。
+func (r loginRegion) userAgent() string {
+	name := "WorkBuddy"
+	if r.Name == "global" {
+		name = "workbuddy-ai"
+	}
+	v, cli := r.clientVersion(), loginClientSettings().CLIVersion
+	return name + "/" + v + " " + name + "/" + v + " CLI/" + cli
+}
+
 func startLogin(client *http.Client, cfg loginRegion) (string, error) {
+	trace := newLoginTrace()
+	// 国内版发起授权带根 span 的头；国际版官方把根 span 的头放在请求头之外，实际不发。
+	includeRoot := cfg.Name != "global"
 	data, status, err := doJSON(client, cfg, http.MethodPost, cfg.endpoint("/v2/plugin/auth/state?platform=")+cfg.platform(), func(req *http.Request) {
 		anonymousHeaders(req, cfg)
 		req.Header.Set("X-Domain", cfg.loginDomain())
+		req.Header.Set("X-Custom-Channel-Id", "unknown")
+		trace.apply(req, "authorization", includeRoot)
 	}, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return "", failureAt("authorization", status, err)
@@ -185,7 +317,18 @@ func startLogin(client *http.Client, cfg loginRegion) (string, error) {
 	if err != nil || authorization.Host == "" || authorization.User != nil || (authorization.Scheme != "https" && authorization.Scheme != "http") {
 		return "", &auth.LoginFailure{Stage: "authorization"}
 	}
-	raw, err := json.Marshal(loginState{State: state.State, Region: cfg.Name, Flow: desktopFlow})
+	// 授权页地址按官方追加参数：两个域都加客户端版本；国内版另加登录观测的
+	// traceparent（打开授权页这一步自己的子 span）、loginSessionId、login_owner_id。
+	query := authorization.Query()
+	query.Set("version", cfg.clientVersion())
+	if cfg.Name != "global" {
+		query.Set("traceparent", "00-"+trace.traceID()+"-"+trace.childSpan("auth-page")+"-01")
+		query.Set("loginSessionId", trace.SessionID)
+		query.Set("login_owner_id", trace.OwnerID)
+	}
+	authorization.RawQuery = query.Encode()
+	raw, err := json.Marshal(loginState{State: state.State, Region: cfg.Name, Flow: desktopFlow,
+		LoginSessionID: trace.SessionID, LoginOwnerID: trace.OwnerID, RootSpanID: trace.RootSpan})
 	if err != nil {
 		return "", fmt.Errorf("encode authorization state failed")
 	}
@@ -207,9 +350,11 @@ func pollLogin(client *http.Client, cfg loginRegion) (map[string]any, error) {
 		return nil, &auth.LoginFailure{Stage: "state"}
 	}
 	escapedState := url.QueryEscape(state.State)
+	trace := loginTrace{SessionID: state.LoginSessionID, OwnerID: state.LoginOwnerID, RootSpan: state.RootSpanID}.orNew()
 	requestHeaders := func(req *http.Request) {
 		if state.Flow == desktopFlow {
 			anonymousHeaders(req, cfg)
+			trace.apply(req, "token", true)
 		} else {
 			legacyHeaders(req, cfg)
 		}
@@ -229,20 +374,25 @@ func pollLogin(client *http.Client, cfg loginRegion) (map[string]any, error) {
 		return nil, &auth.LoginFailure{Stage: "token"}
 	}
 
-	headers := func(req *http.Request) {
-		if state.Flow == desktopFlow {
-			commonHeaders(req, cfg)
-			req.Header.Set("X-Domain", firstNonEmpty(token.Domain, cfg.loginDomain()))
-			if cfg.Name == "global" {
-				for _, key := range []string{"X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
-					req.Header.Set(key, "true")
+	// 取账号与取账号列表是两类请求，各有自己的子 span。
+	headersFor := func(kind string) func(*http.Request) {
+		return func(req *http.Request) {
+			if state.Flow == desktopFlow {
+				commonHeaders(req, cfg)
+				req.Header.Set("X-Domain", firstNonEmpty(token.Domain, cfg.loginDomain()))
+				if cfg.Name == "global" {
+					for _, key := range []string{"X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
+						req.Header.Set(key, "true")
+					}
 				}
+				trace.apply(req, kind, true)
+			} else {
+				legacyHeaders(req, cfg)
 			}
-		} else {
-			legacyHeaders(req, cfg)
+			req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 		}
-		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	}
+	headers := headersFor("account")
 	accountPath := "/v2/plugin/login/account?state=" + escapedState
 	if state.Flow == desktopFlow && cfg.Name == "cn" {
 		accountPath = "/v2/plugin/account"
@@ -265,7 +415,7 @@ func pollLogin(client *http.Client, cfg loginRegion) (map[string]any, error) {
 		if snapshotClient.Timeout == 0 || snapshotClient.Timeout > 5*time.Second {
 			snapshotClient.Timeout = 5 * time.Second
 		}
-		_, _, _ = doJSON(&snapshotClient, cfg, http.MethodGet, cfg.endpoint("/v2/plugin/accounts"), headers, nil)
+		_, _, _ = doJSON(&snapshotClient, cfg, http.MethodGet, cfg.endpoint("/v2/plugin/accounts"), headersFor("accounts"), nil)
 	}
 
 	domain := strings.TrimSpace(token.Domain)
@@ -346,8 +496,13 @@ func doJSON(client *http.Client, cfg loginRegion, method, fullURL string, header
 	if err != nil {
 		return nil, 0, fmt.Errorf("upstream connection failed")
 	}
-	defer resp.Body.Close()
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	// 我们显式声明了 Accept-Encoding，Go 不再自动解压，这里按 Content-Encoding 解。
+	responseBody := io.ReadCloser(resp.Body)
+	if decoded, ok := upstream.DecodeResponse(resp.Header.Get("Content-Encoding"), resp.Body); ok {
+		responseBody = decoded
+	}
+	defer responseBody.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(responseBody, maxResponseBytes+1))
 	if readErr != nil {
 		return nil, resp.StatusCode, fmt.Errorf("read upstream response failed")
 	}
@@ -365,12 +520,18 @@ func doJSON(client *http.Client, cfg loginRegion, method, fullURL string, header
 	return envelope.Data, resp.StatusCode, nil
 }
 
+// commonHeaders 是官方请求框架的公共头（axios）：Accept、X-Requested-With、
+// X-Request-ID、X-Product，UA 是后台服务的。官方这两类登录请求不带 Origin/Referer。
 func commonHeaders(req *http.Request, cfg loginRegion) {
 	if req.Body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("X-Request-ID", newRequestID())
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("User-Agent", cfg.userAgent())
+	req.Header.Set("Accept-Encoding", loginAcceptEncoding)
 }
 
 func anonymousHeaders(req *http.Request, cfg loginRegion) {
@@ -380,9 +541,13 @@ func anonymousHeaders(req *http.Request, cfg loginRegion) {
 	}
 }
 
+// legacyHeaders 保留升级前 CLI 形状（旧 state 继续用它完成登录），不随本次对齐改动。
 func legacyHeaders(req *http.Request, cfg loginRegion) {
-	commonHeaders(req, cfg)
+	if req.Body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Origin", cfg.Origin)
 	req.Header.Set("Referer", strings.TrimRight(cfg.Origin, "/")+"/")

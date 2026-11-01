@@ -302,7 +302,9 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
-	if _, handled, err := c.websiteJSON(context.Background(), a, http.MethodPost, "/v2/report", raw, true); handled {
+	// Cookie 路径也要带真实来源页：资料库等事件的 pageURL 不是成长中心，
+	// 之前这一路被 websiteJSON 统一按成长中心生成 Referer。
+	if _, handled, err := c.websiteJSON(context.Background(), a, http.MethodPost, "/v2/report", raw, true, pageURL); handled {
 		return err
 	}
 	req, err := http.NewRequest(http.MethodPost, c.webBase()+"/v2/report", bytes.NewReader(raw))
@@ -310,15 +312,8 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+	c.applyWebHeaders(req, a, "/activity/growth", pageURL)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("x-client-platform", "web")
-	req.Header.Set("Origin", c.webBase())
-	req.Header.Set("Referer", pageURL)
-	req.Header.Set("User-Agent", ua)
-	if creds.UID != "" {
-		req.Header.Set("X-User-Id", creds.UID)
-	}
 	_, err = c.doJSON(req, a)
 	return err
 }

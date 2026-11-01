@@ -1,0 +1,92 @@
+workbuddy2api-panel
+https://github.com/yreidev/workbuddy2api-panel
+
+Copyright (c) 2026 yreidev (https://github.com/yreidev/workbuddy2api-panel)
+Copyright (c) 2026 linguo2625469 (https://github.com/linguo2625469/workbuddy2api-panel)
+Copyright (c) 2026 Sliverkiss (original project: https://github.com/Sliverkiss/workbuddy2api)
+以及提交历史里的其他贡献者 / and the other contributors in the commit history.
+
+中文在前，英文在后；两者含义不一致时以英文为准。
+The Chinese text comes first and the English text second; where they differ, the English text prevails.
+
+
+一、许可
+
+本项目自 v1.4.0 起以 GNU Affero General Public License 第 3 版授权（仅此版本，SPDX 标识 AGPL-3.0-only），全文见 LICENSE，另附第三节的条款（依 AGPL-3.0 第 7 条）。
+
+v1.3.0 及更早的版本以 MIT 许可发布，仍照 MIT 使用。本项目中来自原始项目 Sliverkiss/workbuddy2api 与上游 linguo2625469/workbuddy2api-panel 的部分原以 MIT 许可提供，其版权与许可声明保留在第四节。
+
+二、你可以做什么
+
+照 AGPL-3.0：可以使用、复制、修改、分发本项目，也可以商用。分发本项目或它的修改版，或者让别人通过网络使用修改版（例如对外提供 API），都必须以 AGPL-3.0 向这些用户提供完整的对应源码，并遵守第三节。
+
+三、附加条款（AGPL-3.0 第 7 条）
+
+下列条款适用于本项目的全部内容，以及任何复制、修改、翻译或改写了本项目任一部分（整个文件、部分文件或代码片段）的作品：
+
+1. 保留声明（第 7 条 b 款）：保留 LICENSE、本 NOTICE 文件，以及各源文件开头的版权与许可声明，不得删除或改动。
+2. 说明文档署名（第 7 条 b 款）：在作品的 README 或主要说明文档的显眼位置写明「基于 / 包含了 workbuddy2api-panel 的代码」，并附链接 https://github.com/yreidev/workbuddy2api-panel 。
+3. 界面署名（第 7 条 b 款、第 5 条 d 款）：作品有交互界面的（网页面板、桌面程序、命令行交互界面等），在其「适当的法律声明」里写明同样的内容和链接，从主界面能够到达（例如「关于」窗口或页脚）。
+4. 不得冒充原版（第 7 条 c 款）：修改过的版本要以合理方式标明与原版不同，不得以本项目原版、官方发布版或作者认可的版本的名义发布、宣传或销售。
+5. 不授予署名背书（第 7 条 e 款）：本许可不授予使用作者、贡献者姓名或项目名称为衍生作品做宣传、背书的权利。
+
+四、上游部分的 MIT 声明
+
+本项目中来自 Sliverkiss/workbuddy2api 与 linguo2625469/workbuddy2api-panel 的部分原以下列 MIT 许可提供：
+
+    MIT License
+
+    Copyright (c) 2026 Sliverkiss (original project: https://github.com/Sliverkiss/workbuddy2api)
+    Copyright (c) 2026 linguo2625469 (fork: https://github.com/linguo2625469/workbuddy2api-panel)
+    Copyright (c) 2026 yreidev (this fork: https://github.com/yreidev/workbuddy2api-panel)
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+五、请求（不属于许可条款）
+
+只参考了本项目的实现思路、协议分析或文档（例如 docs/official-client.md 对官方客户端的对齐记录），没有复制代码的，许可管不到，但请在 README 的致谢里注明并附上链接。
+
+
+1. License
+
+Starting with v1.4.0, this project is licensed under the GNU Affero General Public License, version 3 only (SPDX: AGPL-3.0-only), see LICENSE, with the additional terms in section 3 under Section 7 of the AGPL-3.0.
+
+v1.3.0 and earlier were released under the MIT License and remain available under it. The portions of this project that come from the original project Sliverkiss/workbuddy2api and from the upstream linguo2625469/workbuddy2api-panel were provided under the MIT License; their copyright and permission notice is preserved in section 4.
+
+2. What you may do
+
+Under the AGPL-3.0 you may use, copy, modify and distribute this project, including commercially. If you distribute it or a modified version, or let others use a modified version over a network (for example by offering an API), you must offer those users the complete Corresponding Source under the AGPL-3.0 and comply with section 3.
+
+3. Additional terms (AGPL-3.0 Section 7)
+
+The following terms apply to all of this project and to any work that copies, modifies, translates or adapts any part of it (whole files, parts of files or code snippets):
+
+1. Preservation of notices (Section 7(b)): you must keep LICENSE, this NOTICE file and the copyright and license notices at the top of each source file, without removing or altering them.
+2. Attribution in documentation (Section 7(b)): the work must state prominently in its README or primary documentation that it is "based on / contains code from workbuddy2api-panel", with a link to https://github.com/yreidev/workbuddy2api-panel.
+3. Attribution in the user interface (Sections 7(b) and 5(d)): if the work has an interactive user interface (web panel, desktop program, interactive command-line interface, etc.), its Appropriate Legal Notices must include the same statement and link, reachable from the main interface (for example an "About" dialog or a footer).
+4. No misrepresentation of origin (Section 7(c)): modified versions must be marked in reasonable ways as different from the original version, and must not be published, promoted or sold as the original project, an official release, or a version endorsed by the authors.
+5. No endorsement (Section 7(e)): this license grants no right to use the names of the authors or contributors, or the name of the project, to endorse or promote derived works.
+
+4. MIT notice for upstream portions
+
+The portions from Sliverkiss/workbuddy2api and linguo2625469/workbuddy2api-panel were provided under the MIT License reproduced in section 4 of the Chinese text above.
+
+5. Request (not a license term)
+
+If you only drew on this project's ideas, protocol analysis or documentation (for example the official-client alignment notes in docs/official-client.md) without copying code, the license does not cover that, but please credit this project with a link in your README's acknowledgements.

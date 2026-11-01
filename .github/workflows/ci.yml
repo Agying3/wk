@@ -1,35 +1,27 @@
-name: CI
+name: tdog release verification
 
+# Requires an explicitly configured self-hosted runner on tdog.
+# The same script can be used over SSH without configuring a GitHub runner.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  verify:
+    runs-on: [self-hosted, tdog]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Verify and build on the tdog host
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /srv/build-server/env/workbuddy2api.sh
+          export GOMAXPROCS=4
+          python3 scripts/test-package-source.py
+          bash scripts/build-release.sh "$RUNNER_TEMP/workbuddy2api-release"
+          (cd react && npm test)
+          go test -p=2 ./... -count=1 -timeout=10m
+          go vet -p=2 ./...
+      - uses: actions/upload-artifact@v4
         with:
-          go-version: '1.23'
-          cache: true
-      - name: Test
-        run: go test ./...
-      - name: Vet
-        run: go vet ./...
-      - name: Race tests
-        run: go test -race ./...
-      - name: Loopback load smoke test
-        env:
-          WK_LOADTEST: '1'
-          WK_LOAD_CONCURRENCY: '10'
-          WK_LOAD_DURATION: '1s'
-        run: go test ./cmd/server -run '^TestProxyLoad$' -count=1 -timeout=60s
-
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build --tag workbuddy2api:ci .
+          name: workbuddy2api-release
+          path: ${{ runner.temp }}/workbuddy2api-release/
