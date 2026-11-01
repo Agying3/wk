@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Alert, App, Button, Card, Descriptions, Drawer, Empty, Form, Input, InputNumber, Modal, Select, Space, Statistic, Switch, Table, Tabs, Tag, Typography } from 'antd';
+import { Alert, App, Button, Card, Collapse, Descriptions, Drawer, Empty, Form, Input, InputNumber, Modal, Select, Space, Statistic, Switch, Table, Tabs, Tag, Typography } from 'antd';
 import { ArrowDownOutlined, ArrowUpOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import './PromptGuard.css';
 import { accountScopeLabel, candidateView, diagnosticStates, httpDescription, jobView, probeExplanation, requestAttempted, selectionView, stageNames, verificationStages } from '../lib/promptGuard';
+import PromptVariantEditor from './PromptVariantEditor';
+import PromptRuleTest from './PromptRuleTest';
 
 const { Text, Paragraph } = Typography;
 const root = '/admin/prompt-guard/';
@@ -66,6 +68,7 @@ export default function PromptGuardPage({ api }) {
   const [detail, setDetail] = useState(null);
   const [preview, setPreview] = useState(null);
   const [editor, setEditor] = useState(null);
+  const [testRule, setTestRule] = useState(null);
   const [ruleForm] = Form.useForm();
 
   const load = useCallback(async () => {
@@ -96,7 +99,7 @@ export default function PromptGuardPage({ api }) {
       variants: rule?.variants?.length ? rule.variants : [{ replacement: rule?.replacement || '', weight: 1 }] });
   };
   const saveRule = async () => {
-    const values = await ruleForm.validateFields().catch(() => null); if (!values) return;
+    const values = await ruleForm.validateFields().catch(e => { message.error(e.errorFields?.[0]?.name?.[0] === 'variants' ? `请检查候选 ${e.errorFields[0].name[1] + 1}：${e.errorFields[0].errors[0]}` : '请检查并填写规则必填项'); return null; }); if (!values) return;
     const rules = [...(config.rules || [])];
     const i = rules.findIndex(r => r.id === editor.id);
     if (!values.variants?.some(v => v.weight > 0)) { message.error('至少一个候选的权重须大于 0'); return; }
@@ -121,11 +124,11 @@ export default function PromptGuardPage({ api }) {
   const cancel = async () => { try { await api(`${root}cases/${detailId}/cancel`, { method: 'POST' }); message.success('已请求取消'); await load(); } catch (e) { message.error(e.message); } };
   const remove = row => modal.confirm({ title: '删除这条拦截记录？', content: '将删除保存的完整系统提示词和诊断结果；后续新的 11128 仍会记录。', okText: '删除', okButtonProps: { danger: true }, cancelText: '取消', onOk: async () => { await api(`${root}cases/${row.id}`, { method: 'DELETE' }); if (row.id === detailId) setDetailId(null); await load(); changed(); } });
   const rulesColumns = [
-    { title: '顺序', width: 100, render: (_, r, i) => <Space><Text>{i + 1}</Text><Button aria-label="上移规则" size="small" disabled={busy || i === 0} icon={<ArrowUpOutlined />} onClick={() => move(i, -1)} /><Button aria-label="下移规则" size="small" disabled={busy || i === config.rules.length - 1} icon={<ArrowDownOutlined />} onClick={() => move(i, 1)} /></Space> },
+    { title: '顺序', width: 100, render: (_, r) => { const i = config.rules.findIndex(rule => rule.id === r.id); return <Space><Text>{i + 1}</Text><Button aria-label="上移规则" size="small" disabled={busy || i === 0} icon={<ArrowUpOutlined />} onClick={() => move(i, -1)} /><Button aria-label="下移规则" size="small" disabled={busy || i === config.rules.length - 1} icon={<ArrowDownOutlined />} onClick={() => move(i, 1)} /></Space>; } },
     { title: '规则', dataIndex: 'name', render: (v, r) => <div><Text strong>{v || '未命名规则'}</Text>{['legacy_codex', 'legacy_dsh'].includes(r.source) && <Tag color="blue" style={{ marginLeft: 6 }}>{r.source === 'legacy_codex' ? 'Codex 迁移' : 'DSH 迁移'}</Tag>}{r.require_end_boundary && <Tag>末尾边界</Tag>}<div className="pg-snippet">{r.match}</div></div> },
-    { title: '替换为 / 新会话占比', dataIndex: 'replacement', render: (v, r) => r.variants?.length ? <div className="pg-variant-summary">{r.variants.map((item, i) => <div key={item.id}><Text type="secondary">候选 {i + 1} · 基础权重 {item.weight} · 当前 {((r.effective_weights?.[i] || 0) * 100).toFixed(1)}%</Text><div className="pg-snippet">{item.replacement || <Text type="secondary">删除匹配内容</Text>}</div></div>)}<Text type="secondary">{r.weight_refresh_hours ? `每 ${r.weight_refresh_hours} 小时刷新 · 下次 ${time(r.next_weight_refresh)}` : '固定权重'} · 同会话保持选择</Text></div> : <div className="pg-snippet">{v || <Text type="secondary">删除匹配内容</Text>}</div> },
+    { title: '替换候选摘要', dataIndex: 'replacement', render: (v, r) => r.variants?.length ? <div className="pg-variant-summary"><Text>{r.variants.length} 个候选 · {r.variants.filter(item => item.weight > 0).length} 个参与新会话分配</Text><div className="pg-snippet">{r.variants[0].replacement || <Text type="secondary">首个候选：删除匹配内容</Text>}</div><Text type="secondary">{r.weight_refresh_hours ? `每 ${r.weight_refresh_hours} 小时刷新 · 下次 ${time(r.next_weight_refresh)}` : '固定权重'} · 同会话保持选择</Text></div> : <div className="pg-snippet">{v || <Text type="secondary">删除匹配内容</Text>}</div> },
     { title: '启用', dataIndex: 'enabled', width: 80, render: (v, r) => <Switch aria-label={`启用 ${r.name || '规则'}`} checked={v} disabled={busy} onChange={enabled => saveConfig({ rules: config.rules.map(rule => rule.id === r.id ? { ...rule, enabled } : rule) })} /> },
-    { title: '操作', width: 140, render: (_, r) => <Space><Button size="small" icon={<EditOutlined />} disabled={busy} onClick={() => edit(r)}>编辑</Button><Button size="small" danger disabled={busy} onClick={() => modal.confirm({ title: '删除替换规则？', okText: '删除', cancelText: '取消', onOk: () => saveConfig({ rules: config.rules.filter(rule => rule.id !== r.id) }) })}>删除</Button></Space> },
+    { title: '操作', width: 200, render: (_, r) => <Space><Button size="small" disabled={busy} onClick={() => setTestRule({ rule: r, revision: config.revision })}>测试</Button><Button size="small" icon={<EditOutlined />} disabled={busy} onClick={() => edit(r)}>编辑</Button><Button size="small" danger disabled={busy} onClick={() => modal.confirm({ title: '删除替换规则？', okText: '删除', cancelText: '取消', onOk: () => saveConfig({ rules: config.rules.filter(rule => rule.id !== r.id) }) })}>删除</Button></Space> },
   ];
   const pending = cases.filter(c => !c.resolved).length;
   const active = cases.filter(c => ['running', 'queued'].includes(c.job?.status)).length;
@@ -148,9 +151,9 @@ export default function PromptGuardPage({ api }) {
         </> },
         { key: 'rules', label: '替换规则', children: <>
           {!!config?.legacy_migration_version && <Alert type="success" showIcon message="旧 Codex / DSH 配置已自动迁移" description="规则保留了旧开关的启停状态，可在此修改、关闭或删除。重启不会重新导入，也不会再执行旧兼容替换。" style={{ marginBottom: 12 }} />}
-          <Alert type="info" showIcon message="每条规则可设置多个候选，按权重为新会话选择，同一会话保持相同提示词。" description="支持定时均衡随机刷新权重，只影响新会话。同一请求内的全部匹配共用一个候选；规则仍按顺序执行，只改写 system / developer 文本。请转发稳定的 conversation_id、prompt_cache_key 或会话请求头；缺少时尝试首条用户消息识别，相同开场可能合并，裁剪历史可能视为新会话。会话选择加密保留，闲置 30 天后过期。" />
+          <Alert type="info" showIcon message="每条规则可设置多个候选，按权重为新会话选择，同一会话保持相同提示词。" description="支持定时均衡随机刷新权重，只影响新会话。同一请求内的全部匹配共用一个候选；规则仍按顺序执行，只改写 system / developer 文本。与账号路由共用会话识别：请转发稳定的 conversation_id、prompt_cache_key 或会话请求头；缺少时按替换前的系统提示词、工具和首条用户消息识别，相同开场可能合并，裁剪历史可能视为新会话。会话选择加密保留，闲置 30 天后过期。" />
           <div className="pg-toolbar"><Text type="secondary">保存后立即生效。修改规则后，旧验证结果需要重新验证。</Text><Button type="primary" icon={<PlusOutlined />} disabled={!config} onClick={() => edit()}>新增规则</Button></div>
-          <Table rowKey="id" columns={rulesColumns} dataSource={config?.rules || []} pagination={false} scroll={{ x: 850 }} locale={{ emptyText: '添加任意需要替换的系统提示词内容' }} />
+          <Table rowKey="id" columns={rulesColumns} dataSource={config?.rules || []} pagination={{ defaultPageSize: 10, showSizeChanger: true, pageSizeOptions: [10, 20, 50], hideOnSinglePage: true }} scroll={{ x: 850 }} locale={{ emptyText: '添加任意需要替换的系统提示词内容' }} />
         </> },
         { key: 'settings', label: '诊断设置', children: settings && <Form layout="vertical" className="pg-settings">
           <Alert type="warning" showIcon message="自动定位会发送真实上游请求" description="开启即允许对今后新捕获的 11128 记录自动诊断，单任务按预算串行请求。重复记录不会反复自动重试。关闭会取消自动任务，完整提示词仍会保存，可手动重新定位。" />
@@ -162,6 +165,7 @@ export default function PromptGuardPage({ api }) {
         </Form> },
       ]} />
     </Card>
+    {testRule && <PromptRuleTest api={api} rule={testRule.rule} revision={testRule.revision} onClose={() => setTestRule(null)} />}
     <Drawer title="拦截详情与诊断" open={!!detailId} width="min(940px, 100vw)" onClose={() => setDetailId(null)} destroyOnHidden>
       {!detail ? <Empty description="正在加载记录" /> : <Space direction="vertical" size={18} style={{ width: '100%' }}>
         <Descriptions size="small" column={2} items={[{ key: 'model', label: '模型', children: detail.model }, { key: 'status', label: '状态', children: detail.resolved ? '完整提示词已验证通过' : '待处理' }, { key: 'count', label: '拦截次数', children: detail.occurrences }, { key: 'seen', label: '最近拦截', children: time(detail.last_seen) },{key:'scope',label:'原请求范围',children:accountScopeLabel(detail.account_scope)}]} />
@@ -176,20 +180,15 @@ export default function PromptGuardPage({ api }) {
         <Button onClick={() => edit({ match: textOf(detail.original) })}>根据原始提示词新增规则</Button>
       </Space>}
     </Drawer>
-    <Modal title={editor?.id ? '编辑替换规则' : '新增替换规则'} open={editor !== null} onCancel={() => setEditor(null)} onOk={saveRule} confirmLoading={busy} width={760} okText="保存规则" cancelText="取消" destroyOnHidden>
+    <Modal className="pg-rule-editor" title={editor?.id ? '编辑替换规则' : '新增替换规则'} open={editor !== null} onCancel={() => setEditor(null)} onOk={saveRule} confirmLoading={busy} width={960} styles={{ body: { maxHeight: '70vh', overflowY: 'auto', paddingRight: 8 } }} okText="保存规则" cancelText="取消" destroyOnHidden>
       <Form form={ruleForm} layout="vertical">
         <Form.Item name="name" label="规则名称"><Input maxLength={200} placeholder="例如：路径说明同义改写" /></Form.Item>
-        <Form.Item name="match" label="匹配原文（精确匹配）" rules={[{ required: true, message: '请输入要替换的原文' }]}><Input.TextArea rows={6} spellCheck={false} /></Form.Item>
-        <Form.List name="variants">{(fields, { add, remove }) => <div className="pg-variants">
-          {fields.map((field, i) => <Card size="small" key={field.key} title={`替换候选 ${i + 1}`} extra={<Button danger size="small" disabled={fields.length <= 1} onClick={() => remove(field.name)}>移除候选</Button>}>
-            <Form.Item name={[field.name, 'id']} hidden><Input /></Form.Item>
-            <Form.Item name={[field.name, 'replacement']} label="替换内容" extra="留空会删除匹配内容。请自行确认语义。"><Input.TextArea rows={4} spellCheck={false} /></Form.Item>
-            <Form.Item name={[field.name, 'weight']} label="基础权重" rules={[{ required: true, message: '请输入基础权重' }]} extra="0 表示不分配给新会话；已绑定的会话继续沿用。"><InputNumber min={0} max={1000000} precision={0} aria-label={`候选 ${i + 1} 基础权重`} /></Form.Item>
-          </Card>)}
-          <Button block icon={<PlusOutlined />} disabled={fields.length >= 32} onClick={() => add({ replacement: '', weight: 1 })}>添加替换候选（最多 32 个）</Button>
-        </div>}</Form.List>
+        <Form.Item name="match" label="匹配原文（精确匹配）" rules={[{ required: true, message: '请输入要替换的原文' }]}><Input.TextArea autoSize={{ minRows: 3, maxRows: 6 }} spellCheck={false} /></Form.Item>
+        <PromptVariantEditor form={ruleForm} savedVariants={editor?.variants} effectiveWeights={editor?.effective_weights} />
+        <Collapse className="pg-rule-options" items={[{ key: 'options', label: '分配与匹配设置', forceRender: true, children: <>
         <Form.Item name="weight_refresh_hours" label="自动刷新权重" extra="关闭时严格按基础权重分配新会话；开启后限制基础偏好、加入随机扰动，再将每项概率约束在平均份额的 0.5～1.5 倍。刷新按固定时间窗口生效，保留已有会话选择。"><Select options={[{ value: 0, label: '关闭，使用固定权重' }, { value: 6, label: '每 6 小时' }, { value: 12, label: '每 12 小时' }, { value: 24, label: '每天' }, { value: 48, label: '每 2 天' }, { value: 168, label: '每周' }]} /></Form.Item>
         <Form.Item name="require_end_boundary" label="检查匹配末尾边界" valuePropName="checked" extra="匹配内容之后须为英文句点、空格、制表符、换行或文本结尾。"><Switch /></Form.Item>
+        </> }]} />
         <Form.Item name="enabled" label="启用规则" valuePropName="checked"><Switch /></Form.Item>
         <Alert type="info" showIcon message="保存规则不会自动验证。编辑或删除候选内容会影响已绑定会话；仅调整权重或刷新间隔不会切换其选择。" />
       </Form>

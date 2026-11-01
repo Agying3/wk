@@ -132,6 +132,7 @@ func (h *Handler) registerPromptGuard() {
 		})
 	}
 	h.mux.HandleFunc("/admin/prompt-guard/", h.withFrontend(h.promptGuardAPI))
+	h.mux.HandleFunc("/admin/prompt-guard/rule-test", h.withFrontend(h.promptRuleTestAPI))
 }
 
 func (h *Handler) legacyPromptMigrated() bool {
