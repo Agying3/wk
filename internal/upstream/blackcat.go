@@ -10,7 +10,6 @@ package upstream
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
@@ -58,9 +57,12 @@ func (c *Client) RunNightChats(a *auth.Auth, need int) (int64, error) {
 			}
 			return ok, fmt.Errorf("第 %d 次对话失败: http=%d err=%v body=%.120s", i+1, status, err, respBody)
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1<<20))
+		response, readErr := Aggregate(rc)
 		rc.Close()
-		if err := c.ReportChatActivityModel(a, NewEventID(), "", "glm-5.2", "GLM-5.2"); err != nil {
+		if readErr != nil {
+			return ok, fmt.Errorf("第 %d 次对话未完成: %w", i+1, readErr)
+		}
+		if err := c.ReportChatActivityModel(a, NewEventID(), ResponseID(response), "glm-5.2", "GLM-5.2"); err != nil {
 			return ok, fmt.Errorf("第 %d 次上报失败: %w", i+1, err)
 		}
 		ok++

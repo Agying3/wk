@@ -122,9 +122,9 @@ func mpEventBase(a *auth.Auth) map[string]any {
 	return map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
 		"ideType":      "WorkBuddy_MP",
-		"ideVersion":   "2.4.0",
+		"ideVersion":   miniProgramVersion,
 		"extName":      "workbuddy-mp",
-		"extVersion":   "2.4.0",
+		"extVersion":   miniProgramVersion,
 		"product":      "SaaS",
 		"ideName":      "wx_app_cloud",
 		"platform":     "mini_program",

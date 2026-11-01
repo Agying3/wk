@@ -161,8 +161,13 @@ func TestAccountImportPreviewApplyAndNoOverwrite(t *testing.T) {
 	}
 	var roundtrip accountTransferBundle
 	json.Unmarshal(export.Body.Bytes(), &roundtrip)
-	if _, err := openAccounts(roundtrip, transferTestPassword); err != nil {
+	opened, err := openAccounts(roundtrip, transferTestPassword)
+	if err != nil {
 		t.Fatal(err)
+	}
+	transferred, err := auth.Parse(opened.Accounts[0].Credential)
+	if err != nil || transferred.DeviceIdentity() == "" || transferred.DeviceIdentity() != h.cfg.Pool.AuthByUID("u1").DeviceIdentity() {
+		t.Fatalf("encrypted transfer lost the account device identity: %v", err)
 	}
 }
 func TestAccountImportDoesNotOverwriteOrphanFile(t *testing.T) {

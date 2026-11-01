@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"regexp"
 	"time"
+	"unicode/utf8"
 
 	"workbuddy2api/internal/auth"
 )
@@ -34,17 +35,19 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
 	// marketExpertListPath 专家市场列表（专家类任务需真实专家 id）。
 	marketExpertListPath = "/portal/operation-platform/market/expert/list"
 )
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/sessionId 复用），
-// 幂等：同一账号每次生成相同值，模拟固定设备。
+// deriveID uses a persisted opaque identity. Legacy/read-only accounts retain
+// their previous UID-based identity so persistence failures do not break chat.
 func deriveID(a *auth.Auth, salt string) string {
 	creds := a.Snapshot()
-	sum := sha256.Sum256([]byte(salt + ":" + creds.UID))
+	identity := a.DeviceIdentity()
+	if identity == "" {
+		identity = creds.UID // Legacy fallback for read-only/in-memory accounts.
+	}
+	sum := sha256.Sum256([]byte(salt + ":" + identity))
 	return hex.EncodeToString(sum[:18]) // 36 hex chars
 }
 
@@ -67,11 +70,11 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
+		"ideVersion":   desktopVersion,
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   desktopVersion,
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    device.osVersion,
@@ -257,7 +260,7 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
 	creds := a.Snapshot()
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+	ua := webUA
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
@@ -416,13 +419,19 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // 注意：这条对话**不走 prepareBody 改写管线**（无需脱敏——载荷是固定的极短
 // 中性内容），也不入账号池租约；与 panel 原实现一致，直接裸发 chatBase。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
+	result, err := c.DesktopChatWithExpertObserved(a, expertID)
+	return result.ConversationID, result.RequestID, err
+}
+
+func (c *Client) DesktopChatWithExpertObserved(a *auth.Auth, expertID string) (result DesktopChatResult, err error) {
 	creds := a.Snapshot()
-	conversationID = NewEventID()
+	const prompt = "1+1等于几？直接回答。"
+	result = DesktopChatResult{ConversationID: NewEventID(), ModelID: "fast-model", InputLength: utf8.RuneCountInString(prompt)}
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
 			map[string]any{"role": "system", "content": "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"},
-			map[string]any{"role": "user", "content": "1+1等于几？直接回答。"},
+			map[string]any{"role": "user", "content": prompt},
 		},
 		"agent":          "cli",
 		"temperature":    1,
@@ -431,11 +440,11 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return "", "", err
+		return result, err
 	}
 	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+"/v2/chat/completions", bytes.NewReader(raw))
 	if err != nil {
-		return "", "", err
+		return result, err
 	}
 	h := req.Header
 	h.Set("Authorization", "Bearer "+creds.AccessToken)
@@ -445,13 +454,13 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", creds.UID)
-	h.Set("X-Conversation-ID", conversationID)
+	h.Set("X-Conversation-ID", result.ConversationID)
 	h.Set("X-Request-ID", NewEventID())
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
+	h.Set("X-IDE-Version", desktopVersion)
 	h.Set("x-codebuddy-request", "1")
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
@@ -459,39 +468,23 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	// 账号级统一路由（reqproxy）：经钩子取该账号 client。
 	cli, err := c.proxyClientFor(a)
 	if err != nil {
-		return "", "", err // D4：无可用节点，不回退直连
+		return result, err // D4：无可用节点，不回退直连
 	}
+	result.StartedAt = time.Now().UnixMilli()
 	resp, err := cli.Do(req)
 	if err != nil {
-		return "", "", err
+		return result, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-		return "", "", fmt.Errorf("chat http %d: %s", resp.StatusCode, b)
+		return result, fmt.Errorf("chat http %d: %s", resp.StatusCode, b)
 	}
-	// 从 SSE 流抓第一个 data.id 作为服务端 requestId（读干流避免残留连接）。
-	buf := make([]byte, 0, 1<<20)
-	tmp := make([]byte, 8192)
-	for {
-		n, rerr := resp.Body.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if i := bytes.Index(buf, []byte(`"id":"`)); i >= 0 {
-				rest := buf[i+6:]
-				if end := bytes.IndexByte(rest, '"'); end > 0 {
-					id := string(rest[:end])
-					if desktopIDRegex.MatchString(id) {
-						return conversationID, id, nil
-					}
-				}
-			}
-		}
-		if rerr != nil || len(buf) > 1<<20 {
-			break
-		}
+	if id := ResponseIDFromHeader(resp.Header); desktopIDRegex.MatchString(id) {
+		result.RequestID = id
 	}
-	return "", "", fmt.Errorf("SSE 中未找到服务端 requestId")
+	err = readDesktopObservation(resp.Body, &result)
+	return result, err
 }
 
 // desktopIDRegex 服务端 requestId 形状（cmb- 前缀 32hex 或裸 32hex）。

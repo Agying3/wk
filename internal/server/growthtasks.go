@@ -317,12 +317,14 @@ func (h *Handler) expertChain(a *auth.Auth, e upstream.MarketExpert) error {
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(e)...); err != nil {
 		return fmt.Errorf("召唤链: %w", err)
 	}
-	conv, req, err := h.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+	observed, err := h.cfg.Upstream.DesktopChatWithExpertObserved(a, e.ExpertID)
 	if err != nil {
 		return fmt.Errorf("真实对话: %w", err)
 	}
-	events := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
-	events = append(events, upstream.DesktopExpertActualUseEvent(e, conv, req))
+	events := observed.Events()
+	events = append(events, observed.ObserveEvents([]upstream.DesktopEvent{
+		upstream.DesktopExpertActualUseEvent(e, observed.ConversationID, observed.RequestID),
+	})...)
 	return h.cfg.Upstream.ReportDesktopEvent(a, events...)
 }
 
@@ -346,12 +348,13 @@ func runAppearance(h *Handler, a *auth.Auth) (string, error) {
 
 // runSkillFresh 完成 skill_1：真实对话（finishReason=tool_calls 语义）+ skill_info 事件。
 func runSkillFresh(h *Handler, a *auth.Auth) (string, error) {
-	conv, req, err := h.cfg.Upstream.DesktopChatWithExpert(a, "")
+	observed, err := h.cfg.Upstream.DesktopChatWithExpertObserved(a, "")
 	if err != nil {
 		return "", fmt.Errorf("真实对话: %w", err)
 	}
+	conv, req := observed.ConversationID, observed.RequestID
 	msgID := "msg-" + req[len(req)-8:]
-	events := upstream.DesktopChatSequence(conv, req, msgID, "fast-model", "fast-model")
+	events := observed.Events()
 	for _, ev := range events {
 		if ev["eventCode"] == "chat_message_response" {
 			ev["finishReason"] = "tool_calls" // 模型发起工具调用（技能加载）语义
@@ -396,11 +399,12 @@ func runExpertLighthouse(h *Handler, a *auth.Auth) (string, error) {
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(lh)...); err != nil {
 		return "", fmt.Errorf("召唤链: %w", err)
 	}
-	conv, req, err := h.cfg.Upstream.DesktopChatWithExpert(a, lhID)
+	observed, err := h.cfg.Upstream.DesktopChatWithExpertObserved(a, lhID)
 	if err != nil {
 		return "", fmt.Errorf("真实对话: %w", err)
 	}
-	events := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
+	conv, req := observed.ConversationID, observed.RequestID
+	events := observed.Events()
 	for _, ev := range events {
 		if ev["eventCode"] == "agent_task_created" {
 			ev["has_expert"] = true
@@ -409,7 +413,9 @@ func runExpertLighthouse(h *Handler, a *auth.Auth) (string, error) {
 			ev["expert_industry_id"] = ""
 		}
 	}
-	events = append(events, upstream.DesktopExpertActualUseLocal(lh, conv, req))
+	events = append(events, observed.ObserveEvents([]upstream.DesktopEvent{
+		upstream.DesktopExpertActualUseLocal(lh, conv, req),
+	})...)
 	// 对齐真实样本细节：轻量云专家 actual_use 的 type 为空、cost=0。
 	events[len(events)-1]["type"] = ""
 	events[len(events)-1]["cost"] = 0

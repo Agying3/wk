@@ -198,12 +198,12 @@ func (s *Scheduler) schoolDesktopTask(a *auth.Auth, tasks []upstream.SchoolTask)
 			return
 		}
 	}
-	conv, req, err := s.cfg.Upstream.DesktopChatWithExpert(a, "")
+	observed, err := s.cfg.Upstream.DesktopChatWithExpertObserved(a, "")
 	if err != nil {
 		log.Printf("school %s: desktop chat: %v", uid, err)
 		return
 	}
-	events := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
+	events := observed.Events()
 	if err := s.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 		log.Printf("school %s: desktop events: %v", uid, err)
 		return

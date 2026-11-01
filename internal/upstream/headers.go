@@ -10,6 +10,11 @@ import (
 
 const (
 	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2 WorkBuddy"
+	desktopVersion      = "5.5.6"
+	desktopCLIVersion   = "2.137.1"
+	desktopUA           = "WorkBuddy/" + desktopVersion + " WorkBuddy/" + desktopVersion + " CLI/" + desktopCLIVersion
+	webUA               = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+	miniProgramVersion  = "2.4.0"
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )

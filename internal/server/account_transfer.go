@@ -193,8 +193,13 @@ func (h *Handler) exportAccounts(w http.ResponseWriter, r *http.Request) {
 			transferError(w, 409, "选中的账号已变化，请刷新列表后重试")
 			return
 		}
+		a.DeviceIdentity()
 		c := a.Snapshot()
-		raw, _ := json.Marshal(map[string]any{"uid": c.UID, "nickname": c.Nickname, "accessToken": c.AccessToken, "refreshToken": c.RefreshToken, "domain": c.Domain, "enterpriseId": c.EnterpriseID, "expiresAt": c.ExpiresAt})
+		credential := map[string]any{"uid": c.UID, "nickname": c.Nickname, "accessToken": c.AccessToken, "refreshToken": c.RefreshToken, "domain": c.Domain, "enterpriseId": c.EnterpriseID, "expiresAt": c.ExpiresAt}
+		if c.DeviceID != "" {
+			credential["_device_identity"] = c.DeviceID
+		}
+		raw, _ := json.Marshal(credential)
 		gs := []string{"default"}
 		if h.cfg.Groups != nil {
 			gs = h.cfg.Groups.AccountGroups(uid)

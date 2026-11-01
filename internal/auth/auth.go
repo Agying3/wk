@@ -30,6 +30,10 @@ type Auth struct {
 	// ImportDisabled is immutable metadata: if pool state is lost or an import
 	// crashes after installing its file, a fresh pool must quarantine this auth.
 	ImportDisabled bool
+	// DeviceID is non-secret local metadata, persisted separately from tokens
+	// within the existing auth document. Never use it as an authentication key.
+	DeviceID       string
+	deviceFallback bool
 }
 
 // Credentials is an immutable point-in-time copy of an account credential.
@@ -42,6 +46,7 @@ type Credentials struct {
 	EnterpriseID string
 	Nickname     string
 	FilePath     string
+	DeviceID     string
 }
 
 // Lock serializes refresh operations for one account. Credential field access
@@ -59,7 +64,7 @@ func (a *Auth) Snapshot() Credentials {
 	return Credentials{
 		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresAt: a.ExpiresAt,
 		Domain: a.Domain, UID: a.UID, EnterpriseID: a.EnterpriseID,
-		Nickname: a.Nickname, FilePath: a.FilePath,
+		Nickname: a.Nickname, FilePath: a.FilePath, DeviceID: a.DeviceID,
 	}
 }
 
@@ -218,6 +223,11 @@ func Parse(raw []byte) (*Auth, error) {
 			return nil, fmt.Errorf("parse_error: invalid import marker")
 		}
 	}
+	if field, ok := probe["_device_identity"]; ok {
+		if json.Unmarshal(field, &a.DeviceID) != nil || !validDeviceIdentity(a.DeviceID) {
+			return nil, fmt.Errorf("parse_error: invalid device identity")
+		}
+	}
 	return &a, nil
 }
 
@@ -249,6 +259,13 @@ func (a *Auth) SaveAtomic() error {
 	if snapshot.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
+	unlock := lockDeviceFile(snapshot.FilePath)
+	defer unlock()
+	// A stale reload/refresh object must not erase an identity already saved
+	// by another object for this account.
+	if snapshot.DeviceID == "" {
+		snapshot.DeviceID = savedDeviceIdentity(snapshot.FilePath, snapshot.UID)
+	}
 	doc := map[string]any{
 		"_import_disabled": a.ImportDisabled,
 		"auth": map[string]any{
@@ -262,6 +279,9 @@ func (a *Auth) SaveAtomic() error {
 			"enterpriseId": snapshot.EnterpriseID,
 			"nickname":     snapshot.Nickname,
 		},
+	}
+	if snapshot.DeviceID != "" {
+		doc["_device_identity"] = snapshot.DeviceID
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -279,7 +299,15 @@ func (a *Auth) SaveAtomic() error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, snapshot.FilePath)
+	if err := os.Rename(tmp, snapshot.FilePath); err != nil {
+		return err
+	}
+	if snapshot.DeviceID != "" {
+		a.mu.Lock()
+		a.DeviceID = snapshot.DeviceID
+		a.mu.Unlock()
+	}
+	return nil
 }
 
 // LoadDir 扫描 dir 下 workbuddy*.json，只收 wantRegion（"cn"/"global"）。

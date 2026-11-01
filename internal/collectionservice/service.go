@@ -51,7 +51,7 @@ func New(store collection.Store, p *pool.Pool, up *upstream.Client, metrics metr
 	return s, nil
 }
 func frozen(c auth.Credentials) *auth.Auth {
-	return &auth.Auth{UID: c.UID, AccessToken: c.AccessToken, RefreshToken: c.RefreshToken, ExpiresAt: c.ExpiresAt, Domain: c.Domain, EnterpriseID: c.EnterpriseID, Nickname: c.Nickname, FilePath: c.FilePath}
+	return &auth.Auth{UID: c.UID, AccessToken: c.AccessToken, RefreshToken: c.RefreshToken, ExpiresAt: c.ExpiresAt, Domain: c.Domain, EnterpriseID: c.EnterpriseID, Nickname: c.Nickname, FilePath: c.FilePath, DeviceID: c.DeviceID}
 }
 func same(a, b auth.Credentials) bool {
 	return a.AccessToken == b.AccessToken && a.RefreshToken == b.RefreshToken && a.Domain == b.Domain
