@@ -31,6 +31,8 @@
     "autoenroll_growth_tasks": false
   },
   "upstream": {
+    "tls_fingerprint": true,
+    "shared_conversation_trace": true,
     "timeout_seconds": 120,
     "stream_timeout_seconds": 0,
     "stream_idle_seconds": 120

@@ -215,6 +215,10 @@ type apiEnvelope struct {
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
 	HTTP *http.Client
+	// Network options are fixed before serving; changing them requires restart.
+	TLSFingerprint          bool
+	SharedConversationTrace bool
+	fingerprintTransports   sync.Map // *http.Transport -> http.RoundTripper
 	// RewriteSystem is installed before serving requests. Its implementation
 	// takes concurrent rule snapshots and only edits system/developer text.
 	RewriteSystem func(map[string]any) error
@@ -585,6 +589,7 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 		return nil, 0, nil, nil, err
 	}
 	ChatHeaders(req, a)
+	applyChatTrace(req)
 
 	// 等响应头单独设一个可解除的看门狗。不能直接用 context.WithTimeout 当这个窗口：
 	// 响应体的读取同样绑定在 reqCtx 上，那样等于又给整个流加了总时限，回到要修的问题。

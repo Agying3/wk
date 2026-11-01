@@ -419,6 +419,9 @@ func main() {
 	}
 
 	up := upstream.New()
+	up.TLSFingerprint = cfg.Upstream.TLSFingerprint
+	up.SharedConversationTrace = cfg.Upstream.SharedConversationTrace
+	log.Printf("upstream network: tls_fingerprint=%t shared_conversation_trace=%t (restart required)", up.TLSFingerprint, up.SharedConversationTrace)
 	// 非流式/控制面：整请求（含读完响应体）上限。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 流式：独立策略，不再受上面那个整请求超时约束。默认不限总时长、只守 120s 空闲，

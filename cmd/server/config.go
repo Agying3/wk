@@ -79,6 +79,9 @@ type Config struct {
 	} `json:"schedule"`
 
 	Upstream struct {
+		// Restart required. Both options retain an explicit legacy opt-out.
+		TLSFingerprint          bool `json:"tls_fingerprint"`
+		SharedConversationTrace bool `json:"shared_conversation_trace"`
 		// TimeoutSeconds 非流式请求的**整请求**上限（含读完响应体），默认 120。
 		// 它同时约束控制面 JSON 调用（刷新 token、对账、签到等）。
 		TimeoutSeconds int `json:"timeout_seconds"`
@@ -296,6 +299,8 @@ func Default() *Config {
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.BlackcatEnabled = true
 	c.Upstream.TimeoutSeconds = 120
+	c.Upstream.TLSFingerprint = true
+	c.Upstream.SharedConversationTrace = true
 	// 流式默认不限总时长，只守空闲窗口。这正是本次改造的目的：长回答不再被一个
 	// 整请求超时掐断，而上游卡住时仍会在 StreamIdleSeconds 内失败。
 	c.Upstream.StreamTimeoutSeconds = 0
@@ -449,6 +454,16 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
+	}
+	if v := os.Getenv("WB2A_TLS_FINGERPRINT"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.TLSFingerprint = b
+		}
+	}
+	if v := os.Getenv("WB2A_SHARED_CONVERSATION_TRACE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.SharedConversationTrace = b
+		}
 	}
 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {

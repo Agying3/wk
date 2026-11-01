@@ -6,7 +6,9 @@ require (
 	github.com/jackc/pgx/v5 v5.7.3
 	github.com/klauspost/compress v1.17.4
 	github.com/redis/go-redis/v9 v9.18.0
+	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af
 	github.com/xtls/xray-core v1.260327.0
+	golang.org/x/net v0.52.0
 	modernc.org/sqlite v1.36.1
 )
 
@@ -32,7 +34,6 @@ require (
 	github.com/pelletier/go-toml v1.9.5 // indirect
 	github.com/pires/go-proxyproto v0.11.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sagernet/sing v0.5.1 // indirect
 	github.com/sagernet/sing-shadowsocks v0.2.7 // indirect
@@ -44,7 +45,6 @@ require (
 	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842 // indirect
 	golang.org/x/mod v0.33.0 // indirect
-	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.35.0 // indirect

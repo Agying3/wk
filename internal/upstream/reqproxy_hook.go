@@ -86,14 +86,14 @@ func (c *Client) proxyClientForContext(ctx context.Context, a *auth.Auth) (*http
 		if observe != nil {
 			observe(nil)
 		}
-		return c.HTTP, nil
+		return c.protocolClient(c.HTTP), nil
 	}
 	ao := authOptOf(a)
 	if ao == nil {
 		if observe != nil {
 			observe(nil)
 		}
-		return c.HTTP, nil
+		return c.protocolClient(c.HTTP), nil
 	}
 	proxy, err := c.DialProxy(ao.uid, ao.region)
 	if err != nil {
@@ -105,9 +105,9 @@ func (c *Client) proxyClientForContext(ctx context.Context, a *auth.Auth) (*http
 		observe(proxy)
 	}
 	if proxy == nil {
-		return c.HTTP, nil // 直连
+		return c.protocolClient(c.HTTP), nil // 直连
 	}
 	cli := *c.HTTP
 	cli.Transport = proxyTransports.transportFor(proxy)
-	return &cli, nil
+	return c.protocolClient(&cli), nil
 }

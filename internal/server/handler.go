@@ -5251,6 +5251,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r = withRequestSession(r, resolved)
+	if h.cfg.Upstream.SharedConversationTrace {
+		r = r.WithContext(upstream.WithChatTrace(r.Context(), resolved.Identity.Key))
+	}
 	preparedBody, err := h.preparePromptBody(bodyDoc, r)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())

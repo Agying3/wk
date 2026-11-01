@@ -340,6 +340,12 @@ curl http://localhost:7863/v1/messages \
 
 上报设备标识在首次需要时生成随机的非敏感本地身份，原子保存到原授权文件的 `_device_identity` 元数据，再按不同上报用途派生标识，不再直接由 UID 推导。初始化保留授权文件中未知的供应商字段，权限仍为 0600；刷新和内置加密导入/导出保留该身份。旧账号首次使用新版本时会迁移一次设备标识，原硬件组合不变。授权文件只读、无法保存或账号仅在内存时沿用旧标识规则，避免临时随机身份随重启变化或阻塞聊天。备份与迁移应保留原授权文件及该元数据。
 
+`upstream.tls_fingerprint` 默认开启，通过统一 upstream.Client 发出的 HTTPS 使用 uTLS ClientHello，HTTP/1.1 连接继续复用。账号代理选择保持原逻辑；HTTP/HTTPS CONNECT、SOCKS5 隧道建立后再做同一套上游 TLS 握手，代理失败不新增直连回退。SNI、证书链和主机名校验使用实际目的地址，不使用样本中的域名；握手超时、调用方取消、流式空闲和总时长限制仍有效。HTTP 请求及注入的自定义 RoundTripper 保持原实现。启动时读取，改动后需要重启；设为 false 或 `WB2A_TLS_FINGERPRINT=false` 恢复标准库 TLS。需要自定义客户端证书或 VerifyConnection 回调的部署使用标准库 TLS。独立登录工具、TTFB 测速等自行创建 HTTP 客户端的路径不在此开关覆盖范围内。
+
+TLS 握手样本数据来自 [yreidev/workbuddy2api-panel 39049fc](https://github.com/yreidev/workbuddy2api-panel/blob/39049fcc479c1240d0d80d0404e0308f651424de/internal/upstream/tlsmimic.go) 公开的 Electron/Node ClientHello 抓包，保存在 `internal/upstream/testdata/workbuddy_clienthello.hex`；每条新连接重新解析扩展对象，随机数、密钥交换材料和目标 SNI 由当前连接生成。只调整握手形状，不会把账号硬件、UA 或所有出站路径自动变成某个官方客户端，也不保证上游接受。连接和路由实现使用项目已有版本的 uTLS，不复制该分支的实现代码。
+
+`upstream.shared_conversation_trace` 默认开启，普通 Chat Completions 及经其收口的 Responses/Messages 请求，在选号前从共享会话解析器的鉴权范围隔离身份生成出站会话 ID。该 ID 与选中的账号无关，同会话换号及追加对话保持一致，保留原会话盐可跨重启重建；没有可识别会话的请求单独生成 ID。每个下游 HTTP 请求建立新的轮级追踪 ID，本次换号重试共用；每次实际发送的消息 ID、span ID 独立，B3 与 W3C traceparent 描述同一次尝试。不透传原始客户端会话或追踪 ID，不改变正文中既有会话字段剥离、账号粘性及换号条件。跨账号复用会话和追踪 ID 会明确关联这些尝试，并非账号匿名化；相同开场的推断会话仍遵循共享解析器既有合并规则。设为 false 或 `WB2A_SHARED_CONVERSATION_TRACE=false` 恢复旧请求头行为，改动后需要重启。
+
 已执行真实桌面对话的任务读取到完成事件后才上报，使用实际输入长度、模型、usage、首 token 时间和完成时间；上游缺少的用量字段不填默认值。真实对话中的传输错误、SSE 错误或缺失完成事件不会因为提前收到 requestId 而被判成功。纯事件型任务保留兼容事件模板，不增加真实对话；任务文本、排程、测速设置及换号规则保持原行为。客户端版本字段集中维护，不随机改变协议身份。
 
 程序生成的事件链、会话及请求标识使用随机 UUIDv4，不包含项目名前缀或本机时间戳；同一事件链仍保持关联，上游返回的真实 requestId 原样保留。客户端会话解析、聊天正文、账号换号、代理选择与任务排程规则保持原有行为。聊天 HTTP 错误的普通日志仅保留状态、错误分类、业务 code 和响应长度，避免记录上游回显的提示词或凭证；错误分类及客户端响应仍使用原始正文。
