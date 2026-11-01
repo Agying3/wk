@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"workbuddy2api/internal/device"
 )
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或 CPA 面板扁平形）。
@@ -34,20 +36,22 @@ type Auth struct {
 	// DeviceID is non-secret local metadata, persisted separately from tokens
 	// within the existing auth document. Never use it as an authentication key.
 	DeviceID       string
+	DeviceProfile  device.Profile
 	deviceFallback bool
 }
 
 // Credentials is an immutable point-in-time copy of an account credential.
 type Credentials struct {
-	AccessToken  string
-	RefreshToken string
-	ExpiresAt    int64
-	Domain       string
-	UID          string
-	EnterpriseID string
-	Nickname     string
-	FilePath     string
-	DeviceID     string
+	AccessToken   string
+	RefreshToken  string
+	ExpiresAt     int64
+	Domain        string
+	UID           string
+	EnterpriseID  string
+	Nickname      string
+	FilePath      string
+	DeviceID      string
+	DeviceProfile device.Profile
 	Authority
 }
 
@@ -65,7 +69,7 @@ func (a *Auth) Snapshot() Credentials {
 	return Credentials{
 		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresAt: a.ExpiresAt,
 		Domain: a.Domain, UID: a.UID, EnterpriseID: a.EnterpriseID,
-		Nickname: a.Nickname, FilePath: a.FilePath, DeviceID: a.DeviceID, Authority: a.Authority,
+		Nickname: a.Nickname, FilePath: a.FilePath, DeviceID: a.DeviceID, DeviceProfile: a.DeviceProfile, Authority: a.Authority,
 	}
 }
 
@@ -249,6 +253,11 @@ func Parse(raw []byte) (*Auth, error) {
 			return nil, fmt.Errorf("parse_error: invalid device identity")
 		}
 	}
+	if field, ok := probe["_device_profile"]; ok {
+		if json.Unmarshal(field, &a.DeviceProfile) != nil || a.DeviceProfile.Validate() != nil {
+			return nil, fmt.Errorf("parse_error: invalid device profile")
+		}
+	}
 	return &a, nil
 }
 
@@ -287,6 +296,17 @@ func (a *Auth) SaveAtomic() error {
 	if snapshot.DeviceID == "" {
 		snapshot.DeviceID = savedDeviceIdentity(snapshot.FilePath, snapshot.UID)
 	}
+	// Disk metadata wins over stale refresh/import objects. A pre-profile file
+	// is a legacy Windows record, never a request to change its platform.
+	if raw, err := os.ReadFile(snapshot.FilePath); err == nil {
+		if existing, err := Parse(raw); err == nil && existing.UID == snapshot.UID {
+			snapshot.DeviceID = existing.DeviceID
+			snapshot.DeviceProfile = existing.DeviceProfile
+		}
+	}
+	if snapshot.DeviceProfile.Version == 0 {
+		snapshot.DeviceProfile = device.LegacyWindows(snapshot.UID, snapshot.DeviceID)
+	}
 	doc := map[string]any{
 		"_import_disabled": a.ImportDisabled,
 		"auth": map[string]any{
@@ -301,9 +321,7 @@ func (a *Auth) SaveAtomic() error {
 			"nickname":     snapshot.Nickname,
 		},
 	}
-	if snapshot.DeviceID != "" {
-		doc["_device_identity"] = snapshot.DeviceID
-	}
+	snapshot.AddDeviceMetadata(doc)
 	snapshot.AddAuthorityMetadata(doc["auth"].(map[string]any), doc["account"].(map[string]any))
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -324,11 +342,9 @@ func (a *Auth) SaveAtomic() error {
 	if err := os.Rename(tmp, snapshot.FilePath); err != nil {
 		return err
 	}
-	if snapshot.DeviceID != "" {
-		a.mu.Lock()
-		a.DeviceID = snapshot.DeviceID
-		a.mu.Unlock()
-	}
+	a.mu.Lock()
+	a.DeviceID, a.DeviceProfile = snapshot.DeviceID, snapshot.DeviceProfile
+	a.mu.Unlock()
 	return nil
 }
 

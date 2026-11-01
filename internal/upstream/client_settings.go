@@ -133,6 +133,22 @@ func (c *Client) chatHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set(key, value)
 	}
 	c.privacyHeaders(req, a)
+	if a.Snapshot().DeviceProfile.IsMac() {
+		// Values verified for the referenced macOS desktop/embedded CLI build.
+		// This describes that SDK profile; it does not change gateway deadlines.
+		for key, value := range map[string]string{"X-Stainless-Retry-Count": "0", "X-Stainless-Timeout": "1200", "X-Stainless-Lang": "js", "X-Stainless-Package-Version": "6.25.0", "X-Stainless-OS": "MacOS", "X-Stainless-Arch": "arm64", "X-Stainless-Runtime": "node", "X-Stainless-Runtime-Version": "v22.21.1"} {
+			req.Header.Set(key, value)
+		}
+	}
+}
+
+const macBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+
+func browserUserAgent(a *auth.Auth) string {
+	if a.Snapshot().DeviceProfile.IsMac() {
+		return macBrowserUA
+	}
+	return webUA
 }
 
 func (c *Client) privacyHeaders(req *http.Request, a *auth.Auth) {

@@ -3065,6 +3065,11 @@ func (h *Handler) persistAccount(cred accountCredential, region string) (map[str
 	if cred.ExpiresIn > 0 {
 		expiresAt = time.Now().Unix() + cred.ExpiresIn
 	}
+	path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+cred.UID+".json")
+	metadata, err := h.deviceForLogin(cred.UID, path)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
 	doc := map[string]any{
 		"auth": map[string]any{
 			"accessToken": cred.AccessToken, "refreshToken": cred.RefreshToken,
@@ -3074,8 +3079,8 @@ func (h *Handler) persistAccount(cred accountCredential, region string) (map[str
 			"uid": cred.UID, "enterpriseId": cred.EnterpriseID, "nickname": cred.Nickname,
 		},
 	}
+	metadata.AddDeviceMetadata(doc)
 	raw, _ := json.MarshalIndent(doc, "", "  ")
-	path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+cred.UID+".json")
 	if err := writeFileAtomic(path, append(raw, '\n'), 0600); err != nil {
 		return nil, 500, err
 	}
@@ -3107,7 +3112,7 @@ func (h *Handler) persistAccount(cred accountCredential, region string) (map[str
 		h.cfg.Pool.Add(&auth.Auth{
 			AccessToken: cred.AccessToken, RefreshToken: cred.RefreshToken, ExpiresAt: expiresAt,
 			Domain: cred.Domain, UID: cred.UID, EnterpriseID: cred.EnterpriseID,
-			Nickname: cred.Nickname, FilePath: path,
+			Nickname: cred.Nickname, FilePath: path, DeviceID: metadata.DeviceID, DeviceProfile: metadata.DeviceProfile,
 		})
 	}
 	// A newly added account may expose a different regional model catalogue.

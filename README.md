@@ -346,6 +346,10 @@ curl http://localhost:7863/v1/messages \
 
 上报设备标识在首次需要时生成随机的非敏感本地身份，原子保存到原授权文件的 `_device_identity` 元数据，再按不同上报用途派生标识，不再直接由 UID 推导。初始化保留授权文件中未知的供应商字段，权限仍为 0600；刷新和内置加密导入/导出保留该身份。旧账号首次使用新版本时会迁移一次设备标识，原硬件组合不变。授权文件只读、无法保存或账号仅在内存时沿用旧标识规则，避免临时随机身份随重启变化或阻塞聊天。备份与迁移应保留原授权文件及该元数据。
 
+设备平台按账号保存，支持已有 Windows 与新 Mac 账号混用，不设把全池切换平台的全局开关。通过 OAuth、短信登录或自动加号**首次创建**账号时，默认生成 Mac 档案：`darwin/arm64`、Darwin `24.6.0`、Apple M2 8 核，内存在 8/16/24 GiB 中随机选一次。M2 配置范围依据 [Apple 技术规格](https://support.apple.com/en-ie/111867)；Mac 请求字段参考 [客户端研究记录](https://github.com/yreidev/workbuddy2api-panel/blob/39049fcc479c1240d0d80d0404e0308f651424de/docs/official-client.md)。具体硬件、机器标识和浏览器标识保存在授权文件的 `_device_profile`，随机种子继续使用 `_device_identity`。不同账号可以有相同硬件，每个账号的已分配参数不因重启、版本默认值、刷新 token、重新登录或代理变化而重选。当前不向新增账号开放 Windows 选择，后续研究完成后再新增创建选项，不迁移已有设备。
+
+已有授权文件没有 `_device_profile` 时，继续使用原来的 Windows 硬件目录与标识算法，保存时冻结原值；不会按新账号默认值改成 Mac。重新登录已有 UID 会保留原设备元数据。加密迁移文件同时携带完整设备档案，旧迁移文件缺字段时按旧 Windows 行为兼容；直接复制到 auth_dir 的无设备字段文件同样作为旧文件处理，不推断它是一台新 Mac。Mac 档案使用对应的桌面事件、SDK 系统/架构头和 Mac 浏览器 UA；Windows 档案保留既有参数，不套用 Mac 专属字段。SDK 头里的超时描述不改变网关实际超时设置。小程序通道目前只沿用旧 Windows 抓包协议，独立于桌面档案保留兼容行为，不声称已复现 Mac 微信。
+
 `upstream.header_profile` 默认 `desktop`：聊天、刷新与已核对的积分/签到接口分别构造请求头。客户端版本集中在 `client_version_cn`（默认 `5.9.3`）、`client_version_global`（`5.9.4`）与 `cli_version`（`2.165.0`）；聊天及桌面事件使用对应区域版本，不沿用旧版本的 commit/releaseDate。账号原有设备档案继续使用。未核对的业务接口保持既有头部契约，独立登录工具和 TTFB 测速不在此配置覆盖范围内。可用 `WB2A_HEADER_PROFILE`、`WB2A_CLIENT_VERSION_CN`、`WB2A_CLIENT_VERSION_GLOBAL`、`WB2A_CLI_VERSION` 覆盖；`header_profile=legacy` 恢复旧头部和版本。版本值必须是安全的版本号，修改需重启。
 
 `upstream.model_optimization` 默认 `false`，聊天发送 `X-Private-Data: true`，表示不允许用于模型优化。设为 `true` 只对个人账号发送 `false`；带 enterpriseId 或类型为 ultimate/exclusive 的账号仍发送 `true`。环境变量为 `WB2A_MODEL_OPTIMIZATION`，修改需重启。这是向上游声明的偏好，不是对上游数据处理的保证。

@@ -195,11 +195,10 @@ func (h *Handler) exportAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		a.DeviceIdentity()
 		c := a.Snapshot()
+		c.DeviceProfile = a.Device()
 		credential := map[string]any{"uid": c.UID, "nickname": c.Nickname, "accessToken": c.AccessToken, "refreshToken": c.RefreshToken, "domain": c.Domain, "enterpriseId": c.EnterpriseID, "expiresAt": c.ExpiresAt}
 		c.AddAuthorityMetadata(credential, credential)
-		if c.DeviceID != "" {
-			credential["_device_identity"] = c.DeviceID
-		}
+		c.AddDeviceMetadata(credential)
 		raw, _ := json.Marshal(credential)
 		gs := []string{"default"}
 		if h.cfg.Groups != nil {

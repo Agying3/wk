@@ -155,7 +155,7 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	req.Header.Set("x-client-platform", "web")
 	req.Header.Set("User-Agent", clientUA)
 	if c.desktopHeaders() {
-		req.Header.Set("User-Agent", webUA)
+		req.Header.Set("User-Agent", browserUserAgent(a))
 	}
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)

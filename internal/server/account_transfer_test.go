@@ -11,11 +11,42 @@ import (
 	"testing"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/device"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/pool"
 )
 
 const transferTestPassword = "test-only-long-transfer-password"
+
+func TestAccountTransferPreservesMacDeviceRecord(t *testing.T) {
+	source, _ := testTransferHandler(t)
+	if err := os.MkdirAll(source.cfg.AuthDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	id, profile, _ := device.NewMac()
+	a := &auth.Auth{UID: "mac-migration", Domain: "www.codebuddy.cn", AccessToken: "fake-at", RefreshToken: "fake-rt", DeviceID: id, DeviceProfile: profile, FilePath: filepath.Join(source.cfg.AuthDir, "workbuddy-mac-migration.json")}
+	if err := a.SaveAtomic(); err != nil {
+		t.Fatal(err)
+	}
+	source.cfg.Pool.Add(a)
+	exported := transferRequest(t, source, "/admin/accounts/export", map[string]any{"uids": []string{a.UID}, "password": transferTestPassword})
+	if exported.Code != 200 {
+		t.Fatal(exported.Body.String())
+	}
+	var bundle accountTransferBundle
+	if err := json.Unmarshal(exported.Body.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	target, _ := testTransferHandler(t)
+	imported := transferRequest(t, target, "/admin/accounts/import", accountImportRequest{Bundle: bundle, Password: transferTestPassword, UIDs: []string{a.UID}})
+	if imported.Code != 200 {
+		t.Fatal(imported.Body.String())
+	}
+	b := target.cfg.Pool.AuthByUID(a.UID)
+	if b == nil || b.Device() != profile || b.Snapshot().DeviceID != id {
+		t.Fatal("migration reassigned the Mac device")
+	}
+}
 
 func transferRequest(t *testing.T, h http.Handler, path string, body any) *httptest.ResponseRecorder {
 	t.Helper()

@@ -35,7 +35,7 @@ func (c *Client) RefreshTokenContext(ctx context.Context, a *auth.Auth) error {
 		// that lock inside a shared flight: it would invert the wait order.
 		// Coalescing and the final credential CAS provide serialization here.
 		current := a.Snapshot()
-		if current != before {
+		if !sameRefreshCredential(current, before) {
 			if current.UID != before.UID || current.EnterpriseID != before.EnterpriseID || current.Domain != before.Domain || current.Authority != before.Authority {
 				return nil, fmt.Errorf("refresh discarded: account changed")
 			}
@@ -65,10 +65,17 @@ func (c *Client) RefreshTokenContext(ctx context.Context, a *auth.Auth) error {
 	}
 }
 
+// Persisting a device record or changing a nickname does not rotate tokens.
+// Only a changed credential/authority makes an in-flight refresh obsolete.
+func sameRefreshCredential(a, b auth.Credentials) bool {
+	return a.AccessToken == b.AccessToken && a.RefreshToken == b.RefreshToken && a.ExpiresAt == b.ExpiresAt &&
+		a.Domain == b.Domain && a.UID == b.UID && a.EnterpriseID == b.EnterpriseID && a.Authority == b.Authority
+}
+
 func authFromCredentials(s auth.Credentials) *auth.Auth {
 	return &auth.Auth{AccessToken: s.AccessToken, RefreshToken: s.RefreshToken, ExpiresAt: s.ExpiresAt,
 		Domain: s.Domain, UID: s.UID, EnterpriseID: s.EnterpriseID, Nickname: s.Nickname,
-		FilePath: s.FilePath, DeviceID: s.DeviceID, Authority: s.Authority}
+		FilePath: s.FilePath, DeviceID: s.DeviceID, DeviceProfile: s.DeviceProfile, Authority: s.Authority}
 }
 
 func (c *Client) refreshCredential(ctx context.Context, a *auth.Auth, before auth.Credentials) (auth.Credentials, error) {

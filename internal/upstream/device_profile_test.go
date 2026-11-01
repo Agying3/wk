@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/device"
 )
 
 func TestAccountDeviceStableAcrossCredentialAndClientChanges(t *testing.T) {
@@ -57,6 +58,57 @@ func TestAccountDevicePopulationAllowsSharedHardware(t *testing.T) {
 	}
 	if !shared {
 		t.Fatal("hardware profiles must allow sharing across accounts")
+	}
+}
+
+func TestMixedMacAndWindowsDevicesDoNotSharePlatformFields(t *testing.T) {
+	id, profile, err := device.NewMac()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := &auth.Auth{UID: "mac-account", AccessToken: "fake-at", DeviceID: id, DeviceProfile: profile}
+	windows := &auth.Auth{UID: "old-windows-account", AccessToken: "fake-at"}
+	before := desktopFingerprint(windows)
+	c := &Client{ClientSettings: DefaultClientSettings()}
+	for _, a := range []*auth.Auth{mac, windows, mac, windows} {
+		fp := desktopFingerprint(a)
+		req, _ := http.NewRequest("POST", "https://example.test/v2/chat/completions", strings.NewReader("{}"))
+		c.chatHeaders(req, a)
+		if a == mac {
+			if fp["os"] != "darwin" || fp["arch"] != "arm64" || fp["cpuModel"] != "Apple M2" || fp["machineId"] != profile.MachineID || fp["sessionId"] != "" {
+				t.Fatal("incorrect Mac telemetry")
+			}
+			if req.Header.Get("X-Stainless-OS") != "MacOS" || req.Header.Get("X-Stainless-Arch") != "arm64" || !strings.Contains(browserUserAgent(a), "Macintosh") {
+				t.Fatal("incorrect Mac request profile")
+			}
+		} else {
+			for _, key := range []string{"os", "arch", "osVersion", "cpuCores", "memorySize", "machineId", "sessionId", "timezone"} {
+				if fp[key] != before[key] {
+					t.Fatalf("legacy Windows field %s changed", key)
+				}
+			}
+			if req.Header.Get("X-Stainless-OS") != "" || browserUserAgent(a) != webUA {
+				t.Fatal("Mac-only headers leaked to Windows account")
+			}
+		}
+	}
+}
+
+func TestMacWebReportKeepsStoredBrowserIdentity(t *testing.T) {
+	id, profile, _ := device.NewMac()
+	a := &auth.Auth{UID: "mac-web", AccessToken: "fake-at", DeviceID: id, DeviceProfile: profile}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		var events []map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 1 || events[0]["os"] != "macOS" || events[0]["machineId"] != profile.WebMachineID || events[0]["userAgent"] != macBrowserUA || r.Header.Get("User-Agent") != macBrowserUA {
+			t.Fatal("Mac browser and event disagree")
+		}
+		return jsonResp(200, `{"code":0,"data":{}}`), nil
+	})
+	if err := c.ReportWebEvent(a, "fixture_event", "https://www.workbuddy.cn/profile", "fixture", "fixture"); err != nil {
+		t.Fatal(err)
 	}
 }
 

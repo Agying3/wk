@@ -19,8 +19,6 @@ package upstream
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,13 +40,19 @@ const (
 // deriveID uses a persisted opaque identity. Legacy/read-only accounts retain
 // their previous UID-based identity so persistence failures do not break chat.
 func deriveID(a *auth.Auth, salt string) string {
-	creds := a.Snapshot()
-	identity := a.DeviceIdentity()
-	if identity == "" {
-		identity = creds.UID // Legacy fallback for read-only/in-memory accounts.
+	p := a.Device()
+	switch salt {
+	case "machine":
+		return p.MachineID
+	case "session":
+		return p.SessionID
+	case "webmachine":
+		return p.WebMachineID
+	case "mpmachine":
+		return p.MPMachineID
+	default:
+		panic("unknown device identity scope")
 	}
-	sum := sha256.Sum256([]byte(salt + ":" + identity))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
 }
 
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
@@ -57,10 +61,14 @@ type DesktopEvent map[string]any
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	creds := a.Snapshot()
-	device := deviceProfileForUID(creds.UID)
+	device := a.Device()
 	now := time.Now().UnixMilli()
-	return map[string]any{
-		"timezone":     "Asia/Shanghai",
+	osName := "win32"
+	if device.IsMac() {
+		osName = "darwin"
+	}
+	fp := map[string]any{
+		"timezone":     device.Timezone,
 		"reportDelay":  2000,
 		"userId":       creds.UID,
 		"username":     creds.Nickname,
@@ -71,18 +79,22 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
 		"ideVersion":   desktopVersion,
-		"machineId":    deriveID(a, "machine"),
-		"sessionId":    deriveID(a, "session"),
+		"machineId":    device.MachineID,
+		"sessionId":    device.SessionID,
 		"extName":      "workbuddy-desktop",
 		"extVersion":   desktopVersion,
-		"os":           "win32",
-		"arch":         "x64",
-		"osVersion":    device.osVersion,
-		"cpuCores":     device.cpuCores,
-		"memorySize":   device.memoryGiB,
+		"os":           osName,
+		"arch":         device.Arch,
+		"osVersion":    device.OSVersion,
+		"cpuCores":     device.CPUCores,
+		"memorySize":   device.MemoryGiB,
 		"timestamp":    now,
 		"presentAt":    now,
 	}
+	if device.CPUModel != "" {
+		fp["cpuModel"] = device.CPUModel
+	}
+	return fp
 }
 
 // ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
@@ -274,13 +286,16 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
 	creds := a.Snapshot()
-	ua := webUA
+	ua := browserUserAgent(a)
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": ua,
 		"machineId": deriveID(a, "webmachine"), "userId": creds.UID,
 		"userNickname": creds.Nickname, "enterpriseId": creds.EnterpriseID,
+	}
+	if a.Device().IsMac() {
+		ev["os"], ev["osVersion"] = "macOS", "10.15.7"
 	}
 	raw, err := json.Marshal([]map[string]any{ev})
 	if err != nil {
