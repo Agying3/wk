@@ -94,6 +94,12 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	}
 	creds := a.Snapshot()
 	fp := desktopFingerprint(a)
+	if c.desktopHeaders() {
+		fp["ideVersion"], fp["extVersion"] = c.clientVersion(a), c.clientVersion(a)
+		// Build hashes/dates belong to a particular binary; do not reuse 5.5.6's.
+		delete(fp, "commit")
+		delete(fp, "releaseDate")
+	}
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		arr = append(arr, mergeReportEvent(fp, ev))
@@ -109,12 +115,17 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", c.desktopUserAgent(a, false))
 	req.Header.Set("X-Domain", c.chatBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("X-Request-ID", NewEventID())
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
+	}
+	if c.desktopHeaders() {
+		req.Header.Del("X-Domain")
+		c.commonHeaders(req, a)
+		req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	}
 	_, err = c.doJSON(req, a)
 	return err
@@ -211,10 +222,13 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", c.desktopUserAgent(a, false))
 	req.Header.Set("X-Product", "SaaS")
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
+	}
+	if c.desktopHeaders() {
+		c.commonHeaders(req, a)
 	}
 	_, err = c.doJSON(req, a)
 	return err
@@ -392,7 +406,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", c.desktopUserAgent(a, false))
 	req.Header.Set("X-Domain", c.chatBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	if creds.UID != "" {
@@ -400,6 +414,10 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
+	}
+	if c.desktopHeaders() {
+		req.Header.Del("X-Domain")
+		c.commonHeaders(req, a)
 	}
 	data, err := c.doJSON(req, a)
 	if err != nil {
@@ -450,7 +468,7 @@ func (c *Client) DesktopChatWithExpertObserved(a *auth.Auth, expertID string) (r
 	h.Set("Authorization", "Bearer "+creds.AccessToken)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
+	h.Set("User-Agent", c.desktopUserAgent(a, true))
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", creds.UID)
@@ -462,6 +480,11 @@ func (c *Client) DesktopChatWithExpertObserved(a *auth.Auth, expertID string) (r
 	h.Set("X-IDE-Type", "WorkBuddy")
 	h.Set("X-IDE-Version", desktopVersion)
 	h.Set("x-codebuddy-request", "1")
+	if c.desktopHeaders() {
+		c.chatHeaders(req, a)
+		h.Del("x-codebuddy-request")
+	}
+	c.privacyHeaders(req, a)
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
 	}

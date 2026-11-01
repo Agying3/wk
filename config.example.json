@@ -31,6 +31,12 @@
     "autoenroll_growth_tasks": false
   },
   "upstream": {
+	"header_profile": "desktop",
+	"client_version_cn": "5.9.3",
+	"client_version_global": "5.9.4",
+	"cli_version": "2.165.0",
+	"model_optimization": false,
+	"refresh_identity_check": "best_effort",
     "tls_fingerprint": true,
     "shared_conversation_trace": true,
     "timeout_seconds": 120,

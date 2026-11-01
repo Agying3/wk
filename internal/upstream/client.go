@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"workbuddy2api/internal/auth"
 )
 
@@ -215,6 +217,8 @@ type apiEnvelope struct {
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
 	HTTP *http.Client
+	ClientSettings
+	refreshes singleflight.Group
 	// Network options are fixed before serving; changing them requires restart.
 	TLSFingerprint          bool
 	SharedConversationTrace bool
@@ -430,48 +434,9 @@ func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error
 }
 
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
-// 调用方负责 SaveAtomic。全程持 a 锁，防止并发 SaveAtomic 读半更新 token。
+// 调用方负责 SaveAtomic。并发刷新合并，凭证包通过条件更新原子应用。
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	return c.RefreshTokenContext(context.Background(), a)
-}
-
-// RefreshTokenContext applies a separate HTTP deadline to recovery requests.
-func (c *Client) RefreshTokenContext(ctx context.Context, a *auth.Auth) error {
-	a.Lock()
-	defer a.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	credentials := a.Snapshot()
-	if strings.TrimSpace(credentials.RefreshToken) == "" {
-		return fmt.Errorf("no refreshToken")
-	}
-	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
-	if err != nil {
-		return err
-	}
-	RefreshHeaders(req, a)
-	data, err := c.doJSON(req, a)
-	if err != nil {
-		return err
-	}
-	var tok struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresIn    int64  `json:"expiresIn"`
-		Domain       string `json:"domain"`
-	}
-	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
-	}
-	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
-	expiresAt := int64(0)
-	if tok.ExpiresIn > 0 {
-		expiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	}
-	a.ApplyRefresh(tok.AccessToken, tok.RefreshToken, tok.Domain, expiresAt)
-	return nil
 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
@@ -588,7 +553,7 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 		cancel()
 		return nil, 0, nil, nil, err
 	}
-	ChatHeaders(req, a)
+	c.chatHeaders(req, a)
 	applyChatTrace(req)
 
 	// 等响应头单独设一个可解除的看门狗。不能直接用 context.WithTimeout 当这个窗口：
@@ -697,6 +662,10 @@ func (c *Client) FetchModelsContext(ctx context.Context, a *auth.Auth) ([]ModelI
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", clientUA)
+	if c.desktopHeaders() {
+		c.commonHeaders(req, a)
+		req.Header.Set("Accept", "application/json")
+	}
 	// 账号级统一路由（reqproxy）：经钩子取该账号 client（代理 Transport 或直连原样）。
 	cli, err := c.proxyClientFor(a)
 	if err != nil {
@@ -851,7 +820,7 @@ func (c *Client) UserRequestUsageContext(ctx context.Context, a *auth.Auth, star
 	if err != nil {
 		return nil, 0, err
 	}
-	BillingHeaders(req, a)
+	c.billingHeaders(req, a)
 	data, err := c.doJSON(req, a)
 	if err != nil {
 		return nil, 0, err
@@ -889,7 +858,7 @@ func (c *Client) UserResourceDetailsContext(ctx context.Context, a *auth.Auth) (
 	if err != nil {
 		return ResourceUsage{}, err
 	}
-	BillingHeaders(req, a)
+	c.billingHeaders(req, a)
 	data, err := c.doJSON(req, a)
 	if err != nil {
 		return ResourceUsage{}, err
@@ -963,7 +932,7 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 	if err != nil {
 		return err
 	}
-	BillingHeaders(req, a)
+	c.billingHeaders(req, a)
 	_, err = c.doJSON(req, a)
 	return err
 }

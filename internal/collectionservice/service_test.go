@@ -175,6 +175,33 @@ func TestCollection401RefreshIsCoalesced(t *testing.T) {
 	}
 }
 
+func TestCollectionRefreshPreservesVerifiedAuthority(t *testing.T) {
+	s, a := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			fmt.Fprint(w, `{"code":0,"data":{"accessToken":"fresh-fake","expiresIn":3600,"tokenType":"Bearer"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"code":0,"data":{"uid":"a","type":"personal","idp":"verified","oneidAccountId":"oid"}}`)
+	})
+	s.Upstream.RefreshIdentityCheck = "strict"
+	a.ApplyRefresh("fake-access", "", "", time.Now().Add(-time.Hour).Unix())
+	a.FilePath = filepath.Join(t.TempDir(), "workbuddy.json")
+	if _, err := s.run(context.Background(), collection.Target{UID: a.UID, Resource: "credential"}, collection.Snapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(a.FilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := auth.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Snapshot().IDP != "verified" || saved.Snapshot().TokenType != "Bearer" || saved.Snapshot().OneIDAccountID != "oid" {
+		t.Fatal("collection refresh lost authority metadata")
+	}
+}
+
 func TestCollectionCredentialDeletionDoesNotRecreateFile(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})

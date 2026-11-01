@@ -27,6 +27,7 @@ type Auth struct {
 	EnterpriseID string
 	Nickname     string
 	FilePath     string // 来源文件；refresh 后原子写回此处
+	Authority
 	// ImportDisabled is immutable metadata: if pool state is lost or an import
 	// crashes after installing its file, a fresh pool must quarantine this auth.
 	ImportDisabled bool
@@ -47,11 +48,11 @@ type Credentials struct {
 	Nickname     string
 	FilePath     string
 	DeviceID     string
+	Authority
 }
 
-// Lock serializes refresh operations for one account. Credential field access
-// still goes through Snapshot and ApplyRefresh so HTTP calls never observe a
-// partially updated token bundle.
+// Lock serializes account maintenance callers. Upstream refreshes coalesce
+// requests independently and apply credentials atomically through a CAS.
 func (a *Auth) Lock() { a.refreshMu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
@@ -64,7 +65,7 @@ func (a *Auth) Snapshot() Credentials {
 	return Credentials{
 		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresAt: a.ExpiresAt,
 		Domain: a.Domain, UID: a.UID, EnterpriseID: a.EnterpriseID,
-		Nickname: a.Nickname, FilePath: a.FilePath, DeviceID: a.DeviceID,
+		Nickname: a.Nickname, FilePath: a.FilePath, DeviceID: a.DeviceID, Authority: a.Authority,
 	}
 }
 
@@ -201,6 +202,26 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	tokenFields, accountFields := probe, probe
+	if _, nested := probe["auth"]; nested {
+		tokenFields, accountFields = nil, nil
+		if err := json.Unmarshal(probe["auth"], &tokenFields); err != nil {
+			return nil, fmt.Errorf("storage_parse_error: token metadata")
+		}
+		if raw, ok := probe["account"]; ok && json.Unmarshal(raw, &accountFields) != nil {
+			return nil, fmt.Errorf("storage_parse_error: account metadata")
+		}
+	}
+	for name, target := range map[string]*string{"type": &a.AccountType, "oneidAccountId": &a.OneIDAccountID, "idp": &a.IDP, "departmentFullName": &a.DepartmentFullName} {
+		if raw, ok := accountFields[name]; ok {
+			// Optional extensions in legacy files may use unrelated shapes.
+			// Keep accepting their core credentials, as before this metadata.
+			_ = json.Unmarshal(raw, target)
+		}
+	}
+	if raw, ok := tokenFields["tokenType"]; ok {
+		_ = json.Unmarshal(raw, &a.TokenType)
+	}
 	// 凭证字段会直接进请求头（X-User-Id / X-Enterprise-Id / X-Refresh-Token，
 	// 见 internal/upstream/headers.go）。Go 的 net/http 目前会把头值里的 CR/LF
 	// "中和"掉而不是拒绝，所以这不是可用的请求拆分；但结果是发出去的头被静默
@@ -283,6 +304,7 @@ func (a *Auth) SaveAtomic() error {
 	if snapshot.DeviceID != "" {
 		doc["_device_identity"] = snapshot.DeviceID
 	}
+	snapshot.AddAuthorityMetadata(doc["auth"].(map[string]any), doc["account"].(map[string]any))
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err

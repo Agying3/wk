@@ -13,6 +13,7 @@ import (
 
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/responsehistory"
+	"workbuddy2api/internal/upstream"
 )
 
 // Config 顶层配置。
@@ -79,6 +80,7 @@ type Config struct {
 	} `json:"schedule"`
 
 	Upstream struct {
+		upstream.ClientSettings
 		// Restart required. Both options retain an explicit legacy opt-out.
 		TLSFingerprint          bool `json:"tls_fingerprint"`
 		SharedConversationTrace bool `json:"shared_conversation_trace"`
@@ -300,6 +302,7 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Upstream.TimeoutSeconds = 120
 	c.Upstream.TLSFingerprint = true
+	c.Upstream.ClientSettings = upstream.DefaultClientSettings()
 	c.Upstream.SharedConversationTrace = true
 	// 流式默认不限总时长，只守空闲窗口。这正是本次改造的目的：长回答不再被一个
 	// 整请求超时掐断，而上游卡住时仍会在 StreamIdleSeconds 内失败。
@@ -460,6 +463,22 @@ func applyEnv(c *Config) {
 			c.Upstream.TLSFingerprint = b
 		}
 	}
+	for name, target := range map[string]*string{
+		"WB2A_HEADER_PROFILE":         &c.Upstream.HeaderProfile,
+		"WB2A_CLIENT_VERSION_CN":      &c.Upstream.ClientVersionCN,
+		"WB2A_CLIENT_VERSION_GLOBAL":  &c.Upstream.ClientVersionGlobal,
+		"WB2A_CLI_VERSION":            &c.Upstream.CLIVersion,
+		"WB2A_REFRESH_IDENTITY_CHECK": &c.Upstream.RefreshIdentityCheck,
+	} {
+		if v := os.Getenv(name); v != "" {
+			*target = v
+		}
+	}
+	if v := os.Getenv("WB2A_MODEL_OPTIMIZATION"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.ModelOptimization = b
+		}
+	}
 	if v := os.Getenv("WB2A_SHARED_CONVERSATION_TRACE"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Upstream.SharedConversationTrace = b
@@ -551,6 +570,9 @@ func applyEnv(c *Config) {
 }
 
 func (c *Config) normalize() error {
+	if err := c.Upstream.ClientSettings.Validate(); err != nil {
+		return err
+	}
 	var err error
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

@@ -154,6 +154,9 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
 	req.Header.Set("x-client-platform", "web")
 	req.Header.Set("User-Agent", clientUA)
+	if c.desktopHeaders() {
+		req.Header.Set("User-Agent", webUA)
+	}
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
 	}

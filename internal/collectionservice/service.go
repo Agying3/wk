@@ -51,7 +51,7 @@ func New(store collection.Store, p *pool.Pool, up *upstream.Client, metrics metr
 	return s, nil
 }
 func frozen(c auth.Credentials) *auth.Auth {
-	return &auth.Auth{UID: c.UID, AccessToken: c.AccessToken, RefreshToken: c.RefreshToken, ExpiresAt: c.ExpiresAt, Domain: c.Domain, EnterpriseID: c.EnterpriseID, Nickname: c.Nickname, FilePath: c.FilePath, DeviceID: c.DeviceID}
+	return &auth.Auth{UID: c.UID, AccessToken: c.AccessToken, RefreshToken: c.RefreshToken, ExpiresAt: c.ExpiresAt, Domain: c.Domain, EnterpriseID: c.EnterpriseID, Nickname: c.Nickname, FilePath: c.FilePath, DeviceID: c.DeviceID, Authority: c.Authority}
 }
 func same(a, b auth.Credentials) bool {
 	return a.AccessToken == b.AccessToken && a.RefreshToken == b.RefreshToken && a.Domain == b.Domain
@@ -98,7 +98,9 @@ func (s *Service) refresh(ctx context.Context, a *auth.Auth, rejectedToken strin
 		return obsolete()
 	}
 	after := copy.Snapshot()
-	a.ApplyRefresh(after.AccessToken, after.RefreshToken, after.Domain, after.ExpiresAt)
+	if !a.ApplyRefreshIfCurrent(before, after) {
+		return obsolete()
+	}
 	if a.FilePath != "" {
 		if err := a.SaveAtomic(); err != nil {
 			return &collection.Failure{Kind: "persistence", Message: "凭证已更新，但授权文件保存失败"}

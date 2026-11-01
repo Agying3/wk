@@ -244,6 +244,12 @@ curl http://localhost:7863/v1/messages \
     "keepalive_hours": [22]
   },
   "upstream": {
+	"header_profile": "desktop",
+	"client_version_cn": "5.9.3",
+	"client_version_global": "5.9.4",
+	"cli_version": "2.165.0",
+	"model_optimization": false,
+	"refresh_identity_check": "best_effort",
     "timeout_seconds": 120,
     "stream_timeout_seconds": 0,
     "stream_idle_seconds": 120
@@ -339,6 +345,12 @@ curl http://localhost:7863/v1/messages \
 桌面事件的 Windows 版本、CPU 核数和内存由账号 UID 稳定伪随机分配，允许不同账号选到相同硬件组合。同一 UID 在重启、凭证刷新、账号导入及代理迁移后保持相同档案，无需新增状态文件；小程序上报沿用该档案对应的 Windows 主版本。设备档案 v1 的候选表及选择规则固定，后续修改必须考虑已有账号的一致性。事件业务字段不能覆盖公共设备字段。
 
 上报设备标识在首次需要时生成随机的非敏感本地身份，原子保存到原授权文件的 `_device_identity` 元数据，再按不同上报用途派生标识，不再直接由 UID 推导。初始化保留授权文件中未知的供应商字段，权限仍为 0600；刷新和内置加密导入/导出保留该身份。旧账号首次使用新版本时会迁移一次设备标识，原硬件组合不变。授权文件只读、无法保存或账号仅在内存时沿用旧标识规则，避免临时随机身份随重启变化或阻塞聊天。备份与迁移应保留原授权文件及该元数据。
+
+`upstream.header_profile` 默认 `desktop`：聊天、刷新与已核对的积分/签到接口分别构造请求头。客户端版本集中在 `client_version_cn`（默认 `5.9.3`）、`client_version_global`（`5.9.4`）与 `cli_version`（`2.165.0`）；聊天及桌面事件使用对应区域版本，不沿用旧版本的 commit/releaseDate。账号原有设备档案继续使用。未核对的业务接口保持既有头部契约，独立登录工具和 TTFB 测速不在此配置覆盖范围内。可用 `WB2A_HEADER_PROFILE`、`WB2A_CLIENT_VERSION_CN`、`WB2A_CLIENT_VERSION_GLOBAL`、`WB2A_CLI_VERSION` 覆盖；`header_profile=legacy` 恢复旧头部和版本。版本值必须是安全的版本号，修改需重启。
+
+`upstream.model_optimization` 默认 `false`，聊天发送 `X-Private-Data: true`，表示不允许用于模型优化。设为 `true` 只对个人账号发送 `false`；带 enterpriseId 或类型为 ultimate/exclusive 的账号仍发送 `true`。环境变量为 `WB2A_MODEL_OPTIMIZATION`，修改需重启。这是向上游声明的偏好，不是对上游数据处理的保证。
+
+同一 Client 内重叠的凭证刷新会合并为一次请求，跨账号、区域及不同 token 不共享结果；等待者可独立取消，发起者取消会终止本次共享刷新。刷新响应先暂存，校验后再原子应用，并拒绝覆盖刷新期间导入的新凭证。`upstream.refresh_identity_check` 默认 `best_effort`（`WB2A_REFRESH_IDENTITY_CHECK`）：有 UID 的账号刷新后，以新 access token 查询国内 `/v2/plugin/account` 或国际 `/v2/plugin/accounts`，按 UID、enterpriseId 和已知账号类型选择身份；明确身份、已知授权来源或区域不匹配，以及身份接口拒绝新 token 时，不覆盖旧凭证。临时不可用或旧响应缺字段时，兼容模式继续刷新并仅记录脱敏原因；`strict` 要求校验成功，`off` 关闭额外身份查询。旧授权文件可不含新增元数据；已知 type、oneidAccountId、idp、departmentFullName、tokenType 会在刷新、保存和加密迁移时保留。该查询仍经过原账号代理路由，不改变换号重试条件。
 
 `upstream.tls_fingerprint` 默认开启，通过统一 upstream.Client 发出的 HTTPS 使用 uTLS ClientHello，HTTP/1.1 连接继续复用。账号代理选择保持原逻辑；HTTP/HTTPS CONNECT、SOCKS5 隧道建立后再做同一套上游 TLS 握手，代理失败不新增直连回退。SNI、证书链和主机名校验使用实际目的地址，不使用样本中的域名；握手超时、调用方取消、流式空闲和总时长限制仍有效。HTTP 请求及注入的自定义 RoundTripper 保持原实现。启动时读取，改动后需要重启；设为 false 或 `WB2A_TLS_FINGERPRINT=false` 恢复标准库 TLS。需要自定义客户端证书或 VerifyConnection 回调的部署使用标准库 TLS。独立登录工具、TTFB 测速等自行创建 HTTP 客户端的路径不在此开关覆盖范围内。
 

@@ -419,6 +419,7 @@ func main() {
 	}
 
 	up := upstream.New()
+	up.ClientSettings = cfg.Upstream.ClientSettings
 	up.TLSFingerprint = cfg.Upstream.TLSFingerprint
 	up.SharedConversationTrace = cfg.Upstream.SharedConversationTrace
 	log.Printf("upstream network: tls_fingerprint=%t shared_conversation_trace=%t (restart required)", up.TLSFingerprint, up.SharedConversationTrace)
