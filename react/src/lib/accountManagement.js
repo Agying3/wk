@@ -37,25 +37,69 @@ export function groupChange(current, targets, mode) {
   return [...new Set(result.length ? result : ['default'])];
 }
 
-// The target snapshot is immutable. Cancellation never aborts an in-flight write.
-export async function runAccountBatch(uids, action, { cancelled = () => false, onResult = () => {} } = {}) {
+export const ACCOUNT_BATCH_CONCURRENCY = 4;
+export const ACCOUNT_BATCH_SIZE = 100;
+export const usesLocalAccountBatch = action => ['enable', 'disable', 'clear-cooldown', 'groups'].includes(action);
+
+// Submit local changes in bounded chunks. A received chunk is completed by the
+// server; cancellation affects later chunks. Uncertain writes are never replayed.
+export async function runLocalAccountBatch(uids, send, { cancelled = () => false, onResult = () => {} } = {}) {
   const targets = [...new Set(uids)];
   const results = [];
   let stopped = false;
-  for (const uid of targets) {
-    let row;
-    if (stopped || cancelled()) row = { uid, status: 'cancelled', detail: '未执行' };
-    else {
+  const report = row => { results.push(row); onResult(row, results.length); };
+  for (let start = 0; start < targets.length; start += ACCOUNT_BATCH_SIZE) {
+    const chunk = targets.slice(start, start + ACCOUNT_BATCH_SIZE);
+    if (stopped || cancelled()) {
+      chunk.forEach(uid => report({ uid, status: 'cancelled', detail: '未提交' }));
+      continue;
+    }
+    try {
+      const response = await send(chunk);
+      const rows = response?.results;
+      const byUID = new Map(Array.isArray(rows) ? rows.map(row => [row.uid, row]) : []);
+      if (!Array.isArray(rows) || rows.length !== chunk.length || byUID.size !== chunk.length
+        || chunk.some(uid => !['success', 'failed'].includes(byUID.get(uid)?.status))) {
+        throw new Error('批量回执不完整，状态可能已变化，请刷新核对');
+      }
+      chunk.forEach(uid => report(byUID.get(uid)));
+      stopped = response.stop === true;
+    } catch (error) {
+      stopped = true;
+      chunk.forEach(uid => report({ uid, status: 'failed', detail: error.message || '批量请求失败，状态可能已变化，请刷新核对' }));
+    }
+  }
+  return results;
+}
+
+// Only independent accounts run together. Cancellation stops dispatch, never an in-flight write.
+export async function runAccountBatch(uids, action, { cancelled = () => false, onResult = () => {}, concurrency = ACCOUNT_BATCH_CONCURRENCY } = {}) {
+  const targets = [...new Set(uids)];
+  const results = new Array(targets.length);
+  const workers = Math.min(targets.length, Math.max(1, Math.min(ACCOUNT_BATCH_CONCURRENCY, Number.isFinite(concurrency) ? Math.floor(concurrency) : ACCOUNT_BATCH_CONCURRENCY)));
+  let next = 0;
+  let completed = 0;
+  let stopped = false;
+  const shouldStop = () => stopped || cancelled();
+  const report = (index, row) => { results[index] = row; onResult(row, ++completed); };
+  const work = async () => {
+    while (next < targets.length && !shouldStop()) {
+      const index = next++;
+      const uid = targets[index];
+      let row;
       try {
-        const result = await action(uid);
-        row = { uid, status: result?.ok === false ? 'failed' : 'success', detail: result?.detail || result?.message || '操作成功' };
+        const result = await action(uid, { cancelled: shouldStop });
+        row = { uid, status: result?.cancelled ? 'cancelled' : result?.ok === false ? 'failed' : 'success', detail: result?.detail || result?.message || '操作成功' };
       } catch (error) {
         row = { uid, status: 'failed', detail: error.message || '请求失败，状态可能已变化，请刷新核对' };
-        if (!error.status || error.status === 401 || error.status === 403) stopped = true;
+        if (!error.status || [401, 403, 429].includes(error.status)) stopped = true;
       }
+      report(index, row);
     }
-    results.push(row);
-    onResult(row, results.length);
+  };
+  await Promise.all(Array.from({ length: workers }, work));
+  for (; next < targets.length; next++) {
+    report(next, { uid: targets[next], status: 'cancelled', detail: '未执行' });
   }
   return results;
 }

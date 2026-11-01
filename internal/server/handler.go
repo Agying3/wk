@@ -508,6 +508,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/reqproxy/events", h.withFrontend(h.reqproxyEventsGet))
 	h.mux.HandleFunc("POST /admin/reqproxy/rules/preview", h.withFrontend(h.reqproxyRulesPreview))
 	h.mux.HandleFunc("POST /admin/account/{uid}/enable", h.withFrontend(h.enableAccount))
+	h.mux.HandleFunc("POST /admin/accounts/batch", h.withFrontend(h.accountBatch))
 	h.mux.HandleFunc("POST /admin/account/{uid}/disable", h.withFrontend(h.disableAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/clear-cooldown", h.withFrontend(h.clearCooldownAccount))
 	h.mux.HandleFunc("POST /admin/account/{uid}/checkin", h.withFrontend(h.checkinAccount))

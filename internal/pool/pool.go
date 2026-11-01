@@ -739,6 +739,29 @@ func (p *Pool) Flush() {
 	}
 }
 
+// FlushWithError is an administrative commit barrier. File mode writes a fresh
+// snapshot even if a periodic flusher already consumed the dirty flag. Database
+// mode serializes snapshot collection and commit, retaining later dirty versions.
+func (p *Pool) FlushWithError() error {
+	p.mu.RLock()
+	hasPersister := p.persister != nil
+	p.mu.RUnlock()
+	if hasPersister {
+		return p.flushDirtySet()
+	}
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
+	p.mu.Lock()
+	sf := p.stateOverviewLocked()
+	p.dirty.Store(false)
+	p.mu.Unlock()
+	err := p.persistSnapshot(sf)
+	if err != nil {
+		p.dirty.Store(true)
+	}
+	return err
+}
+
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 // 文件模式不置全量脏标记（历史语义：Add 不触发 state.json 落盘，新账号由
 // SyncToDir/状态变更路径兜底）；DB 模式仍按行 upsert（新账号需要入库，
@@ -1873,26 +1896,32 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 // 锁纪律：调用方持有 p.mu，本方法只做 O(n) 的内存快照（微秒级），
 // 然后释放 p.mu 再做序列化/写盘/镜像（见 persistSnapshot）——磁盘 I/O
 // 不能发生在池锁内，否则每 5s 的 flusher 会把所有选号请求卡一个磁盘延迟。
-// 快照顺序由 persistMu 保证先序：持 p.mu 期间若发现已有更新的落盘在进行中，
-// 本次跳过并保持 dirty（下一次 flush 周期会带上最新状态重试）。
-func (p *Pool) saveLocked() {
-	p.persistMu.Lock()
-	sf := p.stateOverviewLocked()
+// 等待 persistMu 前释放池锁；取得持久化锁后再读取最新快照，保证写入顺序。
+func (p *Pool) saveLocked() error {
 	p.mu.Unlock()
-	p.persistSnapshot(sf)
+	p.persistMu.Lock()
+	p.mu.Lock()
+	sf := p.stateOverviewLocked()
+	p.dirty.Store(false)
+	p.mu.Unlock()
+	err := p.persistSnapshot(sf)
+	if err != nil {
+		p.dirty.Store(true)
+	}
 	p.persistMu.Unlock()
+	return err
 }
 
 // persistSnapshot 序列化快照、写本地 state.json（临时文件 + rename 原子替换）、
 // 同步镜像一份带 savedAt 的快照到 Redis（fire-and-forget）。
 // 调用方必须已持有 persistMu 且**不再持有 p.mu**（写盘慢盘毫秒级，不能阻塞选号）。
 // 落盘失败按 notePersistFail 节流打日志；stateFp 为空时跳过本地写（镜像仍执行）。
-func (p *Pool) persistSnapshot(sf stateFile) {
+func (p *Pool) persistSnapshot(sf stateFile) error {
 	if p.stateFp != "" {
 		raw, err := json.MarshalIndent(sf, "", "  ")
 		if err != nil {
 			p.notePersistFail(err, false)
-			return
+			return err
 		}
 		if dir := filepath.Dir(p.stateFp); dir != "" {
 			_ = os.MkdirAll(dir, 0o755)
@@ -1900,11 +1929,11 @@ func (p *Pool) persistSnapshot(sf stateFile) {
 		tmp := p.stateFp + ".tmp"
 		if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 			p.notePersistFail(err, false)
-			return
+			return err
 		}
 		if err := os.Rename(tmp, p.stateFp); err != nil {
 			p.notePersistFail(err, false)
-			return
+			return err
 		}
 		if p.persistFails > 0 {
 			// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
@@ -1921,6 +1950,7 @@ func (p *Pool) persistSnapshot(sf stateFile) {
 			p.store.SaveState(snapRaw)
 		}
 	}
+	return nil
 }
 
 // notePersistFail 记录一次落盘失败（state.json 或 state.db），并按节流规则

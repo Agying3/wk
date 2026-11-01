@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AccountSnapshots, CollectionLaunch, CollectionTag } from '../components/Collection';
 import { Alert, App, Button, Card, Checkbox, Descriptions, Drawer, Dropdown, Empty, Input, Modal, Progress, Select, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { ApartmentOutlined, DownloadOutlined, MoreOutlined, PlusOutlined, ReloadOutlined, SearchOutlined, SettingOutlined, UploadOutlined } from '@ant-design/icons';
-import { accountCSV, accountReason, accountState, deadline, downloadFile, filterAccounts, groupChange, groupsOf, runAccountBatch, stateColors, stateLabels } from '../lib/accountManagement';
+import { ACCOUNT_BATCH_CONCURRENCY, ACCOUNT_BATCH_SIZE, accountCSV, accountReason, accountState, deadline, downloadFile, filterAccounts, groupsOf, runAccountBatch, runLocalAccountBatch, stateColors, stateLabels, usesLocalAccountBatch } from '../lib/accountManagement';
 import AccountTransfer from '../components/AccountTransfer';
 
 const { Text } = Typography;
@@ -67,15 +67,15 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
     const token = { cancelled: false }; active.current = token; setConfirm(null); setJobOpen(true);
     setJob({ operation, running: true, rows: [], total: operation.uids.length });
     try {
-      await runAccountBatch(operation.uids, async uid => {
-        if (operation.action === 'groups') {
-          const current = await api(`/admin/accounts/${encodeURIComponent(uid)}/groups`);
-          if (token.cancelled) return { ok: false, detail: '已取消，未修改分组' };
-          const next = groupChange(current.groups?.length ? current.groups : ['default'], operation.groups, operation.mode);
-          return api(`/admin/accounts/${encodeURIComponent(uid)}/groups`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ groups: next }) });
-        }
-        return api(`/admin/account/${encodeURIComponent(uid)}${operation.action === 'delete' ? '' : `/${operation.action}`}`, { method: operation.action === 'delete' ? 'DELETE' : 'POST' });
-      }, { cancelled: () => token.cancelled, onResult: row => { if (alive.current) setJob(current => ({ ...current, rows: [...current.rows, row] })); } });
+      const options = { cancelled: () => token.cancelled, onResult: row => { if (alive.current) setJob(current => ({ ...current, rows: [...current.rows, row] })); } };
+      if (usesLocalAccountBatch(operation.action)) {
+        await runLocalAccountBatch(operation.uids, uids => api('/admin/accounts/batch', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uids, action: operation.action, ...(operation.action === 'groups' ? { groups: operation.groups, mode: operation.mode } : {}) }),
+        }), options);
+      } else {
+        await runAccountBatch(operation.uids, uid => api(`/admin/account/${encodeURIComponent(uid)}${operation.action === 'delete' ? '' : `/${operation.action}`}`, { method: operation.action === 'delete' ? 'DELETE' : 'POST' }), options);
+      }
     } finally { active.current = null; if (alive.current) { setJob(current => ({ ...current, running: false })); setSelected([]); await reload(); } }
   };
   const count = status => job?.rows.filter(r => r.status === status).length || 0;
@@ -119,13 +119,13 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
       <Table rowKey="uid" columns={columns} dataSource={filtered} size="middle" scroll={{ x: Math.max(1000, columns.reduce((sum, c) => sum + c.width, 48)) }} rowSelection={{ selectedRowKeys: selected, preserveSelectedRowKeys: true, onChange: keys => setSelected(keys.slice(0, 1000)), getCheckboxProps: () => ({ disabled: running }), columnWidth: 44 }} pagination={{ current: page, pageSize, showSizeChanger: true, pageSizeOptions: [25, 50, 100], showTotal: total => `共 ${total} 个账号`, onChange: (next, size) => { setPage(size === pageSize ? next : 1); setPageSize(size); } }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={accounts.length ? '没有匹配的账号，试试重置筛选' : '暂无账号，可添加或导入账号'} /> }} />
     </Card>
     <Modal zIndex={1300} cancelText="取消" title={`${labels[confirm?.action] || ''}账号`} open={!!confirm} onCancel={() => setConfirm(null)} okText={confirm?.action === 'delete' ? '确认删除' : '确认执行'} okButtonProps={{ danger: confirm?.action === 'delete', disabled: confirm?.action === 'delete' ? deleteText !== 'DELETE' : confirm?.action === 'groups' && !targetGroups.length }} onOk={() => { void execute({ ...confirm, groups: [...targetGroups], mode: groupMode }); }}>
-      <p>将对已选定的 <strong>{confirm?.uids.length || 0}</strong> 个账号执行{labels[confirm?.action]}。每项独立处理，失败项会保留原因。</p>
+      <p>将对已选定的 <strong>{confirm?.uids.length || 0}</strong> 个账号执行{labels[confirm?.action]}。{usesLocalAccountBatch(confirm?.action) ? `每批最多 ${ACCOUNT_BATCH_SIZE} 个账号，服务端集中处理并保存；取消只停止尚未提交的批次。` : `最多 ${ACCOUNT_BATCH_CONCURRENCY} 个账号同时处理。`}每项独立返回结果，失败项会保留原因。</p>
       {confirm?.action === 'delete' && <><Alert type="error" showIcon message="删除账号及授权文件，无法直接恢复。有在途请求的账号会报错并保留。" /><Input aria-label="删除确认" placeholder="输入 DELETE 确认删除" value={deleteText} onChange={e => setDeleteText(e.target.value)} style={{ marginTop: 12 }} /></>}
       {confirm?.action === 'enable' && <Alert type="warning" message="启用将清除禁用及冷却状态；上游仍拒绝的账号可能再次被禁用。" />}
       {confirm?.action === 'disable' && <Alert type="info" message="停止接收新请求，正在处理的请求继续完成。" />}
       {confirm?.action === 'clear-cooldown' && <Alert type="info" message="清除账号/模型冷却及熔断，保留禁用状态。" />}
-      {['checkin', 'keepalive'].includes(confirm?.action) && <Alert type="warning" showIcon message="将串行发送真实上游请求，可能产生用量。取消只停止尚未发出的请求。" />}
-      {confirm?.action === 'groups' && <Space direction="vertical" style={{ width: '100%' }}><Select aria-label="分组操作方式" style={{ width: '100%' }} value={groupMode} onChange={v => { setGroupMode(v); setTargetGroups([]); }} options={[{ value: 'replace', label: '迁移到目标分组（替换现有归属）' }, { value: 'append', label: '追加分组（保留现有归属）' }, { value: 'remove', label: '移出指定分组' }]} /><Select aria-label="目标分组" mode="multiple" placeholder="选择目标分组" style={{ width: '100%' }} value={targetGroups} onChange={setTargetGroups} options={compatibleGroups.map(g => ({ value: g.name, label: `${g.name} · ${g.region === 'all' ? '所有区域' : g.region === 'global' ? '海外版' : '中国区'}` }))} /><Text type="secondary">追加/移出前读取最新归属。移出最后一个分组后回到 default。只列出区域兼容的目标。</Text></Space>}
+      {['checkin', 'keepalive'].includes(confirm?.action) && <Alert type="warning" showIcon message={`将以最多 ${ACCOUNT_BATCH_CONCURRENCY} 个账号并发发送真实上游请求，可能产生用量。取消只停止尚未发出的请求；遇到限流将停止后续操作。`} />}
+      {confirm?.action === 'groups' && <Space direction="vertical" style={{ width: '100%' }}><Select aria-label="分组操作方式" style={{ width: '100%' }} value={groupMode} onChange={v => { setGroupMode(v); setTargetGroups([]); }} options={[{ value: 'replace', label: '迁移到目标分组（替换现有归属）' }, { value: 'append', label: '追加分组（保留现有归属）' }, { value: 'remove', label: '移出指定分组' }]} /><Select aria-label="目标分组" mode="multiple" placeholder="选择目标分组" style={{ width: '100%' }} value={targetGroups} onChange={setTargetGroups} options={compatibleGroups.map(g => ({ value: g.name, label: `${g.name} · ${g.region === 'all' ? '所有区域' : g.region === 'global' ? '海外版' : '中国区'}` }))} /><Text type="secondary">服务端在同一把锁内读取最新归属、合并并保存，保留其他分组。移出最后一个分组后回到 default；服务端逐项校验区域。</Text></Space>}
       <div className="account-target-preview">{confirm?.uids.slice(0, 8).map(uid => <div key={uid}>{byUID.get(uid)?.nickname || '未命名'} · {uid}</div>)}{confirm?.uids.length > 8 && <div>以及另外 {confirm.uids.length - 8} 个账号</div>}</div>
     </Modal>
     <Drawer title="账号详情" open={!!detailUID} onClose={() => setDetailUID(null)} width={600} rootClassName="account-drawer">

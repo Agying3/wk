@@ -81,11 +81,15 @@ func (p *Pool) stateAccountOfLocked(e *entry) stateAccount {
 // 下轮重写——"事务读到的旧值不可能覆盖新状态"由内存版本号保证（比
 // persistMu 的整快照先序更细粒度：persistMu 只保证本轮不被并发 flush
 // 打断，不保证"收集→提交"窗口内的更新不丢，版本号补的就是这个窗口）。
-func (p *Pool) flushDirtySet() {
+func (p *Pool) flushDirtySet() error {
+	// Serialize before collecting: a slow older flush must not overwrite a
+	// newer committed snapshot. Never wait for persistMu while holding p.mu.
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
 	p.mu.Lock()
 	if len(p.dirtySet) == 0 || p.persister == nil {
 		p.mu.Unlock()
-		return
+		return nil
 	}
 	s := p.persister
 	collected := make(map[string]dirtyOp, len(p.dirtySet))
@@ -107,12 +111,9 @@ func (p *Pool) flushDirtySet() {
 	}
 	p.mu.Unlock()
 
-	p.persistMu.Lock()
-	defer p.persistMu.Unlock()
-
 	if err := p.writeDirtyRows(s, upserts, deletes); err != nil {
 		p.notePersistFail(err, true)
-		return // 行保留在 dirtySet，下轮 flush 重试
+		return err // 行保留在 dirtySet，下轮 flush 重试
 	}
 	if p.persistFails > 0 {
 		log.Printf("pool: state.db 落盘恢复（此前连续失败 %d 次）", p.persistFails)
@@ -126,6 +127,7 @@ func (p *Pool) flushDirtySet() {
 		}
 	}
 	p.mu.Unlock()
+	return nil
 }
 
 // writeDirtyRows 把增量行写入 DB（不在任何锁下由 flushDirtySet 调用）。
