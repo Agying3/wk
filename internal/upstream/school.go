@@ -118,6 +118,7 @@ func (c *Client) SchoolDraw(a *auth.Auth) (string, error) {
 // mpEventBase 小程序埋点公共指纹。
 func mpEventBase(a *auth.Auth) map[string]any {
 	creds := a.Snapshot()
+	device := deviceProfileForUID(creds.UID)
 	return map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
 		"ideType":      "WorkBuddy_MP",
@@ -128,7 +129,7 @@ func mpEventBase(a *auth.Auth) map[string]any {
 		"ideName":      "wx_app_cloud",
 		"platform":     "mini_program",
 		"os":           "windows",
-		"osVersion":    "11",
+		"osVersion":    device.windowsMajor(),
 		"arch":         "x64",
 		"machineId":    deriveID(a, "mpmachine"),
 		"timezone":     "Asia/Shanghai",
@@ -145,14 +146,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	base := mpEventBase(a)
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
-		m := map[string]any{}
-		for k, v := range base {
-			m[k] = v
-		}
-		for k, v := range ev {
-			m[k] = v
-		}
-		arr = append(arr, m)
+		arr = append(arr, mergeReportEvent(base, ev))
 	}
 	// billingJSON 对任意 body 原样序列化（含顶层数组）。
 	_, err := c.billingJSON(a, http.MethodPost, "/v2/report", arr)
@@ -161,7 +155,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 
 // SchoolChatTimesEvents 构造一条 chat_request_send 事件（chat_3_times 计数）。
 func SchoolChatTimesEvents(conversationID string) map[string]any {
-	rid := "wb2api-" + clientToken()
+	rid := NewEventID()
 	return map[string]any{
 		"eventCode":   "chat_request_send",
 		"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
@@ -182,7 +176,7 @@ func SchoolChatTimesEvents(conversationID string) map[string]any {
 // SchoolExpertUseEvents 构造专家召唤+对话事件链（expert_use 判据）。
 // expertID/expertName 为开学季分类专家（16-BackToSchool）。
 func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[string]any {
-	rid := "wb2api-" + clientToken()
+	rid := NewEventID()
 	return []map[string]any{
 		{
 			"eventCode": "expert_summon_click", "id": expertID, "name": expertID,

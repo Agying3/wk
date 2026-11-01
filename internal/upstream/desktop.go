@@ -54,6 +54,7 @@ type DesktopEvent map[string]any
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 func desktopFingerprint(a *auth.Auth) map[string]any {
 	creds := a.Snapshot()
+	device := deviceProfileForUID(creds.UID)
 	now := time.Now().UnixMilli()
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
@@ -73,9 +74,9 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"extVersion":   "5.5.6",
 		"os":           "win32",
 		"arch":         "x64",
-		"osVersion":    "10.0.26220",
-		"cpuCores":     20,
-		"memorySize":   24,
+		"osVersion":    device.osVersion,
+		"cpuCores":     device.cpuCores,
+		"memorySize":   device.memoryGiB,
 		"timestamp":    now,
 		"presentAt":    now,
 	}
@@ -83,7 +84,7 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 
 // ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
-// 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
+// 业务字段优先，账号设备字段由统一设备档案固定。
 func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error {
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
@@ -92,14 +93,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	fp := desktopFingerprint(a)
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
-		m := map[string]any{}
-		for k, v := range fp {
-			m[k] = v
-		}
-		for k, v := range ev {
-			m[k] = v
-		}
-		arr = append(arr, m)
+		arr = append(arr, mergeReportEvent(fp, ev))
 	}
 	raw, err := json.Marshal(arr)
 	if err != nil {
@@ -115,7 +109,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("User-Agent", desktopUA)
 	req.Header.Set("X-Domain", c.chatBase(a))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
+	req.Header.Set("X-Request-ID", NewEventID())
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
 	}
@@ -302,7 +296,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 // template_used {template_id,task_mode}，JOIN 一条完整 chat 链。
 // 三账号实测：5 组（不同模板）一次上报 → 5/5 点亮。
 func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-"+templateID, "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, NewEventID(), "fast-model", "fast-model")
 	events = append(events,
 		DesktopEvent{
 			"eventCode": "agent_task_created_with_template", "mode": "working",
@@ -317,7 +311,7 @@ func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateN
 // web_element_click(playbook_ctaClick) + playbook_cta_click + playbook_prompt_send
 // （Dialog 发送 Prompt，带 conversationId/requestId JOIN chat 链）。三账号实测 1/1 点亮。
 func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-pb", "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, NewEventID(), "fast-model", "fast-model")
 	payload := map[string]any{
 		"id": caseID, "name": caseName, "type": "document",
 		"categoryId": "", "categoryName": "",
@@ -349,7 +343,7 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 // wbx_design_canvas_task_create + wbx_design_canvas_open（Ardot create_design 工具
 // 完成时客户端经 metrics 通道上报，同一 /v2/report 端点）。三账号实测 1/1 点亮。
 func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-canvas", "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, NewEventID(), "fast-model", "fast-model")
 	return append(events,
 		DesktopEvent{
 			"eventCode": "wbx_design_canvas_task_create", "conversationId": conversationID,
@@ -423,7 +417,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // 中性内容），也不入账号池租约；与 panel 原实现一致，直接裸发 chatBase。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
 	creds := a.Snapshot()
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	conversationID = NewEventID()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
@@ -452,7 +446,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", creds.UID)
 	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+	h.Set("X-Request-ID", NewEventID())
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")

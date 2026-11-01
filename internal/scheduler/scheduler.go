@@ -551,7 +551,7 @@ func (s *Scheduler) RunActivityNow(ctx context.Context) {
 			}
 		}
 		first = false
-		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
+		cid := upstream.NewEventID()
 		if err := cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", st.UID, err)
 			continue

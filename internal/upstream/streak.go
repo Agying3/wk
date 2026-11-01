@@ -9,10 +9,7 @@
 package upstream
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 
 	"workbuddy2api/internal/auth"
@@ -27,11 +24,7 @@ const (
 
 // clientToken 幂等令牌（前端 randomUUID 同款语义）。
 func clientToken() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("%s-%s-%s-%s-%s",
-		hex.EncodeToString(b[0:4]), hex.EncodeToString(b[4:6]), hex.EncodeToString(b[6:8]),
-		hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16]))
+	return NewEventID()
 }
 
 // StreakFull 连登完整状态（GET /activity/growth/streak）。

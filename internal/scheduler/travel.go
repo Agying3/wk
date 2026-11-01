@@ -4,7 +4,6 @@
 package scheduler
 
 import (
-	"fmt"
 	"log"
 	"time"
 
@@ -135,7 +134,7 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) {
 	}
 	cfg := s.snapshot()
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
-	if err := cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
+	if err := cfg.Upstream.ReportChatActivity(a, upstream.NewEventID(), ""); err != nil {
 		log.Printf("travel %s: adopt preflight report: %v", uid, err)
 	} else {
 		time.Sleep(adoptReportGap) // 给上游事件处理留时间

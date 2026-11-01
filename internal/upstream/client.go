@@ -652,7 +652,13 @@ func (c *Client) chatStreamPrepared(ctx context.Context, a *auth.Auth, outBody [
 		if diagnostic, _ := ctx.Value(diagnosticContextKey{}).(bool); diagnostic {
 			log.Printf("chat_stream uid=%s: upstream %d %s (prompt diagnostic)", a.UID, resp.StatusCode, kind)
 		} else {
-			log.Printf("chat_stream uid=%s: upstream %d %s body=%s", a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+			var envelope struct {
+				Code int `json:"code"`
+			}
+			_ = json.Unmarshal(raw, &envelope)
+			// Upstream errors may echo prompts or credentials. Keep diagnostics
+			// numeric; the original body still reaches classification and clients.
+			log.Printf("chat_stream uid=%s: upstream %d %s code=%d body_bytes=%d", a.UID, resp.StatusCode, kind, envelope.Code, len(raw))
 		}
 		return nil, resp.StatusCode, raw, headers, nil
 	}

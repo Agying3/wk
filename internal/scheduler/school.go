@@ -9,7 +9,6 @@
 package scheduler
 
 import (
-	"fmt"
 	"log"
 	"time"
 
@@ -136,7 +135,7 @@ func (s *Scheduler) schoolChatTimesTask(a *auth.Auth, tasks []upstream.SchoolTas
 		}
 	}
 	for i := 0; i < t.TargetCount && i < 5; i++ {
-		if err := s.cfg.Upstream.ReportMPEvent(a, upstream.SchoolChatTimesEvents(fmt.Sprintf("wb2api-chat-%d-%d", time.Now().Unix(), i))); err != nil {
+		if err := s.cfg.Upstream.ReportMPEvent(a, upstream.SchoolChatTimesEvents(upstream.NewEventID())); err != nil {
 			log.Printf("school %s: chat events: %v", uid, err)
 			return
 		}
@@ -169,7 +168,7 @@ func (s *Scheduler) schoolExpertTask(a *auth.Auth, tasks []upstream.SchoolTask) 
 		}
 	}
 	events := upstream.SchoolExpertUseEvents("ex_jB0dyFIQJEWa", "论文写作导师",
-		fmt.Sprintf("wb2api-exp-%d", time.Now().Unix()))
+		upstream.NewEventID())
 	if err := s.cfg.Upstream.ReportMPEvent(a, events...); err != nil {
 		log.Printf("school %s: expert events: %v", uid, err)
 		return

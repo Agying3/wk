@@ -150,8 +150,8 @@ func runChat5(h *Handler, a *auth.Auth) (string, error) {
 		need = t.Target - t.Current
 	}
 	for i := int64(0); i < need; i++ {
-		cid := fmt.Sprintf("wb2api-chat5-%d-%d", time.Now().UnixMilli(), i)
-		if err := h.cfg.Upstream.ReportChatActivity(a, cid, fmt.Sprintf("%s-r%d", cid, i)); err != nil {
+		cid := upstream.NewEventID()
+		if err := h.cfg.Upstream.ReportChatActivity(a, cid, upstream.NewEventID()); err != nil {
 			return "", fmt.Errorf("第 %d 条上报失败: %w", i+1, err)
 		}
 		time.Sleep(actionStepGap)
@@ -161,7 +161,7 @@ func runChat5(h *Handler, a *auth.Auth) (string, error) {
 
 // runFirstBuddy 完成 first_buddy：report（解锁前置）→ agreement → buddy/first。
 func runFirstBuddy(h *Handler, a *auth.Auth) (string, error) {
-	if err := h.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
+	if err := h.cfg.Upstream.ReportChatActivity(a, upstream.NewEventID(), ""); err != nil {
 		return "", fmt.Errorf("解锁上报: %w", err)
 	}
 	time.Sleep(actionStepGap)
@@ -191,10 +191,9 @@ func runModelChat(h *Handler, a *auth.Auth) (string, error) {
 
 // runRichMeow 完成 RichMeow_Chat：桌面指纹完整对话事件链。
 func runRichMeow(h *Handler, a *auth.Auth) (string, error) {
-	ms := time.Now().UnixMilli()
-	conv := fmt.Sprintf("wb2api-meow-%d", ms)
-	req := fmt.Sprintf("wb2api-meow-req-%d", ms)
-	events := upstream.DesktopChatSequence(conv, req, "msg-meow", "fast-model", "fast-model")
+	conv := upstream.NewEventID()
+	req := upstream.NewEventID()
+	events := upstream.DesktopChatSequence(conv, req, upstream.NewEventID(), "fast-model", "fast-model")
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 		return "", fmt.Errorf("事件链上报: %w", err)
 	}
@@ -213,7 +212,7 @@ func runBuddyApp(h *Handler, a *auth.Auth) (string, error) {
 
 // runAutomationCreate 完成 automation_1：定时任务创建成功事件。
 func runAutomationCreate(h *Handler, a *auth.Auth) (string, error) {
-	ev := upstream.DesktopAutomationCreateEvent("wb2api-automation")
+	ev := upstream.DesktopAutomationCreateEvent("定时任务")
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, ev); err != nil {
 		return "", fmt.Errorf("事件上报: %w", err)
 	}
@@ -236,9 +235,8 @@ func runLibraryRead(h *Handler, a *auth.Auth) (string, error) {
 func runTemplateUse(h *Handler, a *auth.Auth) (string, error) {
 	templates := [][2]string{{"1", "深度研究"}, {"2", "周报生成"}, {"3", "竞品分析"}, {"4", "活动策划"}, {"5", "代码评审"}}
 	for i, tp := range templates {
-		ms := time.Now().UnixMilli()
-		conv := fmt.Sprintf("wb2api-tpl-%d-%d", ms, i)
-		req := fmt.Sprintf("wb2api-tpl-req-%d-%d", ms, i)
+		conv := upstream.NewEventID()
+		req := upstream.NewEventID()
 		events := upstream.DesktopTemplateUseSequence(conv, req, tp[0], tp[1])
 		if err := h.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 			return "", fmt.Errorf("第 %d 组上报失败: %w", i+1, err)
@@ -250,9 +248,8 @@ func runTemplateUse(h *Handler, a *auth.Auth) (string, error) {
 
 // runPlaybookPrompt 完成 playbook_prompt：灵感案例「做同款」事件组。
 func runPlaybookPrompt(h *Handler, a *auth.Auth) (string, error) {
-	ms := time.Now().UnixMilli()
-	conv := fmt.Sprintf("wb2api-pb-%d", ms)
-	req := fmt.Sprintf("wb2api-pb-req-%d", ms)
+	conv := upstream.NewEventID()
+	req := upstream.NewEventID()
 	events := upstream.DesktopPlaybookPromptSequence(conv, req, "pb-1", "用 AI 提升周报效率")
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 		return "", fmt.Errorf("事件链上报: %w", err)
@@ -262,9 +259,8 @@ func runPlaybookPrompt(h *Handler, a *auth.Auth) (string, error) {
 
 // runCreateCanvas 完成 create_canvas：设计画布创建事件组（Ardot 遥测）。
 func runCreateCanvas(h *Handler, a *auth.Auth) (string, error) {
-	ms := time.Now().UnixMilli()
-	conv := fmt.Sprintf("wb2api-canvas-%d", ms)
-	req := fmt.Sprintf("wb2api-canvas-req-%d", ms)
+	conv := upstream.NewEventID()
+	req := upstream.NewEventID()
 	events := upstream.DesktopDesignCanvasSequence(conv, req)
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
 		return "", fmt.Errorf("事件链上报: %w", err)
