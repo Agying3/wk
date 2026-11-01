@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -149,6 +150,26 @@ func (h *Handler) promptGuardAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := m.Update(c); err != nil {
 			bad(err.Error())
+			return
+		}
+		writeJSON(w, 200, m.Config())
+	case path == "weights/refresh" && r.Method == http.MethodPost:
+		var input struct {
+			Revision uint64 `json:"revision"`
+			RuleID   string `json:"rule_id"`
+		}
+		if !decode(&input) {
+			return
+		}
+		if err := m.RefreshWeights(input.RuleID, input.Revision); err != nil {
+			switch {
+			case errors.Is(err, promptguard.ErrWeightRefreshConflict):
+				writeJSON(w, 409, map[string]any{"error": err.Error()})
+			case errors.Is(err, promptguard.ErrWeightRefreshStorage):
+				writeJSON(w, 503, map[string]any{"error": promptguard.ErrWeightRefreshStorage.Error()})
+			default:
+				bad(err.Error())
+			}
 			return
 		}
 		writeJSON(w, 200, m.Config())

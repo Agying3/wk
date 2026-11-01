@@ -146,6 +146,9 @@ func (m *Manager) ApplySession(doc map[string]any, session string) error {
 }
 
 func (m *Manager) resetBindingsLocked() {
+	if m.state.PromptSessions == nil {
+		m.state.PromptSessions = map[string]promptSession{}
+	}
 	m.bindings = session.NewBindingStore[map[string]string](session.BindingPolicy{TTL: promptSessionTTL, MaxEntries: promptSessionLimit, RejectWhenFull: true}, m.state.PromptSessions)
 }
 
@@ -201,7 +204,7 @@ func (m *Manager) applyBindingAt(doc map[string]any, identity, legacy string, no
 				return "", err
 			}
 			unit := float64(binary.BigEndian.Uint64(b[:])>>11) / (1 << 53)
-			v := pickVariant(r, variantWeights(r, m.state.SelectionSeed, now), unit)
+			v := pickVariant(r, refreshedVariantWeights(r, m.state.SelectionSeed, m.state.WeightRefreshes[r.ID], now), unit)
 			if v.ID == "" {
 				return "", errors.New("no eligible prompt variant")
 			}
@@ -229,13 +232,14 @@ func (m *Manager) ApplyDiagnostic(doc map[string]any, caseID string, at time.Tim
 	m.mu.Lock()
 	rules := copyJSON(m.state.Config.Rules)
 	seed := append([]byte(nil), m.state.SelectionSeed...)
+	refreshes := copyJSON(m.state.WeightRefreshes)
 	revision := m.state.Config.Revision
 	m.mu.Unlock()
 	return applyToDocument(doc, rules, func(r Rule) (string, error) {
 		if len(r.Variants) == 0 {
 			return r.Replacement, nil
 		}
-		v := pickVariant(r, variantWeights(r, seed, at), keyedUnit(seed, "diagnostic", caseID, revision, r.ID))
+		v := pickVariant(r, refreshedVariantWeights(r, seed, refreshes[r.ID], at), keyedUnit(seed, "diagnostic", caseID, revision, r.ID))
 		return v.Replacement, nil
 	})
 }

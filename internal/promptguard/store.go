@@ -32,6 +32,7 @@ type Rule struct {
 	WeightRefreshHours int        `json:"weight_refresh_hours,omitempty"`
 	EffectiveWeights   []float64  `json:"effective_weights,omitempty"`
 	NextWeightRefresh  *time.Time `json:"next_weight_refresh,omitempty"`
+	LastWeightRefresh  *time.Time `json:"last_weight_refresh,omitempty"`
 }
 type Settings struct {
 	AutoLocate    bool `json:"auto_locate"`
@@ -96,10 +97,11 @@ type Case struct {
 	Job                *Job          `json:"job,omitempty"`
 }
 type diskState struct {
-	Config         Config                   `json:"config"`
-	Cases          map[string]*Case         `json:"cases"`
-	SelectionSeed  []byte                   `json:"selection_seed,omitempty"`
-	PromptSessions map[string]promptSession `json:"prompt_sessions,omitempty"`
+	Config          Config                   `json:"config"`
+	Cases           map[string]*Case         `json:"cases"`
+	SelectionSeed   []byte                   `json:"selection_seed,omitempty"`
+	PromptSessions  map[string]promptSession `json:"prompt_sessions,omitempty"`
+	WeightRefreshes map[string]weightRefresh `json:"weight_refreshes,omitempty"`
 }
 type Summary struct {
 	Pending      int    `json:"pending"`
@@ -165,6 +167,9 @@ func Open(path, secret string) (*Manager, error) {
 	}
 	if m.state.PromptSessions == nil {
 		m.state.PromptSessions = map[string]promptSession{}
+	}
+	if m.state.WeightRefreshes == nil {
+		m.state.WeightRefreshes = map[string]weightRefresh{}
 	}
 	m.resetBindingsLocked()
 	for _, c := range m.state.Cases {
@@ -235,7 +240,11 @@ func (m *Manager) Config() Config {
 	for i := range c.Rules {
 		r := &c.Rules[i]
 		if len(r.Variants) > 0 {
-			r.EffectiveWeights = variantWeights(*r, m.state.SelectionSeed, now)
+			r.EffectiveWeights = refreshedVariantWeights(*r, m.state.SelectionSeed, m.state.WeightRefreshes[r.ID], now)
+			if refresh := m.state.WeightRefreshes[r.ID]; !refresh.At.IsZero() {
+				at := refresh.At
+				r.LastWeightRefresh = &at
+			}
 			if r.WeightRefreshHours > 0 {
 				period := int64(r.WeightRefreshHours) * 3600
 				next := time.Unix((now.Unix()/period+1)*period, 0).UTC()
@@ -289,6 +298,7 @@ func (m *Manager) Update(c Config) error {
 		}
 		r.EffectiveWeights = nil
 		r.NextWeightRefresh = nil
+		r.LastWeightRefresh = nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -301,6 +311,11 @@ func (m *Manager) Update(c Config) error {
 	rulesChanged := !reflect.DeepEqual(c.Rules, m.state.Config.Rules)
 	c.Revision++
 	m.state.Config = copyJSON(c)
+	for id := range m.state.WeightRefreshes {
+		if !ids[id] {
+			delete(m.state.WeightRefreshes, id)
+		}
+	}
 	// Rule churn must not grow each session's choice map without a bound.
 	for key, session := range m.state.PromptSessions {
 		for ruleID := range session.Value {

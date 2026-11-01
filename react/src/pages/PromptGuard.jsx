@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Alert, App, Button, Card, Collapse, Descriptions, Drawer, Empty, Form, Input, InputNumber, Modal, Select, Space, Statistic, Switch, Table, Tabs, Tag, Typography } from 'antd';
+import { Alert, App, Button, Card, Collapse, Descriptions, Drawer, Empty, Form, Input, InputNumber, Modal, Select, Space, Statistic, Switch, Table, Tabs, Tag, Tooltip, Typography } from 'antd';
 import { ArrowDownOutlined, ArrowUpOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import './PromptGuard.css';
 import { accountScopeLabel, candidateView, diagnosticStates, httpDescription, jobView, probeExplanation, requestAttempted, selectionView, stageNames, verificationStages } from '../lib/promptGuard';
@@ -74,7 +74,7 @@ export default function PromptGuardPage({ api }) {
   const load = useCallback(async () => {
     try {
       const [c, list] = await Promise.all([api(`${root}config`), api(`${root}cases`)]);
-      setConfig(c); setSettings(current => current || c.settings); setCases(list.cases || []); setError('');
+      setConfig(current => current?.revision > c.revision ? current : c); setSettings(current => current || c.settings); setCases(list.cases || []); setError('');
     } catch (e) { setError(e.message); }
   }, [api]);
   useEffect(() => { load(); const timer = setInterval(load, 5000); return () => clearInterval(timer); }, [load]);
@@ -88,8 +88,16 @@ export default function PromptGuardPage({ api }) {
 
   const saveConfig = async patch => {
     setBusy(true);
-    try { const c = await api(`${root}config`, { method: 'PUT', ...json({ ...config, ...patch }) }); setConfig(c); changed(); message.success('配置已保存并立即生效'); return c; }
+    try { const c = await api(`${root}config`, { method: 'PUT', ...json({ ...config, ...patch }) }); setConfig(current => current?.revision > c.revision ? current : c); changed(); message.success('配置已保存并立即生效'); return c; }
     catch (e) { setError(e.message); message.error(e.message); return null; }
+    finally { setBusy(false); }
+  };
+  const refreshWeights = async rule => {
+    setBusy(true);
+    try {
+      const c = await api(`${root}weights/refresh`, { method: 'POST', ...json({ revision: config.revision, rule_id: rule.id }) });
+      setConfig(current => current?.revision > c.revision ? current : c); setError(''); changed(); message.success('已刷新权重，仅影响新会话');
+    } catch (e) { setError(e.message); message.error(e.message); }
     finally { setBusy(false); }
   };
   const edit = rule => {
@@ -126,7 +134,7 @@ export default function PromptGuardPage({ api }) {
   const rulesColumns = [
     { title: '顺序', width: 100, render: (_, r) => { const i = config.rules.findIndex(rule => rule.id === r.id); return <Space><Text>{i + 1}</Text><Button aria-label="上移规则" size="small" disabled={busy || i === 0} icon={<ArrowUpOutlined />} onClick={() => move(i, -1)} /><Button aria-label="下移规则" size="small" disabled={busy || i === config.rules.length - 1} icon={<ArrowDownOutlined />} onClick={() => move(i, 1)} /></Space>; } },
     { title: '规则', dataIndex: 'name', render: (v, r) => <div><Text strong>{v || '未命名规则'}</Text>{['legacy_codex', 'legacy_dsh'].includes(r.source) && <Tag color="blue" style={{ marginLeft: 6 }}>{r.source === 'legacy_codex' ? 'Codex 迁移' : 'DSH 迁移'}</Tag>}{r.require_end_boundary && <Tag>末尾边界</Tag>}<div className="pg-snippet">{r.match}</div></div> },
-    { title: '替换候选摘要', dataIndex: 'replacement', render: (v, r) => r.variants?.length ? <div className="pg-variant-summary"><Text>{r.variants.length} 个候选 · {r.variants.filter(item => item.weight > 0).length} 个参与新会话分配</Text><div className="pg-snippet">{r.variants[0].replacement || <Text type="secondary">首个候选：删除匹配内容</Text>}</div><Text type="secondary">{r.weight_refresh_hours ? `每 ${r.weight_refresh_hours} 小时刷新 · 下次 ${time(r.next_weight_refresh)}` : '固定权重'} · 同会话保持选择</Text></div> : <div className="pg-snippet">{v || <Text type="secondary">删除匹配内容</Text>}</div> },
+    { title: '替换候选摘要', dataIndex: 'replacement', render: (v, r) => r.variants?.length ? <div className="pg-variant-summary"><Text>{r.variants.length} 个候选 · {r.variants.filter(item => item.weight > 0).length} 个参与新会话分配</Text><div className="pg-snippet">{r.variants[0].replacement || <Text type="secondary">首个候选：删除匹配内容</Text>}</div><Text type="secondary">当前新会话占比：{r.effective_weights?.map((weight, i) => `${i + 1}: ${(weight * 100).toFixed(1)}%`).join(' / ')}</Text><Text type="secondary">{r.weight_refresh_hours ? `每 ${r.weight_refresh_hours} 小时刷新 · 下次 ${time(r.next_weight_refresh)}` : '固定权重'} · 同会话保持选择</Text>{r.last_weight_refresh && <Text type="secondary">上次手动刷新：{time(r.last_weight_refresh)}</Text>}<Tooltip title={r.weight_refresh_hours > 0 && r.variants.filter(item => item.weight > 0).length >= 2 ? '立即重新生成本规则的均衡随机权重，只影响新会话，下次定时刷新时间不变' : '开启自动刷新并设置至少两个正权重候选后可用'}><span><Button size="small" icon={<ReloadOutlined />} disabled={busy || !r.weight_refresh_hours || r.variants.filter(item => item.weight > 0).length < 2} onClick={() => refreshWeights(r)}>立即刷新权重</Button></span></Tooltip></div> : <div className="pg-snippet">{v || <Text type="secondary">删除匹配内容</Text>}</div> },
     { title: '启用', dataIndex: 'enabled', width: 80, render: (v, r) => <Switch aria-label={`启用 ${r.name || '规则'}`} checked={v} disabled={busy} onChange={enabled => saveConfig({ rules: config.rules.map(rule => rule.id === r.id ? { ...rule, enabled } : rule) })} /> },
     { title: '操作', width: 200, render: (_, r) => <Space><Button size="small" disabled={busy} onClick={() => setTestRule({ rule: r, revision: config.revision })}>测试</Button><Button size="small" icon={<EditOutlined />} disabled={busy} onClick={() => edit(r)}>编辑</Button><Button size="small" danger disabled={busy} onClick={() => modal.confirm({ title: '删除替换规则？', okText: '删除', cancelText: '取消', onOk: () => saveConfig({ rules: config.rules.filter(rule => rule.id !== r.id) }) })}>删除</Button></Space> },
   ];
