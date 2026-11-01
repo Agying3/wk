@@ -87,7 +87,7 @@ def validate_containers(args):
         raise RuntimeError("candidate restart policy must be no during handoff")
     if check["State"]["Running"]:
         raise RuntimeError("preflight container must be stopped")
-    if check["Config"].get("Env") != new["Config"].get("Env"):
+    if sorted(check["Config"].get("Env") or []) != sorted(new["Config"].get("Env") or []):
         raise RuntimeError("preflight environment differs from candidate")
     # Read-only preflight may differ only in mount write permissions.
     locations = lambda x: sorted((m["Source"], m["Destination"]) for m in x["Mounts"])

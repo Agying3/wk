@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("upgrade", Path(__file__).with_name("seamless-upgrade.py"))
@@ -15,6 +16,31 @@ spec.loader.exec_module(upgrade)
 
 
 class ControllerTest(unittest.TestCase):
+    def validate_env(self, candidate_env, preflight_env):
+        containers = {}
+        for name, release in [("old", "a"), ("new", "b"), ("check", "b")]:
+            containers[name] = {
+                "State": {"Status": "running" if name == "old" else "created", "Running": name == "old"},
+                "Image": "previous" if name == "old" else "candidate",
+                "Config": {"Cmd": ["-preflight"] if name == "check" else ["-release", release, "-state-lock", "/writer", "-control", name + ".sock"],
+                           "Env": preflight_env if name == "check" else candidate_env},
+                "HostConfig": {"RestartPolicy": {"Name": "no"}},
+                "Mounts": [{"Source": "/data", "Destination": "/app/data", "RW": name != "check"}],
+            }
+        args = SimpleNamespace(old_container="old", new_container="new", check_container="check", old_release="a", new_release="b")
+        with patch.object(upgrade, "inspect", side_effect=lambda name: containers[name]):
+            upgrade.validate_containers(args)
+
+    def test_preflight_accepts_environment_order_only_changes(self):
+        env = ["WB2A_LISTEN=127.0.0.1:7864", "TZ=Asia/Shanghai", "PATH=/usr/bin"]
+        self.validate_env(env, list(reversed(env)))
+
+    def test_preflight_rejects_changed_missing_extra_and_duplicate_environment(self):
+        env = ["WB2A_LISTEN=127.0.0.1:7864", "TZ=Asia/Shanghai"]
+        for other in [["WB2A_LISTEN=127.0.0.1:7865", "TZ=Asia/Shanghai"], env[:-1], env + ["EXTRA=1"], env + [env[0]]]:
+            with self.subTest(environment=other), self.assertRaisesRegex(RuntimeError, "preflight environment differs"):
+                self.validate_env(env, other)
+
     def simulate(self, failure=None):
         with tempfile.TemporaryDirectory() as tmp:
             journal = str(Path(tmp) / "release.json")
