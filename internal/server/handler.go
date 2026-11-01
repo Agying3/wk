@@ -392,12 +392,14 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.anthropicMessages))
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
-	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	h.mux.HandleFunc("GET /v1/models", h.withModelsAuth(h.models))
+	h.mux.HandleFunc("GET /v1/models/{model}", h.withModelsAuth(h.model))
 	// Some OpenAI-compatible clients append endpoint paths to a bare base URL.
 	// Route these aliases through exactly the same authentication and handlers.
 	h.mux.HandleFunc("POST /chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /responses", h.withAuth(h.responses))
-	h.mux.HandleFunc("GET /models", h.withAuth(h.models))
+	h.mux.HandleFunc("GET /models", h.withModelsAuth(h.models))
+	h.mux.HandleFunc("GET /models/{model}", h.withModelsAuth(h.model))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("GET /admin/traffic", h.withFrontend(h.trafficStats))
@@ -3969,6 +3971,15 @@ func invalidateDynamicModelsCache() {
 
 // models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	items := h.modelsForRequest(r)
+	if isAnthropicModelsRequest(r) {
+		writeAnthropicModels(w, r, items)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": items})
+}
+
+func (h *Handler) modelsForRequest(r *http.Request) []map[string]any {
 	if h.cfg.Collection != nil {
 		infos := h.collectedModels(h.allowSet(scopeFromRequest(r)))
 		out := []map[string]any{}
@@ -3981,13 +3992,9 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 		if len(out) == 0 {
 			out = staticModels
 		}
-		writeJSON(w, 200, map[string]any{"object": "list", "data": out})
-		return
+		return out
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"object": "list",
-		"data":   h.modelList(),
-	})
+	return h.modelList()
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。

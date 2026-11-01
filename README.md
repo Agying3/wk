@@ -173,6 +173,8 @@ curl -sN http://localhost:7863/v1/chat/completions \
 
 ## Anthropic Messages 兼容接口
 
+模型发现也兼容 Anthropic：`GET /v1/models` 和 `GET /v1/models/{model_id}` 接受 `x-api-key`；使用 Bearer 时增加 `anthropic-version` 请求头即可选择 Anthropic 格式。列表返回 `data`、`has_more`、`first_id`、`last_id`，支持 `limit`（默认 20，1–1000）及互斥的 `after_id` / `before_id`。元数据复用现有模型快照，未知能力返回 `capabilities: null`，不虚构上游能力。普通 Bearer 请求保持 OpenAI 格式；无 `/v1` 前缀的 `/models` 也支持相同功能。模型发现独立于 Messages 开关，沿用相同分组密钥作用域。
+
 默认关闭。设置 `features.anthropic_api: true`、环境变量 `WB2A_ANTHROPIC_API=true`，或在控制台「管理设置 → 特性开关」启用；控制台保存后立即生效并写回配置。关闭时已鉴权请求返回 404。接口使用与 Chat 相同的账号池、鉴权和分组权限，接受 `x-api-key` 或 `Authorization: Bearer`。
 
 ```bash
@@ -604,7 +606,8 @@ Tokens prefixed with @ are paths the user explicitly referenced. Relative paths 
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer | OpenAI 兼容聊天补全（流式/非流式） |
 | `POST /v1/responses` | Bearer | Responses API 适配（流式/非流式、工具调用、`previous_response_id`） |
-| `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
+| `GET /v1/models` | Bearer / x-api-key | 模型列表；按请求头选择 OpenAI 或 Anthropic 格式，Anthropic 支持游标分页 |
+| `GET /v1/models/{model_id}` | Bearer / x-api-key | 查询单个模型，鉴权及协议选择与模型列表一致 |
 | `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情；详情含模型级 `model_cooldowns`） |
 | `GET /requests?limit=50` | Bearer | 最近请求日志（`limit` 默认 50、上限 500；不含提示词和响应正文） |
 | `POST /admin/credits/refresh` | 前端会话/Bearer | 异步刷新所有账号的上游积分明细，不执行签到 |
