@@ -270,17 +270,11 @@ func runCreateCanvas(h *Handler, a *auth.Auth) (string, error) {
 
 // runExpertUse 完成 expert_5：真实专家召唤+使用链 ×5。
 func runExpertUse(h *Handler, a *auth.Auth) (string, error) {
-	experts, err := h.cfg.Upstream.MarketExpertList(a, "agent")
+	experts, err := taskMarketExperts(h.cfg.Upstream, a, "agent", 5, nil)
 	if err != nil {
 		return "", fmt.Errorf("专家市场列表: %w", err)
 	}
-	if len(experts) == 0 {
-		return "", fmt.Errorf("专家市场为空")
-	}
-	n := 5
-	if len(experts) < n {
-		n = len(experts)
-	}
+	n := len(experts)
 	for i := 0; i < n; i++ {
 		if err := h.expertChain(a, experts[i]); err != nil {
 			return "", fmt.Errorf("第 %d 位专家: %w", i+1, err)
@@ -292,17 +286,11 @@ func runExpertUse(h *Handler, a *auth.Auth) (string, error) {
 
 // runExpertTeamUse 完成 Expert_team_use_3：专家团召唤+使用链 ×3。
 func runExpertTeamUse(h *Handler, a *auth.Auth) (string, error) {
-	experts, err := h.cfg.Upstream.MarketExpertList(a, "team")
+	experts, err := taskMarketExperts(h.cfg.Upstream, a, "team", 3, nil)
 	if err != nil {
 		return "", fmt.Errorf("专家团列表: %w", err)
 	}
-	if len(experts) == 0 {
-		return "", fmt.Errorf("专家团列表为空")
-	}
-	n := 3
-	if len(experts) < n {
-		n = len(experts)
-	}
+	n := len(experts)
 	for i := 0; i < n; i++ {
 		if err := h.expertChain(a, experts[i]); err != nil {
 			return "", fmt.Errorf("第 %d 个专家团: %w", i+1, err)
@@ -382,19 +370,9 @@ func runSkillFresh(h *Handler, a *auth.Auth) (string, error) {
 // 与 expert_5 同构，但 chat 链的 agent_task_created 需带 has_expert:true +
 // expert_id，expert_actual_use 的 mode 为 "LOCAL"（非 craft）。
 func runExpertLighthouse(h *Handler, a *auth.Auth) (string, error) {
-	const lhID = "ex_2cvvUZQhDyeJ"
-	lh := upstream.MarketExpert{
-		ExpertID: lhID, ExpertType: "agent",
-		DisplayNameZH: "腾讯轻量云专家", ProfessionZH: "腾讯轻量云专家", Version: "1.0.2",
-	}
-	// 市场列表若命中真实条目则用其信息（version 等以服务端为准）。
-	if experts, err := h.cfg.Upstream.MarketExpertList(a, "agent"); err == nil {
-		for _, e := range experts {
-			if e.ExpertID == lhID {
-				lh = e
-				break
-			}
-		}
+	lh, err := taskLighthouseExpert(h.cfg.Upstream, a)
+	if err != nil {
+		return "", fmt.Errorf("查找轻量云专家: %w", err)
 	}
 	if err := h.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(lh)...); err != nil {
 		return "", fmt.Errorf("召唤链: %w", err)

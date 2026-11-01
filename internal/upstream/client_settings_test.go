@@ -84,11 +84,12 @@ func TestDesktopReportUsesRegionalVersion(t *testing.T) {
 		if len(events) != 1 || events[0]["ideVersion"] != "5.9.4" || events[0]["extVersion"] != "5.9.4" {
 			t.Fatal("event versions diverged")
 		}
-		if _, ok := events[0]["commit"]; ok {
-			t.Fatal("old build hash retained")
+		// 国际版号必须带国际版安装包的构建信息，不能沿用 5.5.6 或国内版的值。
+		if events[0]["commit"] != desktopCommitGlobal {
+			t.Fatalf("commit=%v", events[0]["commit"])
 		}
-		if _, ok := events[0]["releaseDate"]; ok {
-			t.Fatal("old release date retained")
+		if events[0]["releaseDate"] != float64(desktopReleaseDateGlobal) {
+			t.Fatalf("releaseDate=%v", events[0]["releaseDate"])
 		}
 		if r.Header.Get("User-Agent") != "workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0" || r.Header.Get("Content-Type") != "application/json;charset=UTF-8" || r.Header.Get("X-Enterprise-Id") != "e" || r.Header.Get("X-Tenant-Id") != "e" {
 			t.Fatal("incorrect report headers")
@@ -99,5 +100,51 @@ func TestDesktopReportUsesRegionalVersion(t *testing.T) {
 	a := &auth.Auth{UID: "u", EnterpriseID: "e", AccessToken: "at", Domain: "www.workbuddy.ai"}
 	if err := c.ReportDesktopEvent(a, DesktopEvent{"eventCode": "test"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// 构建信息按域取对应安装包的值；legacy 模式保持历史形状不变。
+func TestDesktopReportBuildInfoFollowsRegion(t *testing.T) {
+	for _, tc := range []struct {
+		name, domain, commit string
+		date                 int64
+	}{
+		{"cn", "www.workbuddy.cn", desktopCommitCN, desktopReleaseDateCN},
+		{"global", "www.workbuddy.ai", desktopCommitGlobal, desktopReleaseDateGlobal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got map[string]any
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				var events []map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+					t.Fatal(err)
+				}
+				got = events[0]
+				return jsonResp(200, `{"code":0,"data":{}}`), nil
+			})
+			c.ClientSettings = DefaultClientSettings()
+			if err := c.ReportDesktopEvent(&auth.Auth{UID: "u", AccessToken: "at", Domain: tc.domain}, DesktopEvent{"eventCode": "test"}); err != nil {
+				t.Fatal(err)
+			}
+			if got["commit"] != tc.commit || got["releaseDate"] != float64(tc.date) {
+				t.Fatalf("build info=%v/%v", got["commit"], got["releaseDate"])
+			}
+		})
+	}
+	var legacy map[string]any
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		var events []map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+			t.Fatal(err)
+		}
+		legacy = events[0]
+		return jsonResp(200, `{"code":0,"data":{}}`), nil
+	})
+	c.ClientSettings = ClientSettings{HeaderProfile: "legacy"}
+	if err := c.ReportDesktopEvent(&auth.Auth{UID: "u", AccessToken: "at"}, DesktopEvent{"eventCode": "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if legacy["commit"] != "5f9692923c93033111c51ad7b003eb80204a9b75" {
+		t.Fatalf("legacy commit=%v", legacy["commit"])
 	}
 }

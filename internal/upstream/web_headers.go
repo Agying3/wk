@@ -16,16 +16,17 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// chromeCHUA 与 macBrowserUA 的 Chrome 15x 主版本对应；未抓包确认。
-const chromeCHUA = `"Chromium";v="152", "Not;A=Brand";v="24", "Google Chrome";v="152"`
+// chromeCHUA 与 macBrowserUA 的 Chrome 15x 主版本对应。GREASE 品牌串按 Chromium 的
+// 规则由主版本推算，未抓包；换主版本时要一起重算。
+const chromeCHUA = `"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"`
 
-// mpIOSVersion 小程序 web-view 报的 iOS 版本。UA 里的 17_5 与事件正文的 osVersion
+// mpIOSVersion 小程序 web-view 报的 iOS 版本。UA 里的 18_6 与事件正文的 osVersion
 // 都取它，避免两处独立漂移（本包测试会校验 UA 与该常量一致）。
-const mpIOSVersion = "17.5.0"
+const mpIOSVersion = "18.6.0"
 
-// mpWebViewUA 是微信 iOS web-view（小程序内嵌页）的 UA。iOS 与微信的版本号是挑选的
-// 近期值，未抓包；小程序 appid 未核实，所以不带 `miniProgram/<appid>` 段。
-const mpWebViewUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.49(0x18003132) NetType/WIFI Language/zh_CN"
+// mpWebViewUA 是微信 iOS web-view（小程序内嵌页）的 UA。iOS 与微信的版本号是挑选的近期值，
+// 未抓包；appid wx907c65e5e107ddcf 取自官网前端代码。
+const mpWebViewUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.61(0x18003d2c) NetType/WIFI Language/zh_CN miniProgram/wx907c65e5e107ddcf"
 
 // 官网前端各功能所在的页面路径（Referer 用）。
 const (
@@ -135,24 +136,30 @@ func (c *Client) applyMPHeaders(req *http.Request, a *auth.Auth, path string) {
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("User-Agent", mpWebViewUA)
 	req.Header.Set("X-Client-Platform", "miniprogram")
-	req.Header.Set("Referer", origin+webPageFor(path))
+	// 小程序 web-view 打开的就是成长中心那份网页，来源页固定它。
+	req.Header.Set("Referer", origin+webPageGrowthCenter)
 	if req.Method != http.MethodGet && req.Method != http.MethodHead {
 		req.Header.Set("Origin", origin)
 	}
-	req.Header.Set("Accept-Language", "zh-CN")
+	req.Header.Set("Accept-Language", webAcceptLanguage(a, path))
+	// 小程序里的网页 XHR：同源 cors。不是桌面 Chrome，没有 UA-CH。
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
 	if s.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", s.EnterpriseID)
 	}
-	// iOS WebKit 不发 zstd，也没有 sec-ch-ua；声明与运行时一致。
+	// iOS WebKit 不发 zstd；声明与运行时一致。
 	applyEncoding(req, acceptEncodingWebKit)
 }
 
 // applyWebNavigationHeaders 设置浏览器顶层导航（打开 client-login 页）的头。
+// 从外部打开的导航 Sec-Fetch-Site 是 none（不是 same-origin）；Accept 与 Chrome 一致。
 func applyWebNavigationHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
 	req.Header.Set("User-Agent", browserUserAgent(a))
 	req.Header.Set("Accept-Language", webAcceptLanguage(a, ""))
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Sec-Fetch-User", "?1")
@@ -161,6 +168,21 @@ func applyWebNavigationHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Sec-CH-UA-Mobile", "?0")
 	req.Header.Set("Sec-CH-UA-Platform", webClientHintPlatform(a))
 	applyEncoding(req, acceptEncodingChrome)
+}
+
+// webLoginTarget 登录码的 target 参数：触发这次网页请求的来源页。传完整 URL（网页上报的
+// pageURL）时取路径加查询串；传页面路径常量时原样用；空值回落到成长中心。
+func webLoginTarget(page string) string {
+	if strings.TrimSpace(page) == "" {
+		return webPageGrowthCenter
+	}
+	if u, err := url.Parse(page); err == nil && u.Scheme != "" && u.Host != "" {
+		if u.Path == "" {
+			return "/"
+		}
+		return u.RequestURI()
+	}
+	return page
 }
 
 // applyNodeFetchHeaders 设置 Node 内置 fetch（undici）自动加的头，用于网页登录码请求。

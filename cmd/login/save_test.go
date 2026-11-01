@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/device"
@@ -131,5 +133,49 @@ func TestSaveLoginDefaultPath(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "auths", "workbuddy-"+uid+".json")); err != nil {
 		t.Fatalf("default path not used: %v", err)
+	}
+}
+
+func TestSaveLoginRejectsUnsafeUID(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("WB2A_LOGIN_AUTH_FILE", "")
+	for _, uid := range []string{"x/../../outside", `x\..\..\outside`, "../outside", "u:stream", "u\x00", ".", ".."} {
+		raw, _ := json.Marshal(loginResult{UID: uid, AccessToken: "fixture-token"})
+		if err := saveLogin(bytes.NewReader(raw)); err == nil {
+			t.Errorf("accepted unsafe uid %q", uid)
+		}
+	}
+	entries, err := os.ReadDir(".")
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("rejected input created files: %v err=%v", entries, err)
+	}
+}
+
+func TestSaveLoginExpiry(t *testing.T) {
+	for _, seconds := range []int64{0, -1, 3600, 31536000000} {
+		t.Run(fmt.Sprint(seconds), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "account.json")
+			t.Setenv("WB2A_LOGIN_AUTH_FILE", path)
+			raw, _ := json.Marshal(loginResult{UID: "fixture-uid", AccessToken: "fixture-token", ExpiresIn: seconds})
+			before := time.Now().Unix()
+			if err := saveLogin(bytes.NewReader(raw)); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			account, err := auth.Parse(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if seconds <= 0 {
+				if account.ExpiresAt != 0 {
+					t.Fatalf("unknown expiry=%d", account.ExpiresAt)
+				}
+			} else if account.ExpiresAt < before+seconds || account.ExpiresAt > time.Now().Unix()+seconds {
+				t.Fatalf("expiry=%d seconds=%d", account.ExpiresAt, seconds)
+			}
+		})
 	}
 }

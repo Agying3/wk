@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -397,7 +398,7 @@ func pollLogin(client *http.Client, cfg loginRegion) (map[string]any, error) {
 	if state.Flow == desktopFlow && cfg.Name == "cn" {
 		accountPath = "/v2/plugin/account"
 	}
-	accountRaw, accountStatus, accountErr := doJSON(client, cfg, http.MethodGet, cfg.endpoint(accountPath), headers, nil)
+	accountRaw, accountStatus, accountErr := fetchLoginAccount(client, cfg, cfg.endpoint(accountPath), headers, time.Second)
 	if accountErr != nil {
 		return nil, failureAt("account", accountStatus, accountErr)
 	}
@@ -480,8 +481,33 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// 令牌就绪后，账号资料可能短暂返回 12151。只重试这个业务状态，
+// 最多额外请求五次，整个账号阶段不超过 30 秒；不重新领取令牌。
+func fetchLoginAccount(client *http.Client, cfg loginRegion, fullURL string, headers func(*http.Request), retryDelay time.Duration) (json.RawMessage, int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for attempt := 0; ; attempt++ {
+		raw, status, err := doJSONContext(ctx, client, cfg, http.MethodGet, fullURL, headers, nil)
+		var failure *auth.LoginFailure
+		if attempt >= 5 || status != http.StatusOK || !errors.As(err, &failure) || failure.Code != 12151 {
+			return raw, status, err
+		}
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, status, err
+		case <-timer.C:
+		}
+	}
+}
+
 func doJSON(client *http.Client, cfg loginRegion, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
-	req, err := http.NewRequest(method, fullURL, body)
+	return doJSONContext(context.Background(), client, cfg, method, fullURL, headers, body)
+}
+
+func doJSONContext(ctx context.Context, client *http.Client, cfg loginRegion, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("create upstream request failed")
 	}

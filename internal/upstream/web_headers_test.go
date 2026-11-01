@@ -169,7 +169,7 @@ func TestMPHeadersUseWebKitClass(t *testing.T) {
 	if req.Header.Get("Authorization") != "Bearer at" {
 		t.Errorf("authorization=%q", req.Header.Get("Authorization"))
 	}
-	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "iPhone") || !strings.Contains(ua, "MicroMessenger") {
+	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "iPhone") || !strings.Contains(ua, "MicroMessenger") || !strings.Contains(ua, "miniProgram/wx907c65e5e107ddcf") {
 		t.Errorf("ua=%q", ua)
 	}
 	if req.Header.Get("Referer") != "https://www.workbuddy.cn/profile/growth-center" {
@@ -178,7 +178,11 @@ func TestMPHeadersUseWebKitClass(t *testing.T) {
 	if req.Header.Get("X-Enterprise-Id") != "ent-mp" {
 		t.Errorf("enterprise=%q", req.Header.Get("X-Enterprise-Id"))
 	}
-	for _, name := range []string{"Sec-CH-UA", "Sec-CH-UA-Platform", "Sec-Fetch-Site", "X-User-Id", "X-Tenant-Id", "X-Domain", "X-Product", "X-Request-ID", "X-Requested-With"} {
+	// 小程序里的网页 XHR 有 Sec-Fetch-*，但没有桌面 Chrome 的 UA-CH。
+	if req.Header.Get("Sec-Fetch-Site") != "same-origin" || req.Header.Get("Sec-Fetch-Mode") != "cors" || req.Header.Get("Sec-Fetch-Dest") != "empty" {
+		t.Errorf("sec-fetch=%v", req.Header)
+	}
+	for _, name := range []string{"Sec-CH-UA", "Sec-CH-UA-Platform", "X-User-Id", "X-Tenant-Id", "X-Domain", "X-Product", "X-Request-ID", "X-Requested-With"} {
 		if v := req.Header.Get(name); v != "" {
 			t.Errorf("mp request kept %s=%q", name, v)
 		}
@@ -336,5 +340,40 @@ func TestCompressContentEncodingDecodesBothWrappers(t *testing.T) {
 				t.Fatalf("data=%s err=%v", data, err)
 			}
 		})
+	}
+}
+
+// 顶层导航是从外部打开的：Sec-Fetch-Site 是 none，Accept 与 Chrome 一致。
+func TestWebNavigationHeaders(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "https://www.workbuddy.cn/console/client-login?code=x", nil)
+	applyWebNavigationHeaders(req, macAuth(""))
+	if got := req.Header.Get("Sec-Fetch-Site"); got != "none" {
+		t.Errorf("site=%q", got)
+	}
+	if got := req.Header.Get("Sec-Fetch-Mode"); got != "navigate" || req.Header.Get("Sec-Fetch-Dest") != "document" || req.Header.Get("Sec-Fetch-User") != "?1" {
+		t.Errorf("sec-fetch=%v", req.Header)
+	}
+	accept := req.Header.Get("Accept")
+	for _, want := range []string{"text/html", "image/avif", "signed-exchange"} {
+		if !strings.Contains(accept, want) {
+			t.Errorf("accept=%q missing %q", accept, want)
+		}
+	}
+	if req.Header.Get("Upgrade-Insecure-Requests") != "1" || req.Header.Get("Referer") != "" || req.Header.Get("Origin") != "" {
+		t.Errorf("navigation headers=%v", req.Header)
+	}
+}
+
+// 登录码的 target 用触发这次请求的来源页，而不是固定成长中心。
+func TestWebLoginTarget(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", webPageGrowthCenter},
+		{webPageUsage, webPageUsage},
+		{"https://www.workbuddy.cn/library/doc/abc?x=1", "/library/doc/abc?x=1"},
+		{"https://www.workbuddy.cn", "/"},
+	} {
+		if got := webLoginTarget(tc.in); got != tc.want {
+			t.Errorf("webLoginTarget(%q)=%q want %q", tc.in, got, tc.want)
+		}
 	}
 }

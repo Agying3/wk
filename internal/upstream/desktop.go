@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -36,6 +37,16 @@ const (
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
 	// marketExpertListPath 专家市场列表（专家类任务需真实专家 id）。
 	marketExpertListPath = "/portal/operation-platform/market/expert/list"
+)
+
+// 事件公共字段里的构建信息按账号所在域取，来源是官方安装包 product.json 的
+// commit / date（macOS 包）：国内版 5.9.3、国际版 5.9.4。这两个值属于产品二进制，
+// 不能跨版本或跨域混用；换客户端版本时要一起重新核对。
+const (
+	desktopCommitCN          = "d46924219e79332f49c37ccebf27292f87001b19"
+	desktopReleaseDateCN     = int64(1793093023713) // 2026-10-27T09:23:43.713Z
+	desktopCommitGlobal      = "fa0a0901906addaa1a4259f6df347388a5563ded"
+	desktopReleaseDateGlobal = int64(1793290653510) // 2026-10-29T16:17:33.510Z
 )
 
 // deriveID uses a persisted opaque identity. Legacy/read-only accounts retain
@@ -108,10 +119,16 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	creds := a.Snapshot()
 	fp := desktopFingerprint(a)
 	if c.desktopHeaders() {
-		fp["ideVersion"], fp["extVersion"] = c.clientVersion(a), c.clientVersion(a)
-		// Build hashes/dates belong to a particular binary; do not reuse 5.5.6's.
+		version := c.clientVersion(a)
+		fp["ideVersion"], fp["extVersion"] = version, version
+		// 构建信息只适用于核实过的区域和版本。自定义版本不能借用旧构建信息。
 		delete(fp, "commit")
 		delete(fp, "releaseDate")
+		if a.Region() == auth.RegionGlobal && version == "5.9.4" {
+			fp["commit"], fp["releaseDate"] = desktopCommitGlobal, desktopReleaseDateGlobal
+		} else if a.Region() == auth.RegionCN && version == "5.9.3" {
+			fp["commit"], fp["releaseDate"] = desktopCommitCN, desktopReleaseDateCN
+		}
 	}
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
@@ -405,13 +422,37 @@ type MarketExpert struct {
 	Categories    []any           `json:"categories"`
 }
 
+// MarketExpertPageSize 专家市场列表每页条数（官方专家页一页 20 条）。
+const MarketExpertPageSize = 20
+
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
 // expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
 func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
+	return c.marketExpertList(a, expertType, "", 1)
+}
+
+// MarketExpertListPage 拉取第 page 页；往下翻页只改 page（官方翻页请求未抓包，未确认）。
+func (c *Client) MarketExpertListPage(a *auth.Auth, expertType string, page int) ([]MarketExpert, error) {
+	if page < 1 {
+		page = 1
+	}
+	return c.marketExpertList(a, expertType, "", page)
+}
+
+// MarketExpertSearch 按关键词搜第一页。官方专家页的搜索还是同一个列表请求，只是请求体多
+// keyword、请求头多 X-Language（界面语言，默认 zh-CN）；5.8.3 是否也这样没核对。
+func (c *Client) MarketExpertSearch(a *auth.Auth, expertType, keyword string) ([]MarketExpert, error) {
+	return c.marketExpertList(a, expertType, strings.TrimSpace(keyword), 1)
+}
+
+func (c *Client) marketExpertList(a *auth.Auth, expertType, keyword string, page int) ([]MarketExpert, error) {
 	creds := a.Snapshot()
-	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
+	body := map[string]any{"page": page, "page_size": MarketExpertPageSize, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
 		body["expert_type"] = expertType
+	}
+	if keyword != "" {
+		body["keyword"] = keyword
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -436,6 +477,9 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if c.desktopHeaders() {
 		req.Header.Del("X-Domain")
 		c.commonHeaders(req, a)
+	}
+	if keyword != "" {
+		req.Header.Set("X-Language", "zh-CN")
 	}
 	data, err := c.doJSON(req, a)
 	if err != nil {

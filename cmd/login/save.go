@@ -4,7 +4,7 @@
 // 会把既有账号的 _device_identity、_device_profile 一起丢掉（重新登录后可能退回旧
 // Windows 档案），新账号也不会像服务端那样建立 Mac 档案。现在统一走这里：
 //
-//   - 已有账号：沿用磁盘上的设备标识与档案，并保留文件里其他未知键（由 SaveAtomic 写回）；
+//   - 已有账号：沿用磁盘上的设备标识与档案；
 //   - 新账号：建立 Mac 档案（与服务端新增账号的默认一致）；
 //   - 写入按 0600 原子替换，accessToken 为空或文件不属于同一 uid 时拒绝覆盖。
 //
@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,11 +61,23 @@ func saveLogin(in io.Reader) error {
 	if result.AccessToken == "" || result.UID == "" {
 		return fmt.Errorf("login result is incomplete")
 	}
+	// UID 来自上游响应，不允许它改变凭证目录或 Windows 文件流。
+	if result.UID == "." || result.UID == ".." || strings.ContainsAny(result.UID, `<>:"/\|?*`) || strings.ContainsFunc(result.UID, func(r rune) bool { return r < 32 || r == 127 }) {
+		return fmt.Errorf("login result has invalid uid")
+	}
+	var expiresAt int64
+	if result.ExpiresIn > 0 {
+		now := time.Now().Unix()
+		if result.ExpiresIn > math.MaxInt64-now {
+			return fmt.Errorf("login result has invalid expiry")
+		}
+		expiresAt = now + result.ExpiresIn
+	}
 	path := authFilePath(result.UID)
 	account := &auth.Auth{
 		AccessToken:  result.AccessToken,
 		RefreshToken: result.RefreshToken,
-		ExpiresAt:    time.Now().Add(time.Duration(result.ExpiresIn) * time.Second).Unix(),
+		ExpiresAt:    expiresAt,
 		Domain:       result.Domain,
 		UID:          result.UID,
 		EnterpriseID: result.EnterpriseID,

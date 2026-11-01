@@ -294,3 +294,46 @@ frontend.tar.gz   fe6e583d0e5891248d88a451c51c80cca6475c87eda8548d4a72b002026fc2
 新增/调整的测试：`cmd/login/save_test.go`（保留设备、新账号建 Mac、拒绝不安全覆盖、默认路径）、`TestLoginTraceRootAndChildSpans`（根 span 一致、子 span 互不相同、授权页独立子 span）、`TestWebReportKeepsRealPageOnCookiePath`、`TestMPFingerprintMatchesRuntime`。
 
 仍未做：真实上游联调（含真实扫码）。脚本主体（签到、容器重启）按约定未执行，只做了 `bash -n` 与隔离的 `login save` 联调。
+
+### 11.7 许可证迁移与第一批代码移植（2026-11-01 深夜）
+
+- 仓库已在提交 `9a5da8e`（`补齐客户端协议与登录持久化并迁移至AGPL-3.0-only`）落到 **AGPL-3.0-only**：`LICENSE`、`LICENSES/`（upstream-MIT、yreidev-NOTICE、responses-proxy-Apache-2.0、依赖清单）、`NOTICE`、`legal.go` 与 `/legal` 路由、响应 `Link` 头都已就位。此后可以移植参考项目代码，但**必须**保留其 SPDX 头与 `NOTICE` 署名（AGPL §5、§13 义务）。
+- 第一批移植：桌面事件公共字段 `commit`/`releaseDate` 改为按账号所在域取官方安装包 `product.json` 的值——国内 5.9.3 `d4692421…` / `2026-10-27T09:23:43.713Z`、国际 5.9.4 `fa0a0901…` / `2026-10-29T16:17:33.510Z`。桌面模式不再省略这两个字段；`header_profile=legacy` 仍沿用 5.5.6 的历史值（有意保留，不代表真实客户端）。新增 `TestDesktopReportBuildInfoFollowsRegion` 覆盖两域与 legacy。
+- 验证（tdog）：`go test ./...` exit 0（27 包）、`go vet ./...` exit 0、`-race ./internal/upstream/` exit 0；源码树 SHA256 `c85ce9baaca5f3c1fee686f847d85a2ca33e21febb001c2d32160eb969c2b501`；日志 `/srv/build-server/logs/workbuddy2api/agpl-port-20261101-r1`。
+- **磁盘告警**：tdog 根分区仅余约 53 MB（`/srv/build-server/sources` 36 GB、`artifacts` 11 GB 均为历史任务目录，未删除）。本轮把 `GOCACHE`/`GOTMPDIR` 放到 tmpfs（`/tmp/gocache-agpl-r1`）规避写满，未产出二进制产物。后续需要清理旧任务目录（需用户确认，不能代删）才能恢复完整构建/产物流程。
+
+### 11.8 第二批移植（2026-11-01 深夜，AGPL 之后）
+
+按参考项目 `websession.go` / `web.go` 的实际取值对齐，补三处：
+
+1. **`Sec-CH-UA` 的 GREASE 品牌串**：改成 `"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"`（对方按 Chromium 规则由主版本推算，未抓包；我们照它的值，注释标明来源与"换主版本要重算"）。
+2. **顶层导航头**：`Sec-Fetch-Site: none`（从外部打开的导航不是 same-origin），`Accept` 补成 Chrome 的完整值（含 `image/avif`、`image/webp`、`application/signed-exchange`）。此前我们发的是 `same-origin` + 简化 Accept。
+3. **登录码 `target` 用来源页**：新增 `webLoginTarget`，把触发这次网页请求的 `page` 一路传到 `websiteSessionFor` → `openWebsite`；完整 URL 取 path+query，页面路径常量原样用，空值回落成长中心。此前固定写死 `/profile/growth-center`。
+
+新增测试：`TestWebNavigationHeaders`、`TestWebLoginTarget`。
+
+验证（tdog，磁盘清理后恢复完整流程）：`go test ./...` 27 包 exit 0、`go vet ./...` exit 0、`-race ./internal/upstream/ ./cmd/login/` exit 0、Linux amd64 CGO 关闭的 login 与 server 构建 exit 0。源码树 `3bd89b21…`；产物 `login ccff9d47…`、`wb2api 251c07a5…`；日志 `/srv/build-server/logs/workbuddy2api/agpl-port-20261101-r1`。
+
+磁盘操作：按用户授权清理了 Go 构建缓存（`/root/.cache/go-build` 与 `/opt/tdog-build-tools/cache/workbuddy2api/go-build`，共约 8.7 GB），根分区从 53 MB 恢复到约 8.6 GB；未删除任何历史任务目录，模块缓存保留。
+
+仍然没做：真实上游联调。这批改动依旧只有单元/桩测试覆盖。
+
+### 11.9 第三批移植（小程序 UA / 专家分页与搜索）
+
+- **小程序 UA 补齐 appid**：换成 `iPhone OS 18_6 … MicroMessenger/8.0.61 … miniProgram/wx907c65e5e107ddcf`（appid 是对方从官网前端代码里取的；iOS/微信版本号仍是挑选值，未抓包）。`mpIOSVersion` 同步为 `18.6.0`，事件正文与 UA 同源。
+- **小程序请求头对齐**：来源页固定成长中心、`Accept-Language` 按路径取（成长中心接口 zh-CN）、补 `Sec-Fetch-Site/Mode/Dest`（同源 cors），仍不带 UA-CH。
+- **专家市场分页与搜索**：新增 `MarketExpertListPage`、`MarketExpertSearch` 与 `MarketExpertPageSize`；搜索走同一个列表请求，请求体多 `keyword`、请求头多 `X-Language: zh-CN`；官方先取 `data.items` 再回落 `data.experts` 的顺序保留。新增 `TestMarketExpertListPagingAndSearch`。
+- 验证（tdog）：`go test ./...` 27 包 exit 0、`go vet ./...` exit 0、`-race ./internal/upstream/ ./cmd/login/` exit 0、Linux amd64 CGO 关闭的 login 与 server 构建 exit 0。源码树 `5d76a16e…`；产物 `login ddeb8587…`、`wb2api eeb84aa0…`；日志同目录 r4。
+- 当时未接线：服务端专家类任务仍走 `MarketExpertList` 第一页；已有专家任务的分页和轻量云关键词搜索现已在 11.10 接入。未新增 `WorkBuddy_Valorant` 等任务动作。
+
+### 11.10 审查问题修复与已有专家任务接线（2026-11-02）
+
+- CLI 落盘拒绝含路径分隔符、Windows 文件流等非法字符的 UID；缺失或非正 `expires_in` 保存为 `expiresAt: 0`，正值按 Unix 秒相加并防止整数溢出，保留既有设备档案。
+- 取到令牌后，仅对账号接口 HTTP 200 / code 12151 额外重试至多五次、间隔一秒，账号阶段总预算 30 秒；不重新取令牌，不重试授权拒绝等其他错误。
+- 桌面事件仅给已核实的 CN 5.9.3 / Global 5.9.4 填对应构建信息；自定义其他版本省略 commit/releaseDate，legacy 保持原有行为。
+- Cookie 业务请求先推导来源页，再同时用于网页登录 target 和业务 Referer；礼包、补偿走 usage，成长任务走 growth-center，显式 pageURL 继续保留。
+- expert_5 / Expert_team_use_3 接入分页：按 ID 去重，至多五页，空页、末页或重复页停止，先收齐所需条目再执行动作，数量不足直接报错。
+- 轻量云专家先关键词搜索，未命中时有界翻页按真实 ID 查找，沿用服务端 version/cloud/pay 属性；未找到或查询失败不再用硬编码旧条目发送对话。
+- tdog 验证全部 exit 0：新增用例定向测试、`go test -p=2 ./... -count=1 -timeout=6m`、`go vet -p=2 ./...`、三个修改包新增用例的 `-race` 检查，以及 Linux amd64 / CGO_ENABLED=0 的 server、login 编译。真实上游审计显式禁用，外部数据库等 opt-in 集成测试未启用。
+- 验证基于 HEAD `9a5da8e` 加当前未提交业务源码，快照 SHA-256 `ea5e16cb154b895c5718bbf6602e170040a473b9a1381ea27e2f1ee6ceb40e52`；本节为验证后补录。日志及快照本地留存 `.build-out/fix-20261102-r1/`，远端日志 `/srv/build-server/logs/workbuddy2api/fix-20261102-r1/`。
+- 未提交、未推送、未部署；未做真实上游联调。

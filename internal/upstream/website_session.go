@@ -93,7 +93,7 @@ func (c *Client) cachedWebsite(key, base string) (websiteSession, bool) {
 	return entry, time.Since(entry.created) < 24*time.Hour && hasWebsiteCookie(entry.jar, base)
 }
 
-func (c *Client) websiteSessionFor(ctx context.Context, a *auth.Auth) (websiteSession, error) {
+func (c *Client) websiteSessionFor(ctx context.Context, a *auth.Auth, page string) (websiteSession, error) {
 	key, base := c.websiteKey(a), c.websiteBase(a)
 	if entry, ok := c.cachedWebsite(key, base); ok {
 		return entry, nil
@@ -106,7 +106,7 @@ func (c *Client) websiteSessionFor(ctx context.Context, a *auth.Auth) (websiteSe
 		// caller must not cancel login for the other waiting requests.
 		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
 		defer cancel()
-		entry, err := c.openWebsite(flightCtx, a)
+		entry, err := c.openWebsite(flightCtx, a, page)
 		if err != nil && c.WebAuthMode == "auto" && legacyReadAllowed(flightCtx, err) {
 			entry, err = websiteSession{created: time.Now(), unsupported: true}, nil
 		}
@@ -126,7 +126,7 @@ func (c *Client) websiteSessionFor(ctx context.Context, a *auth.Auth) (websiteSe
 	}
 }
 
-func (c *Client) openWebsite(ctx context.Context, a *auth.Auth) (websiteSession, error) {
+func (c *Client) openWebsite(ctx context.Context, a *auth.Auth, page string) (websiteSession, error) {
 	entry := websiteSession{created: time.Now()}
 	s := a.Snapshot()
 	if s.UID == "" || s.RefreshToken == "" {
@@ -172,7 +172,7 @@ func (c *Client) openWebsite(ctx context.Context, a *auth.Auth) (websiteSession,
 	}
 	query := navigation.Query()
 	query.Set("code", code.Value)
-	query.Set("target", "/profile/growth-center")
+	query.Set("target", webLoginTarget(page))
 	navigation.RawQuery = query.Encode()
 	nav, err := http.NewRequestWithContext(ctx, http.MethodGet, navigation.String(), nil)
 	if err != nil {
@@ -223,8 +223,11 @@ func (c *Client) websiteJSON(ctx context.Context, a *auth.Auth, method, path str
 	if err != nil {
 		return nil, true, err
 	}
+	if page == "" {
+		page = originOf(c.websiteBase(a)) + webPageFor(uri.Path)
+	}
 	for attempt := 0; attempt < 2; attempt++ {
-		entry, err := c.websiteSessionFor(ctx, a)
+		entry, err := c.websiteSessionFor(ctx, a, page)
 		if err != nil {
 			return nil, true, err
 		}
