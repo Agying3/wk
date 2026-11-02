@@ -967,7 +967,7 @@ func watchConfigFrom(cfg *Config) server.WatchConfig {
 	for _, p := range cfg.AutoEnroll.Watch.Projects {
 		sid := strings.TrimSpace(p.Sid)
 		hex := strings.TrimSpace(p.HexSID)
-		if sid == "" || hex == "" || p.MaxPrice <= 0 || p.MinStock < 1 {
+		if sid == "" || hex == "" || p.MaxPrice <= 0 || p.MinPrice < 0 || p.MinPrice > p.MaxPrice || p.MinStock < 1 {
 			log.Printf("uid-watcher: 跳过非法监控项目 %q（sid/hex_sid/价格/库存校验不过）", p.Name)
 			continue
 		}
@@ -975,6 +975,7 @@ func watchConfigFrom(cfg *Config) server.WatchConfig {
 			Sid:      sid,
 			HexSID:   hex,
 			Name:     strings.TrimSpace(p.Name),
+			MinPrice: p.MinPrice,
 			MaxPrice: p.MaxPrice,
 			MinStock: p.MinStock,
 			Enabled:  p.Enabled,

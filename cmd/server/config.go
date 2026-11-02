@@ -787,6 +787,7 @@ type WatchProjectJSON struct {
 	Sid      string  `json:"sid"`
 	HexSID   string  `json:"hex_sid"`
 	Name     string  `json:"name"`
+	MinPrice float64 `json:"min_price"`
 	MaxPrice float64 `json:"max_price"`
 	MinStock int     `json:"min_stock"`
 	Enabled  bool    `json:"enabled"`

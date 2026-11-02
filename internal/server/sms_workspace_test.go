@@ -213,3 +213,45 @@ func TestSMSWorkspaceMonitorDisableUsesSavedProjects(t *testing.T) {
 		t.Fatal("unsaved draft replaced stored projects")
 	}
 }
+
+func TestSMSWorkspaceMonitorPriceRangePersistence(t *testing.T) {
+	h, _, path := newWebuiTestHandler(t, `{}`)
+	w := NewUIDWatcher(WatchConfig{}, nil, nil, "")
+	h.cfg.UIDWatcher = w
+	const endpoint = "/admin/account/sms/haozhuma/watch"
+	put := func(min float64) *httptest.ResponseRecorder {
+		r := httptest.NewRecorder()
+		body := fmt.Sprintf(`{"projects":[{"sid":"52283","hex_sid":"a1b2c3d4e5f60718","min_price":%v,"max_price":1,"min_stock":1,"enabled":true}]}`, min)
+		h.ServeHTTP(r, httptest.NewRequest("PUT", endpoint, strings.NewReader(body)))
+		return r
+	}
+	if r := put(0.5); r.Code != 200 {
+		t.Fatalf("save: %d %s", r.Code, r.Body.String())
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored struct {
+		AutoEnroll struct {
+			Watch WatchConfig `json:"watch"`
+		} `json:"autoenroll"`
+	}
+	if err := json.Unmarshal(before, &stored); err != nil || len(stored.AutoEnroll.Watch.Projects) != 1 || stored.AutoEnroll.Watch.Projects[0].MinPrice != 0.5 {
+		t.Fatalf("minimum lost on disk: %s, %v", before, err)
+	}
+	for _, min := range []float64{-1, 2} {
+		if r := put(min); r.Code != 400 {
+			t.Fatalf("invalid minimum %v: %d %s", min, r.Code, r.Body.String())
+		}
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) || w.Status().Projects[0].MinPrice != 0.5 {
+		t.Fatal("invalid update changed stored or running minimum")
+	}
+	r := httptest.NewRecorder()
+	h.ServeHTTP(r, httptest.NewRequest("GET", endpoint, nil))
+	if r.Code != 200 || !strings.Contains(r.Body.String(), `"min_price":0.5`) {
+		t.Fatalf("minimum missing from GET: %d %s", r.Code, r.Body.String())
+	}
+}

@@ -1,11 +1,43 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestWatchConfigFromPriceRange(t *testing.T) {
+	for _, tc := range []struct {
+		name, field string
+		want        float64
+		valid       bool
+	}{
+		{"legacy", "", 0, true},
+		{"range", `"min_price":0.5,`, 0.5, true},
+		{"equal", `"min_price":1,`, 1, true},
+		{"negative", `"min_price":-1,`, 0, false},
+		{"above maximum", `"min_price":2,`, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			if err := json.Unmarshal([]byte(`{"autoenroll":{"watch":{"projects":[{"sid":"52283","hex_sid":"a1b2c3d4e5f60718",`+tc.field+`"max_price":1,"min_stock":1,"enabled":true}]}}}`), &cfg); err != nil {
+				t.Fatal(err)
+			}
+			watch := watchConfigFrom(&cfg)
+			if !tc.valid {
+				if len(watch.Projects) != 0 {
+					t.Fatal("invalid price range survived restart")
+				}
+				return
+			}
+			if len(watch.Projects) != 1 || watch.Projects[0].MinPrice != tc.want {
+				t.Fatalf("minimum lost on restart: %+v", watch)
+			}
+		})
+	}
+}
 
 // 流式超时默认值：不限总时长（否则长回答仍会被整请求超时掐断，正是本次改造要解决的问题），
 // 但空闲窗口必须非零，否则上游卡住时没有任何保护。

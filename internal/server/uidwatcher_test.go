@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -420,6 +421,84 @@ func TestWatchConfigValidate(t *testing.T) {
 	c7200 := WatchConfig{IntervalSeconds: 7200, Projects: good.Projects}
 	if _, err := c7200.Validate(); err == nil {
 		t.Fatal("间隔 7200s 应报错")
+	}
+}
+
+func TestWatchConfigPriceRange(t *testing.T) {
+	for _, min := range []float64{-0.01, 1.01, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		cfg := WatchConfig{Projects: []WatchProject{{Sid: "52283", HexSID: "a1b2c3d4e5f60718", MinPrice: min, MaxPrice: 1, MinStock: 1}}}
+		if _, err := cfg.Validate(); err == nil {
+			t.Errorf("minimum %v should be rejected", min)
+		}
+	}
+	for _, min := range []float64{0, 0.5, 1} {
+		cfg := WatchConfig{Projects: []WatchProject{{Sid: "52283", HexSID: "a1b2c3d4e5f60718", MinPrice: min, MaxPrice: 1, MinStock: 1}}}
+		clean, err := cfg.Validate()
+		if err != nil || len(clean.Projects) != 1 || clean.Projects[0].MinPrice != min {
+			t.Fatalf("minimum %v lost during validation: %+v, %v", min, clean, err)
+		}
+	}
+}
+
+// 最低价阻止低价码入选，包含区间边界；锁定目标跌破下限后切换。
+func TestWatcherPriceFloorAndLockedTarget(t *testing.T) {
+	e := newManualWatchEnv(t, map[string]string{
+		"52283-LOW": "0.30|5", "52283-FLOOR": "0.50|5",
+		"52283-CEILING": "1.00|5", "52283-HIGH": "1.10|5",
+	})
+	p := e.proj(1, 1)
+	p.MinPrice = 0.5
+	e.w.Reconfigure(WatchConfig{Enabled: true, Projects: []WatchProject{p}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.w.tick(t.Context(), e.w.cfg)
+	if st := e.w.Status(); st.TargetUID != "52283-FLOOR" || st.EnrolledTotal != 1 {
+		t.Fatalf("should choose inclusive floor, got %+v", st)
+	}
+	e.fh.mu.lock()
+	e.fh.uidTable["52283-FLOOR"] = "0.40|5"
+	e.fh.mu.unlock()
+	e.w.tick(t.Context(), e.w.cfg)
+	if st := e.w.Status(); st.TargetUID != "52283-CEILING" || st.EnrolledTotal != 2 {
+		t.Fatalf("should stop using below-floor target and choose inclusive ceiling, got %+v", st)
+	}
+}
+
+// 库存不变，只因从最低价以下涨回区间也应触发。
+func TestWatcherPriceRisesIntoRange(t *testing.T) {
+	e := newManualWatchEnv(t, map[string]string{"52283-A": "0.40|5"})
+	p := e.proj(1, 1)
+	p.MinPrice = 0.5
+	e.w.Reconfigure(WatchConfig{Enabled: true, Projects: []WatchProject{p}})
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.w.tick(t.Context(), e.w.cfg)
+	if e.w.Status().TriggerTotal != 0 || e.fz.getPhone.Load() != 0 {
+		t.Fatal("below-floor code triggered a phone purchase")
+	}
+	e.fh.mu.lock()
+	e.fh.uidTable["52283-A"] = "0.50|5"
+	e.fh.mu.unlock()
+	e.w.tick(t.Context(), e.w.cfg)
+	if st := e.w.Status(); st.TargetUID != "52283-A" || st.EnrolledTotal != 1 {
+		t.Fatalf("rising into range should trigger without restocking, got %+v", st)
+	}
+}
+
+func TestWatcherPriceFloorDeadBaseline(t *testing.T) {
+	e := newManualWatchEnv(t, nil)
+	p := e.proj(1, 1)
+	p.MinPrice = 0.5
+	e.w.state.PerUID["52283-A"] = &watchUIDState{KnownStock: -1}
+	e.w.syncSnapshot(p, []h5.UIDItem{{UID: "52283-A", Price: 0.4, Stock: 5}}, nil)
+	if got := e.w.stateSnapshot().PerUID["52283-A"].KnownStock; got != -1 {
+		t.Fatalf("below-floor relisting consumed dead baseline: %d", got)
+	}
+	e.w.syncSnapshot(p, []h5.UIDItem{{UID: "52283-A", Price: 0.5, Stock: 5}}, nil)
+	if got := e.w.stateSnapshot().PerUID["52283-A"].KnownStock; got != 5 {
+		t.Fatalf("eligible relisting did not restore baseline: %d", got)
 	}
 }
 

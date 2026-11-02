@@ -39,12 +39,18 @@ type WatchProject struct {
 	HexSID string `json:"hex_sid"`
 	// Name 项目名称（展示用）。
 	Name string `json:"name"`
+	// MinPrice 只接受 ≥ 此价（元）的对接码；默认 0。
+	MinPrice float64 `json:"min_price"`
 	// MaxPrice 只接受 ≤ 此价（元）的对接码。>0 必填。
 	MaxPrice float64 `json:"max_price"`
 	// MinStock 触发要求的最低库存（≥1：库存 0 的码取不到号）。
 	MinStock int `json:"min_stock"`
 	// Enabled false = 暂停该项目的事件判定（码表仍拉取，观测不中断）。
 	Enabled bool `json:"enabled"`
+}
+
+func (p WatchProject) acceptsPrice(price float64) bool {
+	return price >= p.MinPrice && price <= p.MaxPrice
 }
 
 // WatchConfig 对接码监控的完整配置（config.json autoenroll.watch）。
@@ -143,6 +149,9 @@ func (c *WatchConfig) Validate() (WatchConfig, error) {
 		if math.IsNaN(p.MaxPrice) || math.IsInf(p.MaxPrice, 0) || p.MaxPrice <= 0 {
 			return out, fmt.Errorf("项目 %s 的最高价必须大于 0（元）", sid)
 		}
+		if math.IsNaN(p.MinPrice) || math.IsInf(p.MinPrice, 0) || p.MinPrice < 0 || p.MinPrice > p.MaxPrice {
+			return out, fmt.Errorf("项目 %s 的最低价需大于等于 0 且不超过最高价（元）", sid)
+		}
 		if p.MinStock < 1 {
 			return out, fmt.Errorf("项目 %s 的最少库存需 ≥ 1", sid)
 		}
@@ -154,6 +163,7 @@ func (c *WatchConfig) Validate() (WatchConfig, error) {
 			Sid:      sid,
 			HexSID:   hex,
 			Name:     strings.TrimSpace(p.Name),
+			MinPrice: p.MinPrice,
 			MaxPrice: p.MaxPrice,
 			MinStock: p.MinStock,
 			Enabled:  p.Enabled,
@@ -693,7 +703,7 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 		now := time.Now()
 		for _, it := range items {
 			// 价格/库存门槛：超出区间的码不触发。
-			if it.Price > p.MaxPrice || it.Stock < p.MinStock {
+			if !p.acceptsPrice(it.Price) || it.Stock < p.MinStock {
 				continue
 			}
 			st := snap.PerUID[it.UID]
@@ -717,11 +727,9 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 				candidates = append(candidates, candidate{p, it.UID, it.Price, fmt.Sprintf("补货 %d→%d", st.KnownStock, it.Stock), it.Stock})
 				continue
 			}
-			// 降价进入区间：上一轮此码因价格超限被过滤（LastPrice >
-			// MaxPrice），这一轮降到区间内且库存达标——用户核心场景
-			//（"出现比设定价格更低的对接码"）。
-			if st.LastPrice > p.MaxPrice && it.Price <= p.MaxPrice && it.Stock >= p.MinStock {
-				candidates = append(candidates, candidate{p, it.UID, it.Price, fmt.Sprintf("降价 ¥%.2f→¥%.2f", st.LastPrice, it.Price), it.Stock})
+			// 从价格区间外进入区间（包括从最低价以下涨回区间）。
+			if !p.acceptsPrice(st.LastPrice) {
+				candidates = append(candidates, candidate{p, it.UID, it.Price, fmt.Sprintf("价格进入区间 ¥%.2f→¥%.2f", st.LastPrice, it.Price), it.Stock})
 				continue
 			}
 			// 其余情况（价格区间内小幅波动、库存下降=别人消耗）：静默，
@@ -755,6 +763,8 @@ func (w *UIDWatcher) tick(ctx context.Context, cfg WatchConfig) {
 					w.log("收割目标 %s 所在项目已停用，切换下一个", target)
 				} else if it.Price > f.proj.MaxPrice {
 					w.log("收割目标 %s 涨价 ¥%.2f 超上限 ¥%.2f，切换下一个", target, it.Price, f.proj.MaxPrice)
+				} else if !f.proj.acceptsPrice(it.Price) {
+					w.log("收割目标 %s 价格 ¥%.2f 低于下限 ¥%.2f 或无效，切换下一个", target, it.Price, f.proj.MinPrice)
 				} else if it.Stock < cfg.want() {
 					w.log("收割目标 %s 可取库存 %d < 每轮目标 %d，已吃干，切换下一个", target, it.Stock, cfg.want())
 				} else {
@@ -917,7 +927,7 @@ func (w *UIDWatcher) syncSnapshot(p WatchProject, items []haozhumah5.UIDItem, sk
 			//（否则每轮都会当成"重新上架"重复触发）。不满足门槛的
 			// 保持 dead，等它达标或消失。
 			if st.KnownStock < 0 {
-				if it.Price <= p.MaxPrice && it.Stock >= p.MinStock {
+				if p.acceptsPrice(it.Price) && it.Stock >= p.MinStock {
 					st.KnownStock = it.Stock
 				}
 			} else {

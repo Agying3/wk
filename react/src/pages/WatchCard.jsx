@@ -177,7 +177,9 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
   const saveProjects = async () => {
     // 客户端先校验一遍（后端还会再验）：给用户即时反馈。
     for (const p of projects) {
-      if (!(p.max_price > 0)) { message.error(`项目 ${p.sid || p.name} 的最高价需大于 0`); return; }
+      if (!Number.isFinite(p.max_price) || !(p.max_price > 0)) { message.error(`项目 ${p.sid || p.name} 的最高价需大于 0`); return; }
+      const minPrice = p.min_price ?? 0;
+      if (!Number.isFinite(minPrice) || minPrice < 0 || minPrice > p.max_price) { message.error(`项目 ${p.sid || p.name} 的最低价需大于等于 0 且不超过最高价`); return; }
       if (!(p.min_stock >= 1)) { message.error(`项目 ${p.sid || p.name} 的最少库存需 ≥ 1`); return; }
     }
     await save({
@@ -243,6 +245,7 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
       sid: p.project_id,
       hex_sid: p.sid,
       name: p.name,
+      min_price: 0,
       max_price: 1.0,
       min_stock: 5,
       enabled: true,
@@ -252,6 +255,21 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
 
   const columns = [
     { title: '项目', dataIndex: 'name', key: 'name', render: (n, p) => <Text>{n || p.sid}</Text> },
+    {
+      title: '最低价（元）',
+      key: 'min_price',
+      width: 120,
+      render: (_, p, i) => (
+        <InputNumber
+          min={0}
+          step={0.1}
+          value={p.min_price ?? 0}
+          disabled={saving} onChange={v => updateProject(i, { min_price: v ?? 0 })}
+          size="small"
+          style={{ width: '100%' }}
+        />
+      ),
+    },
     {
       title: '最高价（元）',
       key: 'max_price',
@@ -453,7 +471,7 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
               description={(
                 <Text type="secondary">
                   还没有监控项目。添加后，值班员会定期拉取这些项目的对接码市场，
-                  发现「新出现的低价码 / 降价进入心理价 / 补货」就自动用该码加号。
+                  发现价格区间内的新码、价格进入区间或补货时，就自动用该码加号。
                 </Text>
               )}
             />
@@ -464,8 +482,10 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
               columns={columns}
               dataSource={projects}
               pagination={false}
+              scroll={{ x: 650 }}
             />
           )}
+          <Text type="secondary" style={{ fontSize: 12 }}>仅使用最低价 ≤ 价格 ≤ 最高价的对接码；最低价为 0 时不设下限。已锁定的码超出区间后，下轮停止使用。</Text>
         </div>
 
         {/* 活动日志 */}
