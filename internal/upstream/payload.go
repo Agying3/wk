@@ -76,6 +76,7 @@ func prepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]
 	normalizeMessageRoles(obj)
 	ensureSystemFirstMessage(obj)
 	normalizeToolChoice(obj)
+	injectThinking(obj, "")
 	normalizeReasoningEffort(obj, efforts)
 	stripConversationIdentity(obj)
 	// tool 配对安全网（见 tool_pairing.go）：先 repack 再 cleanup，双侧同口径。
@@ -91,6 +92,7 @@ func prepareBodyFromMap(obj map[string]any, sanitize bool, efforts map[string][]
 		msgs, _ = cleanupOrphanToolCalls(msgs)
 		obj["messages"] = msgs
 	}
+	backfillReasoningContent(obj)
 	// Codex 兼容改写放在角色映射之后：developer→system 已完成，system
 	// 消息（含由 developer 映射来的）都会被检查；放在脱敏之前，两层
 	// 改写互不干扰（脱敏管 Claude 指纹，这里管 Codex 身份句）。
