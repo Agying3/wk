@@ -86,17 +86,19 @@ type errorCapture struct {
 }
 
 type captureManager struct {
-	mu          sync.Mutex
-	initialized bool
-	enabled     bool
-	codes       []int
-	epoch       uint64
-	inFlight    int
-	skipped     uint64
-	evicted     uint64
-	bytes       int
-	records     []*storedCapture
-	timer       *time.Timer
+	mu             sync.Mutex
+	initialized    bool
+	enabled        bool
+	codes          []int
+	epoch          uint64
+	inFlight       int
+	skipped        uint64
+	evicted        uint64
+	bytes          int
+	records        []*storedCapture
+	timer          *time.Timer
+	structureUntil time.Time
+	structures     []*storedCapture
 }
 
 type storedCapture struct {
@@ -122,6 +124,13 @@ func (m *captureManager) expireLocked(now time.Time) {
 	if len(m.records) == 0 {
 		m.records = nil
 	}
+	for len(m.structures) > 0 && !m.structures[0].expires.After(now) {
+		m.structures[0] = nil
+		m.structures = m.structures[1:]
+	}
+	if len(m.structures) == 0 {
+		m.structures = nil
+	}
 }
 
 func (m *captureManager) scheduleLocked() {
@@ -129,10 +138,17 @@ func (m *captureManager) scheduleLocked() {
 		m.timer.Stop()
 		m.timer = nil
 	}
-	if len(m.records) == 0 {
+	var next time.Time
+	if len(m.records) > 0 {
+		next = m.records[0].expires
+	}
+	if len(m.structures) > 0 && (next.IsZero() || m.structures[0].expires.Before(next)) {
+		next = m.structures[0].expires
+	}
+	if next.IsZero() {
 		return
 	}
-	m.timer = time.AfterFunc(time.Until(m.records[0].expires), func() { m.mu.Lock(); defer m.mu.Unlock(); m.expireLocked(time.Now()); m.scheduleLocked() })
+	m.timer = time.AfterFunc(time.Until(next), func() { m.mu.Lock(); defer m.mu.Unlock(); m.expireLocked(time.Now()); m.scheduleLocked() })
 }
 
 func (m *captureManager) clear() {
@@ -140,6 +156,8 @@ func (m *captureManager) clear() {
 	defer m.mu.Unlock()
 	m.epoch++
 	m.records = nil
+	m.structures = nil
+	m.structureUntil = time.Time{}
 	m.bytes = 0
 	if m.timer != nil {
 		m.timer.Stop()
@@ -148,14 +166,15 @@ func (m *captureManager) clear() {
 }
 
 type captureSession struct {
-	mu        sync.Mutex
-	closed    bool
-	manager   *captureManager
-	epoch     uint64
-	codes     map[int]bool
-	secrets   []string // transient, never serialized; known auth values to remove from echoes
-	remaining int
-	record    errorCapture
+	mu             sync.Mutex
+	closed         bool
+	manager        *captureManager
+	epoch          uint64
+	codes          map[int]bool
+	secrets        []string // transient, never serialized; known auth values to remove from echoes
+	remaining      int
+	record         errorCapture
+	structureUntil time.Time
 }
 
 type captureContextKey struct{}
@@ -173,7 +192,7 @@ func (m *captureManager) begin(r *http.Request) *captureSession {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.initLocked()
-	if !m.enabled {
+	if !m.enabled && !time.Now().Before(m.structureUntil) {
 		return nil
 	}
 	if m.inFlight >= captureInFlightLimit {
@@ -186,9 +205,12 @@ func (m *captureManager) begin(r *http.Request) *captureSession {
 		return nil
 	}
 	s := &captureSession{manager: m, epoch: m.epoch, codes: map[int]bool{}, remaining: captureRecordBudget}
-	for _, code := range m.codes {
-		s.codes[code] = true
+	if m.enabled {
+		for _, code := range m.codes {
+			s.codes[code] = true
+		}
 	}
+	s.structureUntil = m.structureUntil
 	s.addSecrets(r.Header)
 	for _, c := range r.Cookies() {
 		if len(c.Value) >= 6 {
@@ -204,6 +226,10 @@ func (s *captureSession) finish() {
 	s.mu.Lock()
 	s.closed = true
 	matched := len(s.record.MatchedCodes) > 0
+	var structure []byte
+	if time.Now().Before(s.structureUntil) {
+		structure, _ = json.Marshal(s.structure())
+	}
 	var data []byte
 	if matched {
 		s.remaining = captureRecordBudget
@@ -232,6 +258,15 @@ func (s *captureSession) finish() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.inFlight--
+	if m.epoch == s.epoch && time.Now().Before(m.structureUntil) && len(structure) > 0 && len(structure) <= captureStructureBytes {
+		m.expireLocked(time.Now())
+		if len(m.structures) >= captureStructureLimit {
+			m.structures[0] = nil
+			m.structures = m.structures[1:]
+		}
+		m.structures = append(m.structures, &storedCapture{data: structure, expires: time.Now().Add(captureRetention)})
+		m.scheduleLocked()
+	}
 	if !matched || len(data) > captureStoreLimit || !m.enabled || m.epoch != s.epoch {
 		return
 	}
@@ -628,14 +663,19 @@ func (h *Handler) requestCaptureAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodPost {
 		var input struct {
-			Enabled *bool  `json:"enabled"`
-			Codes   *[]int `json:"business_codes"`
+			Enabled          *bool  `json:"enabled"`
+			Codes            *[]int `json:"business_codes"`
+			StructureSeconds *int   `json:"structure_sample_seconds"`
 		}
 		d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 		d.DisallowUnknownFields()
 		var extra any
-		if d.Decode(&input) != nil || d.Decode(&extra) != io.EOF || input.Enabled == nil && input.Codes == nil {
+		if d.Decode(&input) != nil || d.Decode(&extra) != io.EOF || input.Enabled == nil && input.Codes == nil && input.StructureSeconds == nil {
 			writeJSON(w, 400, map[string]any{"error": "无效设置"})
+			return
+		}
+		if input.StructureSeconds != nil && (*input.StructureSeconds < 0 || *input.StructureSeconds > 1200) {
+			writeJSON(w, 400, map[string]any{"error": "结构采样期限须为 0–1200 秒"})
 			return
 		}
 		if input.Codes != nil {
@@ -653,6 +693,12 @@ func (h *Handler) requestCaptureAPI(w http.ResponseWriter, r *http.Request) {
 		m.mu.Lock()
 		m.initLocked()
 		m.epoch++
+		if input.StructureSeconds != nil {
+			m.structureUntil = time.Time{}
+			if *input.StructureSeconds > 0 {
+				m.structureUntil = time.Now().Add(time.Duration(*input.StructureSeconds) * time.Second)
+			}
+		}
 		if input.Enabled != nil {
 			m.enabled = *input.Enabled
 		}
@@ -686,6 +732,14 @@ func (h *Handler) requestCaptureAPI(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, m.records[i].summary)
 	}
 	data := map[string]any{"enabled": m.enabled, "business_codes": append([]int(nil), m.codes...), "records": rows, "in_flight": m.inFlight, "skipped_busy": m.skipped, "evicted": m.evicted, "bytes": m.bytes, "retention_seconds": int(captureRetention.Seconds()), "max_records": captureRecordLimit, "max_bytes": captureStoreLimit, "max_body_bytes": captureBodyLimit, "memory_only": true}
+	structures := make([]json.RawMessage, 0, len(m.structures))
+	for i := len(m.structures) - 1; i >= 0; i-- {
+		structures = append(structures, json.RawMessage(bytes.Clone(m.structures[i].data)))
+	}
+	data["structures"] = structures
+	data["structure_sampling_until"] = m.structureUntil
+	data["structure_sampling"] = time.Now().Before(m.structureUntil)
+	data["max_structures"] = captureStructureLimit
 	m.mu.Unlock()
 	writeJSON(w, 200, data)
 }

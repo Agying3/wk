@@ -20,6 +20,8 @@ Chat 的 `max_completion_tokens` 有效正整数会转换为上游使用的 `max
 
 管理员 API（均为本地观测，不触发上游）：`GET /admin/request-capture` 返回设置和记录摘要；`GET /admin/request-capture/{id}` 读取一份详情；`POST /admin/request-capture` 接收 `{"enabled":true,"business_codes":[11128,11140,11148]}`；`DELETE /admin/request-capture` 清空记录。设置仅本次进程生效，重启恢复默认。修改设置、暂停或清空会丢弃尚未完成的采样，实际推理请求继续。启用该功能不代表能阻止上游限制，也不证明捕获到的请求就是风控唯一原因。
 
+需要对照成功与失败请求时，可向同一管理员接口 POST `{"structure_sample_seconds":600}`，开启限时结构采样（默认关闭，范围 0–1200 秒，0 为停止）。GET 返回的 `structures` 包含入口、标准 Chat 和实际出站三个阶段的大小/哈希、消息角色计数、工具定义大小/哈希、工具历史配对计数、assistant 推理字段类型及白名单协议控制值。不保留正文、工具名称/定义/参数/结果、任意字段名、认证头或原始工具调用 ID。正文超限或不完整时只提供大小/哈希并标记未分析；消息配对统计只作诊断，不修改或阻止请求。结构记录使用独立内存队列，最多 64 条、每条 32 KiB，保留 10 分钟，不占用或挤出失败正文记录。采样到期不再收集，已有结构按保留期自动释放；DELETE 同时清空结构并关闭采样。错误捕获暂停时仍可单独启用结构采样。采样状态可从 `structure_sampling` 和 `structure_sampling_until` 核对。
+
 本修改版采用 **AGPL-3.0-only**。基于 / 包含了 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)、[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 和 [workbuddy2api-panel](https://github.com/yreidev/workbuddy2api-panel) 的代码或材料；这是独立维护的修改版，不代表原作者或腾讯官方。版权与第三方授权见 [NOTICE](NOTICE) 和 [LICENSES](LICENSES)。
 
 ### 上游读取兼容
