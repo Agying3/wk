@@ -133,7 +133,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
   return <div className="enroll-page">
 
     {statusError && <Alert type="error" showIcon message="任务状态暂不可用，正在自动重试" description={statusError} />}
-    {!status?.running && (status?.held || 0)>0 && <Alert type="warning" showIcon message={`有 ${status.held} 个遗留号码等待释放`} description="为保护在途号码，暂不能更换配置或启动新批次。" action={<Popconfirm title="释放豪猪账户全部占用号码？" description="此操作也会释放本服务账本之外的账户占用号。" onConfirm={async()=>{try{await api('/admin/account/sms/release-all',{method:'POST',body:'{}'});poller.current?.refresh();}catch(e){setActionError(e.message);}}}><Button danger size="small">释放占用</Button></Popconfirm>} />}
+    {!status?.running && (status?.held || 0)>0 && <Alert type="warning" showIcon message={`有 ${status.held} 个遗留号码等待清理`} description="暂不能更换配置或启动新批次；监控会按原动作重试，手动释放不会清除待拉黑记录。" action={<Popconfirm title="释放豪猪账户全部占用号码？" description="此操作也会释放本服务账本之外的账户占用号；待拉黑记录仍会保留。" onConfirm={async()=>{try{await api('/admin/account/sms/release-all',{method:'POST',body:'{}'});poller.current?.refresh();}catch(e){setActionError(e.message);}}}><Button danger size="small">释放占用</Button></Popconfirm>} />}
     {actionError && <Alert type="error" showIcon message="操作未完成" description={actionError} closable onClose={() => setActionError('')} />}
     <Tabs activeKey={tab} onChange={setTab} items={[
       { key: 'manual', label: '加号工作台', children: <Space direction="vertical" size={20} style={{ width: '100%' }}>{taskCard}</Space> },

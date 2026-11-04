@@ -138,7 +138,7 @@ func (a *AutoEnroller) smsBusyLocked() error {
 	case a.fetchLease:
 		return &smsBusyReason{"监控正在使用取号参数，请等待本轮收尾后再试"}
 	case len(a.held) > 0:
-		return &smsBusyReason{fmt.Sprintf("仍有 %d 个遗留号码未释放，清理完成前不可更换接码配置", len(a.held))}
+		return &smsBusyReason{fmt.Sprintf("仍有 %d 个遗留号码待清理，清理完成前不可更换接码配置", len(a.held))}
 	default:
 		return nil
 	}
@@ -170,7 +170,7 @@ func (a *AutoEnroller) prepareMonitorClient(ctx context.Context, build func(cont
 			return err
 		}
 		if left := a.Status().Held; left > 0 {
-			return fmt.Errorf("仍有 %d 个遗留号码未释放，监控将在下一轮自动重试清理；持续失败请在豪猪后台核对占用号码", left)
+			return fmt.Errorf("仍有 %d 个遗留号码待清理，监控将在下一轮按原拉黑或释放动作重试；持续失败请在豪猪后台核对", left)
 		}
 	}
 	c, err := build(ctx)

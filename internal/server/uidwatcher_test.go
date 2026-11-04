@@ -440,6 +440,75 @@ func TestWatchConfigPriceRange(t *testing.T) {
 	}
 }
 
+func TestWatchConfigProjectSelection(t *testing.T) {
+	isp := " 5,9,14,16 "
+	project := WatchProject{Sid: "52283", HexSID: "a1b2c3d4e5f60718", ISP: &isp, Province: " 44 ", CardType: "2", MaxPrice: 1, MinStock: 1}
+	cfg := WatchConfig{Workers: 3, Projects: []WatchProject{project}}
+	clean, err := cfg.Validate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.Workers != 3 || *clean.Projects[0].ISP != "5,9,14,16" || clean.Projects[0].Province != "44" || clean.Projects[0].CardType != "2" {
+		t.Fatalf("selection lost: %+v", clean)
+	}
+	for _, bad := range []string{"2", "3", "15", "5,5", ""} {
+		project.ISP = &bad
+		cfg.Projects = []WatchProject{project}
+		_, err := cfg.Validate()
+		if (bad == "") != (err == nil) {
+			t.Fatalf("ISP %q: %v", bad, err)
+		}
+	}
+	project.ISP = nil
+	project.Province = "10"
+	cfg.Projects = []WatchProject{project}
+	if _, err := cfg.Validate(); err == nil {
+		t.Fatal("accepted unknown province")
+	}
+}
+
+// 两个监控项目使用独立筛选，手动取号参数在监控结束后完整恢复。
+func TestWatcherProjectSelectionReachesSupplier(t *testing.T) {
+	e := newManualWatchEnv(t, nil)
+	e.fz.phoneQueries = make(chan url.Values, 8)
+	client := e.en.CurrentSMSClient()
+	client.ISP = "1,2"
+	client.SetUID("52283-MANUAL")
+	if _, err := e.w.AddBudget(10, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i, item := range []struct{ isp, province, card string }{{"5", "44", "2"}, {"9,14,16", "11", "1"}} {
+		p := e.proj(1, 1)
+		p.ISP = &item.isp
+		p.Province = item.province
+		p.CardType = item.card
+		uid := "52283-A"
+		if i == 1 {
+			uid = "52283-B"
+		}
+		if got := e.w.executeTrigger(t.Context(), WatchConfig{WantPerTrigger: 1, Workers: 2}, p, uid, 0.88, "fixture"); got != 1 {
+			t.Fatalf("enrolled=%d", got)
+		}
+		queries := len(e.fz.phoneQueries)
+		if queries == 0 {
+			t.Fatal("no supplier request")
+		}
+		// 并发 worker 可在首个成功前同时取号，核对本批所有取号请求。
+		for n := 0; n < queries; n++ {
+			q := <-e.fz.phoneQueries
+			if q.Get("uid") != uid || q.Get("isp") != strings.Split(item.isp, ",")[0] || q.Get("Province") != item.province || q.Get("ascription") != item.card {
+				t.Fatalf("supplier selection mismatch: %v", q)
+			}
+		}
+		if client.ISP != "1,2" || client.UID() != "52283-MANUAL" {
+			t.Fatal("manual config was changed")
+		}
+		if e.en.Status().Workers != 2 {
+			t.Fatal("monitor workers setting did not reach executor")
+		}
+	}
+}
+
 // 最低价阻止低价码入选，包含区间边界；锁定目标跌破下限后切换。
 func TestWatcherPriceFloorAndLockedTarget(t *testing.T) {
 	e := newManualWatchEnv(t, map[string]string{

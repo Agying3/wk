@@ -89,7 +89,7 @@ func TestMonitorOrphanRetryResumesWatcher(t *testing.T) {
 	}
 	e.w.tick(context.Background(), config)
 	st := e.w.Status()
-	if e.en.Status().Held != 1 || e.fz.getPhone.Load() != 0 || !strings.Contains(st.PausedReason, "1 个遗留号码未释放") || strings.Contains(st.PausedReason, "任务运行中") {
+	if e.en.Status().Held != 1 || e.fz.getPhone.Load() != 0 || !strings.Contains(st.PausedReason, "1 个遗留号码待清理") || strings.Contains(st.PausedReason, "任务运行中") {
 		t.Fatalf("failed cleanup lost the ledger or misreported a running task: %+v", st)
 	}
 	e.w.tick(context.Background(), config)

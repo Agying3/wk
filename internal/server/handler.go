@@ -1521,24 +1521,10 @@ type autoEnrollPatch struct {
 // 如 52283-WW9L2J4WOL）。
 var haozhumaUIDPattern = regexp.MustCompile(`^[0-9]+-[A-Za-z0-9]+$`)
 
-// validISPList 运营商优先级：1/2/3 的逗号组合，允许重复项以外的任何顺序
-// （豪猪按列表顺序降级）。空串合法（= 不限）。
+// validISPList 校验豪猪官方现行运营商值，空串表示不限。
 func validISPList(s string) bool {
-	seen := map[string]bool{}
-	for _, part := range strings.Split(s, ",") {
-		p := strings.TrimSpace(part)
-		if p == "" {
-			continue
-		}
-		if p != "1" && p != "2" && p != "3" {
-			return false
-		}
-		if seen[p] {
-			return false
-		}
-		seen[p] = true
-	}
-	return true
+	_, err := haozhuma.NormalizeISP(s)
+	return err == nil
 }
 
 // haozhumaAuthPatchPresent 请求是否带了鉴权字段（user/pass/token 任一）。
@@ -1716,11 +1702,11 @@ func (h *Handler) saveAdminConfig(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// 运营商优先级：只允许 1（移动）/2（联通）/3（电信）的逗号组合，不重复。
+	// 运营商优先级使用官方现行代码；旧存量值由读取路径兼容。
 	if req.SMS != nil && req.SMS.Haozhuma.ISP != nil {
 		isp := strings.TrimSpace(*req.SMS.Haozhuma.ISP)
 		if isp != "" && !validISPList(isp) {
-			writeJSON(w, 400, map[string]string{"error": "运营商优先级只能是 1（移动）/2（联通）/3（电信）的逗号组合，如 2,1"})
+			writeJSON(w, 400, map[string]string{"error": "运营商只能是 1（移动）/5（联通）/9（电信）/14（广电）/16（虚拟运营商）的逗号组合，不可重复"})
 			return
 		}
 	}

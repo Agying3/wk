@@ -186,6 +186,8 @@ func TestAdminConfigHaozhumaFetchPatch(t *testing.T) {
 		{"uid": "not-a-uid"},
 		{"uid": "52283_underscore"},
 		{"isp": "4,1"},
+		{"isp": "2"},
+		{"isp": "3"},
 		{"isp": "1,1"},
 		{"isp": "x"},
 	} {
@@ -207,7 +209,7 @@ func TestAdminConfigHaozhumaFetchPatch(t *testing.T) {
 		"checkin_hours":   []int{3},
 		"keepalive_hours": []int{9},
 		"sms": map[string]any{"haozhuma": map[string]any{
-			"author": "", "uid": "52283-NEW", "isp": "2,1",
+			"author": "", "uid": "52283-NEW", "isp": "5,1,9,14,16",
 		}},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/admin/config", strings.NewReader(string(body)))
@@ -220,7 +222,7 @@ func TestAdminConfigHaozhumaFetchPatch(t *testing.T) {
 	var doc map[string]any
 	_ = json.Unmarshal(raw, &doc)
 	hz := doc["sms"].(map[string]any)["haozhuma"].(map[string]any)
-	if hz["uid"] != "52283-NEW" || hz["isp"] != "2,1" {
+	if hz["uid"] != "52283-NEW" || hz["isp"] != "5,1,9,14,16" {
 		t.Fatalf("persisted fetch opts not updated: %v", hz)
 	}
 	// 运行时热改生效。
@@ -228,8 +230,8 @@ func TestAdminConfigHaozhumaFetchPatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.UID != "52283-NEW" || s.ISP != "2,1" || s.Author != "" {
-		t.Fatalf("runtime fetch opts = uid %q isp %q author %q, want NEW/2,1/empty", s.UID, s.ISP, s.Author)
+	if s.UID != "52283-NEW" || s.ISP != "5,1,9,14,16" || s.Author != "" {
+		t.Fatalf("runtime fetch opts = uid %q isp %q author %q", s.UID, s.ISP, s.Author)
 	}
 }
 

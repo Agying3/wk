@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/haozhumah5"
 	"workbuddy2api/internal/lifecycle"
 )
@@ -33,12 +34,16 @@ import (
 
 // WatchProject 一个被监控的豪猪项目。
 type WatchProject struct {
+	CardType string `json:"card_type,omitempty"`
 	// Sid 项目数字 ID（取号 API 用，如 52283）。
 	Sid string `json:"sid"`
 	// HexSID type=8 查询用的 16 位 hex 项目会话标识（前端选项目时带上）。
 	HexSID string `json:"hex_sid"`
 	// Name 项目名称（展示用）。
 	Name string `json:"name"`
+	// ISP nil 沿用旧手动配置；空字符串不限；指定列表时严格限定运营商。
+	ISP      *string `json:"isp,omitempty"`
+	Province string  `json:"province,omitempty"`
 	// MinPrice 只接受 ≥ 此价（元）的对接码；默认 0。
 	MinPrice float64 `json:"min_price"`
 	// MaxPrice 只接受 ≤ 此价（元）的对接码。>0 必填。
@@ -155,6 +160,22 @@ func (c *WatchConfig) Validate() (WatchConfig, error) {
 		if p.MinStock < 1 {
 			return out, fmt.Errorf("项目 %s 的最少库存需 ≥ 1", sid)
 		}
+		var isp *string
+		card, err := haozhuma.NormalizeCardType(p.CardType)
+		if err != nil {
+			return out, fmt.Errorf("项目 %s：%w", sid, err)
+		}
+		province, err := haozhuma.NormalizeProvince(p.Province)
+		if err != nil {
+			return out, fmt.Errorf("项目 %s：%w", sid, err)
+		}
+		if p.ISP != nil {
+			value, err := haozhuma.NormalizeISP(*p.ISP)
+			if err != nil {
+				return out, fmt.Errorf("项目 %s：%w", sid, err)
+			}
+			isp = &value
+		}
 		if seen[sid] {
 			return out, fmt.Errorf("项目 %s 重复配置", sid)
 		}
@@ -163,6 +184,9 @@ func (c *WatchConfig) Validate() (WatchConfig, error) {
 			Sid:      sid,
 			HexSID:   hex,
 			Name:     strings.TrimSpace(p.Name),
+			ISP:      isp,
+			Province: province,
+			CardType: card,
 			MinPrice: p.MinPrice,
 			MaxPrice: p.MaxPrice,
 			MinStock: p.MinStock,
@@ -1002,12 +1026,13 @@ func (w *UIDWatcher) executeTrigger(ctx context.Context, cfg WatchConfig, p Watc
 		maxAttempts = affordable
 	}
 	err = w.en.AutoRunWith(AutoRunOptions{
-		Source:       "monitor",
-		ProviderMode: "haozhuma",
-		Want:         want,
-		Workers:      cfg.workers(),
-		Groups:       cfg.Groups,
-		MaxAttempts:  maxAttempts,
+		PhoneSelection: &haozhuma.PhoneSelection{UID: uid, ISP: p.ISP, Province: p.Province, CardType: p.CardType},
+		Source:         "monitor",
+		ProviderMode:   "haozhuma",
+		Want:           want,
+		Workers:        cfg.workers(),
+		Groups:         cfg.Groups,
+		MaxAttempts:    maxAttempts,
 	})
 	if err != nil {
 		w.log("启动加号失败：%v（本轮放弃）", err)

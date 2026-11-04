@@ -7,6 +7,7 @@ import { EyeOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 
 import ProjectPickerModal from './ProjectPickerModal';
 import WatchHistoryPanel from './WatchHistoryPanel';
+import { haozhumaCardTypes, haozhumaOperators, haozhumaProvinces, monitorOperatorValue } from '../lib/haozhumaFilters.js';
 
 const { Text } = Typography;
 
@@ -245,6 +246,9 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
       sid: p.project_id,
       hex_sid: p.sid,
       name: p.name,
+      isp: '',
+      province: '',
+      card_type: '',
       min_price: 0,
       max_price: 1.0,
       min_stock: 5,
@@ -255,6 +259,39 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
 
   const columns = [
     { title: '项目', dataIndex: 'name', key: 'name', render: (n, p) => <Text>{n || p.sid}</Text> },
+    {
+      title: '号码类型', key: 'card_type', width: 125,
+      render: (_, p, i) => (
+        <Select
+          allowClear placeholder="不限" value={p.card_type || undefined} options={haozhumaCardTypes}
+          disabled={saving} style={{ width: '100%' }} size="small"
+          onChange={value => updateProject(i, { card_type: value || '' })}
+        />
+      ),
+    },
+    {
+      title: '归属省份', key: 'province', width: 130,
+      render: (_, p, i) => (
+        <Select
+          allowClear showSearch optionFilterProp="label" placeholder="不限"
+          value={p.province || undefined} options={haozhumaProvinces}
+          disabled={saving} style={{ width: '100%' }} size="small"
+          onChange={value => updateProject(i, { province: value || '' })}
+        />
+      ),
+    },
+    {
+      title: '运营商（严格筛选）', key: 'isp', width: 220,
+      render: (_, p, i) => (
+        <Select
+          mode="multiple" allowClear maxTagCount="responsive"
+          value={p.isp == null ? ['inherit'] : p.isp.split(',').filter(Boolean)}
+          options={[{ value: 'inherit', label: '沿用手动优先级' }, ...haozhumaOperators]}
+          placeholder="不限" disabled={saving} style={{ width: '100%' }} size="small"
+          onChange={values => updateProject(i, { isp: monitorOperatorValue(values) })}
+        />
+      ),
+    },
     {
       title: '最低价（元）',
       key: 'min_price',
@@ -430,6 +467,20 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
           </div>
           <div>
             <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
+              加号并发数（1-3，所有监控项目共用）
+            </Text>
+            <CommitInputNumber
+              min={1}
+              max={3}
+              value={shown?.workers || 1}
+              validate={v => Number.isInteger(v) && v >= 1 && v <= 3}
+              formatMessage={() => '监控并发数需在 1-3 之间'}
+              onCommit={v => saveParam({ workers: v })}
+              precision={0} disabled={saving} style={{ width: 120 }}
+            />
+          </div>
+          <div>
+            <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
               <Tooltip title="值班加的号登记进这些分组（可多选）。分组密钥只能用对应分组里的账号；空 = default。">
                 <span style={{ borderBottom: '1px dashed #bfbfbf' }}>加号进分组</span>
               </Tooltip>
@@ -482,10 +533,11 @@ export default function WatchCard({ api, h5Ready, onConfigure }) {
               columns={columns}
               dataSource={projects}
               pagination={false}
-              scroll={{ x: 650 }}
+              scroll={{ x: 1160 }}
             />
           )}
           <Text type="secondary" style={{ fontSize: 12 }}>仅使用最低价 ≤ 价格 ≤ 最高价的对接码；最低价为 0 时不设下限。已锁定的码超出区间后，下轮停止使用。</Text>
+          <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>指定运营商后只在所选范围取号，不自动放宽为不限。留空表示不限；旧配置默认沿用手动优先级。</Text>
         </div>
 
         {/* 活动日志 */}

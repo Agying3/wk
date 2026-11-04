@@ -221,7 +221,7 @@ func TestSMSWorkspaceMonitorPriceRangePersistence(t *testing.T) {
 	const endpoint = "/admin/account/sms/haozhuma/watch"
 	put := func(min float64) *httptest.ResponseRecorder {
 		r := httptest.NewRecorder()
-		body := fmt.Sprintf(`{"projects":[{"sid":"52283","hex_sid":"a1b2c3d4e5f60718","min_price":%v,"max_price":1,"min_stock":1,"enabled":true}]}`, min)
+		body := fmt.Sprintf(`{"workers":3,"projects":[{"sid":"52283","hex_sid":"a1b2c3d4e5f60718","min_price":%v,"max_price":1,"min_stock":1,"enabled":true,"isp":"5,9","province":"44","card_type":"2"}]}`, min)
 		h.ServeHTTP(r, httptest.NewRequest("PUT", endpoint, strings.NewReader(body)))
 		return r
 	}
@@ -240,9 +240,19 @@ func TestSMSWorkspaceMonitorPriceRangePersistence(t *testing.T) {
 	if err := json.Unmarshal(before, &stored); err != nil || len(stored.AutoEnroll.Watch.Projects) != 1 || stored.AutoEnroll.Watch.Projects[0].MinPrice != 0.5 {
 		t.Fatalf("minimum lost on disk: %s, %v", before, err)
 	}
+	if p := stored.AutoEnroll.Watch.Projects[0]; p.ISP == nil || *p.ISP != "5,9" || p.Province != "44" || p.CardType != "2" || stored.AutoEnroll.Watch.Workers != 3 {
+		t.Fatal("project selection or workers lost on disk")
+	}
 	for _, min := range []float64{-1, 2} {
 		if r := put(min); r.Code != 400 {
 			t.Fatalf("invalid minimum %v: %d %s", min, r.Code, r.Body.String())
+		}
+	}
+	for _, extra := range []string{`"isp":"2"`, `"isp":"5,5"`, `"province":"10"`, `"card_type":"0"`} {
+		r := httptest.NewRecorder()
+		h.ServeHTTP(r, httptest.NewRequest("PUT", endpoint, strings.NewReader(`{"projects":[{"sid":"52283","hex_sid":"a1b2c3d4e5f60718","max_price":1,"min_stock":1,`+extra+`}]}`)))
+		if r.Code != 400 {
+			t.Fatalf("invalid selection accepted: %s", extra)
 		}
 	}
 	after, _ := os.ReadFile(path)

@@ -784,6 +784,9 @@ type WatchJSON struct {
 
 // WatchProjectJSON 单个监控项目（同上，翻译用）。
 type WatchProjectJSON struct {
+	CardType string  `json:"card_type,omitempty"`
+	Province string  `json:"province,omitempty"`
+	ISP      *string `json:"isp,omitempty"`
 	Sid      string  `json:"sid"`
 	HexSID   string  `json:"hex_sid"`
 	Name     string  `json:"name"`

@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { haozhumaOperators, savedOperatorValues } from '../lib/haozhumaFilters.js';
 import {
   Alert, Button, Divider, Drawer, Form, Input, InputNumber, message, Modal, Popconfirm, Select, Space, Tag, Typography,
 } from 'antd';
@@ -88,7 +89,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
         sid: hz.sid || '',
         uid: hz.uid || '',
         uids: hz.uids || [],
-        isp: (hz.isp || '').split(',').map(s => s.trim()).filter(Boolean),
+        isp: savedOperatorValues(hz.isp),
         author: hz.author || '',
         min_balance: Number(ae.min_balance ?? DEFAULTS.min_balance),
         consecutive_fails: Number(ae.consecutive_fails ?? DEFAULTS.consecutive_fails),
@@ -361,11 +362,7 @@ export default function AutoEnrollAdvanced({ open, onClose, api, config, running
             mode="multiple"
             allowClear
             placeholder="不限"
-            options={[
-              { value: '1', label: '移动' },
-              { value: '2', label: '联通' },
-              { value: '3', label: '电信' },
-            ]}
+            options={haozhumaOperators}
           />
         </Form.Item>
         <Form.Item

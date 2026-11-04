@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,18 +113,21 @@ type AutoEnroller struct {
 	// 运行期间只读）。空 = default。
 	runGroups []string
 
-	// held 本次运行中"已从豪猪取走、但还没确认释放"的号码。
+	// held 本次运行中已取走、但还没确认完成清理的号码。
 	//
 	// 为什么要单独记账：取号成功后就占用了豪猪的并发额度，而额度满了会返回
 	// 「您的余额不足,请释放拉黑后再取号」——后续所有取号都会失败，看起来像
 	// 账户没钱（其实是没释放）。tryOne 的正常路径都会调 finish 释放，但如果
 	// 进程被 kill、或某次 finish 的 HTTP 请求本身失败，号就一直挂在豪猪那边
 	// （实测：一次任务结束后额度仍被占着，下一轮 14 次尝试全部失败）。
-	// 任务收尾时按这份账本兜底释放，保证"任务结束 = 号全部还回去"。
+	// 任务收尾按账本重试清理；已收码的豪猪号码必须拉黑，不能降级为释放。
 	held map[string]bool
+	// blacklistPending 保存已收码、但尚未确认拉黑的号码及原项目 ID。
+	// 与 held 一起落盘，重启或切换项目后仍按原动作重试。
+	blacklistPending map[string]string
 	// E码云没有平台拉黑接口，本批次用过的号即使收尾后也不重复发码。
 	seenEcode map[string]bool
-	// released 已确认释放的号（从 held 移出后记在这里，用于统计与日志）。
+	// released 已完成释放或拉黑的号（沿用 API 字段，用于统计与日志）。
 	released int
 	// ledgerPath 账本落盘路径（空 = 不落盘）。
 	//
@@ -545,8 +549,10 @@ func (a *AutoEnroller) FetchSnapshot() (sid, author, uid string, uids []string, 
 // 零值成员一律取默认值，所以调用方只填用户显式给的部分即可——这样新增参数
 // 不会打破既有调用点。
 type AutoRunOptions struct {
-	Client *haozhuma.Client
-	Source string
+	// PhoneSelection 只作用于当前监控批次，手动任务不传。
+	PhoneSelection *haozhuma.PhoneSelection
+	Client         *haozhuma.Client
+	Source         string
 
 	ProviderMode string
 	// Want 目标成功数（必填，>0）。
@@ -665,7 +671,7 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	// 它是"我们仍认为占着豪猪额度"的持久集合，正确性要求它跨任务存活：
 	// 上一轮收尾时释放失败（或进程被杀）的号必须留着，下次启动/下次任务
 	// 才能继续重试。清空等于把"这个号还没还"忘掉，而它正占着取号额度。
-	// 条目只在**确认释放成功**（markReleased）时移除。
+	// 条目只在确认对应清理动作成功后移除。
 	a.logs = nil
 	a.stopReason = ""
 	a.workers = workers
@@ -675,6 +681,9 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 	// 撞上 a.cancel 还是 nil，Stop 静默失效（用户以为停了其实还在跑）。
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = haozhuma.WithMode(ctx, opts.ProviderMode)
+	if opts.PhoneSelection != nil {
+		ctx = haozhuma.WithPhoneSelection(ctx, *opts.PhoneSelection)
+	}
 	a.cancel = cancel
 	a.mu.Unlock()
 	lifecycle.Go(func() {
@@ -969,11 +978,23 @@ func (a *AutoEnroller) trackHeld(phone string) {
 	a.mu.Unlock()
 }
 
-// markReleased 标记该号已释放（从 held 移出），并同步落盘。
+// trackBlacklist 在验码前持久化已收码号码的拉黑意图。
+func (a *AutoEnroller) trackBlacklist(phone, sid string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.blacklistPending == nil {
+		a.blacklistPending = make(map[string]string)
+	}
+	a.blacklistPending[phone] = sid
+	a.persistLedgerLocked()
+}
+
+// markReleased 标记该号已完成清理（释放或拉黑），并同步落盘。
 func (a *AutoEnroller) markReleased(phone string) {
 	a.mu.Lock()
 	if _, ok := a.held[phone]; ok {
 		delete(a.held, phone)
+		delete(a.blacklistPending, phone)
 		a.released++
 		a.persistLedgerLocked()
 	}
@@ -992,22 +1013,37 @@ func (a *AutoEnroller) heldPhones() []string {
 	return out
 }
 
+// heldLedger 兼容旧版号码数组；只有需要重试拉黑时才写入带动作的 v2 账本。
+type heldLedger struct {
+	Version    int               `json:"version"`
+	Phones     []string          `json:"phones"`
+	Blacklists map[string]string `json:"blacklists"`
+}
+
 // persistLedgerLocked 把账本写盘（调用方必须持锁）。
 //
-// 写的只有号码本身，不含 token/凭据；号码是已付费资产，所以文件权限收紧到
+// 只写号码、项目和清理动作，不含 token/凭据；文件权限收紧到
 // 0600。失败只记日志：账本写不下去不该中断加号主流程。
 func (a *AutoEnroller) persistLedgerLocked() {
 	if a.hzm == nil || a.hzm.ValidateMode("haozhuma") != nil || a.ledgerPath == "" {
 		return
 	}
 	phones := make([]string, 0, len(a.held))
+	blacklists := make(map[string]string)
 	for p := range a.held {
 		if a.hzm.IsEcodePhone(p) {
 			continue
 		}
 		phones = append(phones, p)
+		if sid, ok := a.blacklistPending[p]; ok {
+			blacklists[p] = sid
+		}
 	}
-	raw, err := json.Marshal(phones)
+	var ledger any = phones
+	if len(blacklists) > 0 {
+		ledger = heldLedger{Version: 2, Phones: phones, Blacklists: blacklists}
+	}
+	raw, err := json.Marshal(ledger)
 	if err != nil {
 		log.Printf("[auto-enroll] 账本序列化失败: %v", err)
 		return
@@ -1029,9 +1065,7 @@ func (a *AutoEnroller) persistLedgerLocked() {
 // 不能一律清空账本：清空等于把释放失败的号永久遗忘，而它正占着豪猪的
 // 取号额度——那正是我们要修的问题。只有确认"号已不在豪猪手里"才算归还。
 //
-// 遗留号只释放、不拉黑：账本里可能混有接码已成功的号（成功路径 finish(false)
-// 释放失败也会留在账本），拉黑它会让号主以后在本项目收不到码。遗留号里
-// 真正收不到码的，下次被取到时走 tryOne 失败路径自然会被拉黑，不会反复。
+// 已记录收码成功的号码按原项目重试拉黑；旧版账本及未收码号码保留释放语义。
 //
 // report 为 true 时用 a.logf（会进控制台日志），否则用标准 log（启动阶段）。
 func (a *AutoEnroller) reclaim(phones []string, report bool) int {
@@ -1057,6 +1091,19 @@ func (a *AutoEnroller) reclaimContext(ctx context.Context, phones []string, repo
 			stuck = append(stuck, phones[i:]...)
 			break
 		}
+		a.mu.Lock()
+		blacklistSID, pending := a.blacklistPending[phone]
+		a.mu.Unlock()
+		if pending {
+			if err := c.Blacklist(ctx, blacklistSID, phone); err != nil {
+				say("遗留号拉黑失败 %s: %v（保留拉黑动作，稍后重试）", maskPhone(phone), err)
+				stuck = append(stuck, phone)
+			} else {
+				c.ForgetPhone(phone)
+				done++
+			}
+			continue
+		}
 		rerr := c.Release(ctx, sid, phone)
 		switch {
 		case rerr == nil:
@@ -1080,11 +1127,17 @@ func (a *AutoEnroller) reclaimContext(ctx context.Context, phones []string, repo
 	a.mu.Lock()
 	// 以"仍卡住"的集合为准，而不是简单清空。
 	a.held = next
+	a.released += done
+	for phone := range a.blacklistPending {
+		if !next[phone] {
+			delete(a.blacklistPending, phone)
+		}
+	}
 	a.persistLedgerLocked()
 	a.mu.Unlock()
-	say("遗留号码补释放完成：%d/%d 个已归还", done, len(phones))
+	say("遗留号码清理完成：%d/%d 个已完成", done, len(phones))
 	if len(stuck) > 0 && a.ledgerPath != "" {
-		say("%d 个号仍占用取号额度（已记入账本，稍后重试；若持续失败可在豪猪后台手动释放）", len(stuck))
+		say("%d 个号码仍待清理（已记入账本，按原拉黑或释放动作重试）", len(stuck))
 	}
 	return done
 }
@@ -1102,13 +1155,13 @@ func (a *AutoEnroller) reclaimStuck() int {
 	return a.reclaim(left, true)
 }
 
-// ReclaimOrphans 从账本读回"上次进程没来得及释放"的号码并补释放一次。
+// ReclaimOrphans 从账本读回上次未清理的号码，按记录的拉黑或释放动作重试。
 //
 // 场景：容器重启是 SIGKILL，defer 不执行，内存账本直接消失，号就永远留在
 // 豪猪那边占额度——后续每次取号都会返回「您的余额不足,请释放拉黑后再取号」，
 // 看起来像账户没钱。启动时补一次就恢复干净。
 //
-// 必须在服务开始接单前调用（main 里）。返回补释放的号码数。
+// 必须在服务开始接单前调用（main 里）。返回完成清理的号码数。
 func (a *AutoEnroller) ReclaimOrphans() int {
 	if !a.HasHaozhuma() || a.ledgerPath == "" {
 		return 0
@@ -1122,14 +1175,31 @@ func (a *AutoEnroller) ReclaimOrphans() int {
 		return 0
 	}
 	var phones []string
-	if err := json.Unmarshal(raw, &phones); err != nil {
+	var blacklists map[string]string
+	if bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{")) {
+		var ledger heldLedger
+		if err := json.Unmarshal(raw, &ledger); err != nil || ledger.Version != 2 || ledger.Phones == nil || ledger.Blacklists == nil {
+			log.Printf("[auto-enroll] 遗留账本格式无效或版本不支持（跳过）")
+			return 0
+		}
+		phones, blacklists = ledger.Phones, ledger.Blacklists
+		for phone, sid := range blacklists {
+			if sid == "" || !slices.Contains(phones, phone) {
+				log.Printf("[auto-enroll] 遗留账本拉黑记录无效（跳过）")
+				return 0
+			}
+		}
+	} else if err := json.Unmarshal(raw, &phones); err != nil {
 		log.Printf("[auto-enroll] 遗留账本损坏（跳过）: %v", err)
 		return 0
 	}
 	if len(phones) == 0 {
 		return 0
 	}
-	log.Printf("[auto-enroll] 发现 %d 个上次未释放的号码（进程曾非正常结束），正在补释放", len(phones))
+	a.mu.Lock()
+	a.blacklistPending = blacklists
+	a.mu.Unlock()
+	log.Printf("[auto-enroll] 发现 %d 个上次未清理的号码，正在按原动作重试", len(phones))
 	return a.reclaim(phones, false)
 }
 
@@ -1233,8 +1303,7 @@ func (a *AutoEnroller) SetSMSDebugPath(path string) {
 //
 // 与逐号兜底（releaseAllHeld）的区别：cancelAllRecv 是平台侧全量操作，
 // 能把**账本之外**的号也放掉（手动测试留下的、别的进程取的、账本文件
-// 丢失前的）。代价是没有逐号确认，所以调用后把整个账本清空——平台已经
-// 没有任何占用了，账本再留着只会让下次启动对已释放的号空转。
+// 丢失前的）。已收码但未确认拉黑的记录仍需保留：释放不等于拉黑。
 //
 // 任务运行中拒绝执行（409）：cancelAllRecv 会把正在收码的在途号码一起
 // 放掉，等码等一半号没了，所有 worker 白等。
@@ -1263,10 +1332,13 @@ func (a *AutoEnroller) ReleaseAllHeld(ctx context.Context) (bool, int, error) {
 	if err := c.ReleaseAll(ctx); err != nil {
 		return false, heldBefore, err
 	}
-	// 平台侧已全量释放：账本整体清空，released 补记本批。
+	// 全量释放不代表已加入黑名单：保留待拉黑号码及原项目，后续继续重试。
 	a.mu.Lock()
 	a.held = map[string]bool{}
-	a.released += heldBefore
+	for phone := range a.blacklistPending {
+		a.held[phone] = true
+	}
+	a.released += heldBefore - len(a.held)
 	a.persistLedgerLocked()
 	a.mu.Unlock()
 	return true, heldBefore, nil
@@ -1275,51 +1347,14 @@ func (a *AutoEnroller) ReleaseAllHeld(ctx context.Context) (bool, int, error) {
 // ErrBusy 一键释放与运行中的任务冲突。
 var ErrBusy = errors.New("自动加号任务正在运行，等它结束后再一键释放")
 
-// releaseAllHeld 任务收尾兜底：把账本里仍未确认释放的号全部释放。
-//
-// 必须兜底的原因：取号后就占用了豪猪的并发额度，额度满了会返回
-// 「您的余额不足,请释放拉黑后再取号」，导致**后续所有取号都失败**——
-// 看起来像账户没钱，实际是号没还。正常路径都会释放，但进程被 kill、
-// 或单次释放请求失败时就会漏（实测：一轮任务结束后额度仍被占着，
-// 下一轮 14 次尝试全部失败）。
-//
-// 不拉黑：账本里可能混有接码已成功的号（成功路径 finish(false) 释放
-// 失败也会留下），拉黑它会让号主以后在本项目收不到码。失败路径的号
-// 在 tryOne 里已经被拉黑过了，这里的号要么是"释放请求失败"要么是
-// "接码成功但没还回去"，两种都不该拉黑。
-//
-// 释放失败只记日志、不报错——收尾阶段没有更合适的处理方式，而且这条
-// 路径本就是"正常释放没成功"时的补救。
-//
-// 释放失败的号会**留在账本里**（markReleased 只在成功时调用）：账本不随
-// 任务结束清空，下次任务开跑前（reclaimStuck）或进程下次启动时
-// （ReclaimOrphans）会再试。删掉它们等于把"这个号还占着额度"忘了，
-// 而那正是本函数要解决的问题。
+// releaseAllHeld 任务收尾按原动作兜底，失败留账本，供下轮或重启后继续重试。
 func (a *AutoEnroller) releaseAllHeld() {
 	left := a.heldPhones()
 	if len(left) == 0 {
 		return
 	}
-	a.logf("任务结束，兜底释放 %d 个仍占用的号码", len(left))
-	bg := context.Background()
-	// 任务中途切过 sid 时，在途号属于旧项目：当前 sid 释放报"手机号不
-	// 存在"→ 失败留账本，下次启动 reclaim 走 goneUpstream 判定收尾。
-	sid := a.currentSid()
-	var failed int
-	for _, phone := range left {
-		if err := a.hzm.Release(bg, sid, phone); err != nil {
-			a.logf("兜底释放 %s 失败（号仍占着豪猪额度）: %v", phone, err)
-			failed++
-			continue
-		}
-		a.markReleased(phone)
-	}
-	if failed == 0 {
-		a.logf("收尾完成：%d 个号码的本地占用已结束", len(left))
-	} else {
-		a.logf("兜底释放结束：%d 个成功，%d 个失败（失败的号已留在账本，下次启动会重试）",
-			len(left)-failed, failed)
-	}
+	a.logf("任务结束，兜底清理 %d 个号码", len(left))
+	a.reclaim(left, true)
 }
 
 // reloginOnce 保证并发的 token 失效只触发一次重登。
@@ -1405,25 +1440,17 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 	}
 	a.logf("[w%d] 取号 %s", worker, phone)
 
-	// finish 统一收尾。任何退出路径都要走它；释放成功才把号从账本里销掉，
-	// 失败则留在账本上，由任务收尾的 releaseAllHeld 再兜一次（额度被占着
-	// 会让后续取号全部失败）。
-	//
-	// 拉黑策略（与豪猪官方 SDK next_code() 的语义对齐，2026-09 核对）：
-	//   - blacklist=true 的路径：收不到码/发码失败/验码失败——这个号在
-	//     本项目上"废了"，拉黑避免下次又取到同一个（黑名单语义就是
-	//     "别再发给我"）；
-	//   - blacklist=false（接码成功）：只释放不拉黑。豪猪官方 SDK 成功
-	//     后仅 release；拉黑已成功的号会让号主（真实用户）以后在这个
-	//     项目上收不到码，过于激进。
-	//
-	// 关于"拉黑后是否还要 release"：豪猪官方 SDK 超时分支只调
-	// addBlacklist、不补 cancelRecv——说明 addBlacklist 自带释放语义
-	// （拉黑即收回号码、归还占用额度；平台文案「请释放拉黑后再取号」
-	// 把两者并列也印证这一点）。这里拉黑后仍然补一次 release：对已
-	// 归还的号豪猪返回"手机号不存在"，reclaim 的 goneUpstream 判定
-	// 会把它当成功处理，双保险没有副作用。
+	// 已收码号码立即拉黑；finish 复用结果，不再释放，也不因注册/落盘失败降级。
+	// 未收码失败路径保留现有拉黑与释放策略。E码云只结束本地占用。
+	receivedCleanupNote := ""
+	receivedBlacklisted := false
 	finish := func(blacklist bool) string {
+		if receivedCleanupNote != "" {
+			if receivedBlacklisted {
+				a.markReleased(phone)
+			}
+			return receivedCleanupNote
+		}
 		if isEcode {
 			a.markReleased(phone)
 			return "本地占用已结束；未调用平台拉黑或释放"
@@ -1481,6 +1508,17 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 		a.mu.Lock()
 		a.runReceived++
 		a.mu.Unlock()
+		if !isEcode {
+			a.trackBlacklist(phone, sid)
+			if err := a.hzm.Blacklist(context.Background(), sid, phone); err != nil {
+				a.logf("已收码号码 %s 拉黑失败: %v（保留拉黑动作，收尾重试）", maskPhone(phone), err)
+				receivedCleanupNote = "平台拉黑失败，留待收尾重试"
+			} else {
+				// 保留本地占用直到本次登录结束，防止供应商重复返号干扰在途验码。
+				receivedBlacklisted = true
+				receivedCleanupNote = "已拉黑"
+			}
+		}
 		creds, verr := a.sms.Verify(ctx, send.SessionID, code)
 		if verr == nil {
 			// 6) 落盘。
@@ -1497,11 +1535,11 @@ func (a *AutoEnroller) tryOne(ctx context.Context, worker, pollCount int) (ok bo
 			_, _, perr := a.persist(acc, creds.Region)
 			if perr != nil {
 				a.logf("号 %s 登录成功但落盘失败: %v", phone, perr)
-				// 接码已成功（豪猪已扣费），落盘失败不拉黑——只释放。
+				// 接码已计费，号码已拉黑或进入待拉黑账本，不因落盘失败释放。
 				finish(false)
 				return false, true, perr
 			}
-			// 接码成功：只释放不拉黑（对齐豪猪官方 SDK next_code 语义）。
+			// 接码成功后的号码已按上述策略处理。
 			a.smsDebug("[%s] 验码成功 phone=%s code=%s uid=%s", sid, phone, code, creds.UID)
 			// 分组登记失败只告警不影响加号结果：账号已落盘可用，分组是
 			// 归属元数据，用户可以在账号列表里事后补设。

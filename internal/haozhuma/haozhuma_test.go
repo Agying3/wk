@@ -170,9 +170,9 @@ func TestGetPhoneISPFallback(t *testing.T) {
 	if phone != "13900139000" {
 		t.Fatalf("phone=%q", phone)
 	}
-	// 应该先试 1，再试 2 并成功（不该再多试）。
-	if len(seen) < 2 || seen[0] != "1" || seen[1] != "2" {
-		t.Fatalf("isp attempts=%v want [1 2]", seen)
+	// 旧界面的 2（联通）读取时迁为现行官方值 5。
+	if len(seen) < 2 || seen[0] != "1" || seen[1] != "5" {
+		t.Fatalf("isp attempts=%v want [1 5]", seen)
 	}
 }
 

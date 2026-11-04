@@ -21,17 +21,21 @@ import (
 
 // fakeHZM 假豪猪服务器：可编程的响应序列，用于测试终止逻辑。
 type fakeHZM struct {
-	t            *testing.T
-	srv          *httptest.Server
-	getPhone     atomic.Int32 // getPhone 调用次数
-	uniquePhones atomic.Bool  // 并发占用测试使用不同号码，而不是重复分配同一号码。
-	getMsg       atomic.Int32 // getMessage 调用次数（验证轮询次数用）
-	blacklist    atomic.Int32 // addBlacklist 成功次数
-	releaseOK    atomic.Int32 // cancelRecv 成功次数
-	summary      atomic.Value // string: 余额响应
-	phoneResp    atomic.Value // string: getPhone 响应
-	tokenResp    atomic.Value // string: login 响应
-	msgResp      atomic.Value // string: getMessage 响应（默认"等待短信"）
+	phoneQueries   chan url.Values
+	t              *testing.T
+	srv            *httptest.Server
+	getPhone       atomic.Int32 // getPhone 调用次数
+	uniquePhones   atomic.Bool  // 并发占用测试使用不同号码，而不是重复分配同一号码。
+	getMsg         atomic.Int32 // getMessage 调用次数（验证轮询次数用）
+	blacklist      atomic.Int32 // addBlacklist 成功次数
+	blacklistCalls atomic.Int32 // addBlacklist 调用次数（含失败）
+	blacklistFail  atomic.Int32
+	blacklistGone  atomic.Bool
+	releaseOK      atomic.Int32 // cancelRecv 成功次数
+	summary        atomic.Value // string: 余额响应
+	phoneResp      atomic.Value // string: getPhone 响应
+	tokenResp      atomic.Value // string: login 响应
+	msgResp        atomic.Value // string: getMessage 响应（默认"等待短信"）
 	// releaseFail 剩余多少次 cancelRecv 要失败（模拟释放请求失败）。
 	releaseFail atomic.Int32
 	// releaseGone 为 true 时豪猪对释放返回"手机号不存在"（号已不在它手里）。
@@ -61,6 +65,12 @@ func newFakeHZM(t *testing.T) *fakeHZM {
 		case "getSummary":
 			_, _ = w.Write([]byte(f.summary.Load().(string)))
 		case "getPhone":
+			if f.phoneQueries != nil {
+				select {
+				case f.phoneQueries <- r.URL.Query():
+				default:
+				}
+			}
 			// 记下第一次取号的时刻（compare-and-swap：只记首次）。
 			f.firstPhoneSeq.CompareAndSwap(0, f.nextSeq())
 			n := f.getPhone.Add(1)
@@ -74,6 +84,16 @@ func newFakeHZM(t *testing.T) *fakeHZM {
 			// 默认永远等待（模拟收不到码）。
 			_, _ = w.Write([]byte(f.msgResp.Load().(string)))
 		case "addBlacklist":
+			f.blacklistCalls.Add(1)
+			if f.blacklistGone.Load() {
+				_, _ = w.Write([]byte(`{"code":"-1","msg":"很抱歉,手机号不存在"}`))
+				return
+			}
+			if f.blacklistFail.Load() > 0 {
+				f.blacklistFail.Add(-1)
+				_, _ = w.Write([]byte(`{"code":"-1","msg":"系统繁忙，请稍后再试（模拟）"}`))
+				return
+			}
 			f.blacklist.Add(1)
 			_, _ = w.Write([]byte(`{"code":"0","msg":"ok"}`))
 		case "cancelRecv":
@@ -423,10 +443,7 @@ func TestAutoEnrollConcurrentRespectsTarget(t *testing.T) {
 	}
 }
 
-// TestAutoEnrollBlacklistPolicy 拉黑策略（2026-09 与豪猪官方 SDK next_code
-// 语义对齐后）：**失败号**（收不到码/验码失败）必须拉黑+释放；
-// **成功号**（接码成功、账号落盘）只释放不拉黑——拉黑已成功的号会让
-// 号主以后在本项目收不到码。
+// TestAutoEnrollBlacklistPolicy 已收码号码只拉黑，不调用释放；未收码失败保留原策略。
 func TestAutoEnrollBlacklistPolicy(t *testing.T) {
 	f := newFakeHZM(t)
 	var mu sync.Mutex
@@ -480,24 +497,17 @@ func TestAutoEnrollBlacklistPolicy(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	// 每个取到过的号都要被释放（成功失败都一样：额度必须归还）。
-	if n := int(f.getPhone.Load()); len(releaseCalls) != n {
-		t.Fatalf("released=%d but took %d numbers, every taken number must be released", len(releaseCalls), n)
+	if n := int(f.getPhone.Load()); len(blacklistCalls) != n {
+		t.Fatalf("blacklisted=%d but took %d numbers", len(blacklistCalls), n)
 	}
-	for phone := range releaseCalls {
-		last := phone[len(phone)-1]
-		if last == '0' || last == '2' || last == '4' || last == '6' || last == '8' {
-			// 偶数 = 失败号：必须拉黑。
-			if !blacklistCalls[phone] {
-				t.Errorf("failed number %s was not blacklisted", phone)
-			}
-		}
-	}
-	// 成功号（奇数）不允许出现在黑名单里。
 	for phone := range blacklistCalls {
 		last := phone[len(phone)-1]
-		if last == '1' || last == '3' || last == '5' || last == '7' || last == '9' {
-			t.Errorf("successful number %s must NOT be blacklisted (release only)", phone)
+		if last == '0' || last == '2' || last == '4' || last == '6' || last == '8' {
+			if !releaseCalls[phone] {
+				t.Errorf("number without SMS %s was not released", phone)
+			}
+		} else if releaseCalls[phone] {
+			t.Errorf("number with SMS %s must be blacklisted without release", phone)
 		}
 	}
 }
@@ -971,9 +981,7 @@ func TestReclaimOrphansOnStartup(t *testing.T) {
 	if got := f.releaseOK.Load(); got != 2 {
 		t.Fatalf("releaseOK=%d want 2 — every orphan must be released", got)
 	}
-	// 遗留号不拉黑：账本可能混有接码已成功的号（成功路径释放失败也会留下），
-	// 拉黑它会让号主以后在本项目收不到码。真正收不到码的号，下次被取到时
-	// 走 tryOne 失败路径自然会拉黑。
+	// 旧版数组没有收码状态，保留原有释放语义；新版待拉黑动作单独测试。
 	if got := f.blacklist.Load(); got != 0 {
 		t.Fatalf("blacklist=%d want 0 — reclaim must not blacklist (ledger may contain successful numbers)", got)
 	}

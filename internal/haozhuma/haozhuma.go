@@ -62,7 +62,7 @@ type Client struct {
 	// drained 已出池的对接码（等上层消费走 H5 type=41 移出账户）。
 	drained []string
 
-	// ISP 运营商优先级列表（取号参数 isp）。实测取值：1=移动 2=联通 3=电信，
+	// ISP 运营商优先级列表：1=移动、5=联通、9=电信、14=广电、16=虚拟运营商。
 	// 逗号分隔表示依次降级，最后自动退回"不限"。
 	// 空字符串表示直接不限。腾讯短信通道对广电号支持不稳定。
 	ISP string
@@ -508,7 +508,7 @@ func truncate(s string, n int) string {
 // 「[限对接]」类项目按对接方放号，官方 SDK 会带 author（默认 adminzfz）；
 // 缺了会拿不到号（豪猪提示"建议学会加对接码后再取号"）。
 //
-// ISP 是运营商**优先级列表**（1=移动 2=联通 3=电信）：逐档尝试，前一档
+// ISP 是运营商优先级列表（1=移动、5=联通、9=电信）：逐档尝试，前一档
 // 没号就退到下一档，最后自动退回"不限"。实测同一项目不同对接码放的号段
 // 不一样（广电/联通/虚拟运营商），挑到能收码的运营商比死等一档更快。
 //
@@ -521,6 +521,10 @@ func truncate(s string, n int) string {
 func (c *Client) getPhoneDirect(ctx context.Context, sid string) (string, error) {
 	if c.Provider == "ecode" {
 		return c.ecodePhone(ctx, sid)
+	}
+	if selection, ok := ctx.Value(phoneSelectionKey{}).(PhoneSelection); ok && selection.UID != "" {
+		// 监控预算和项目筛选只针对该码；失效时不能退回其它码或公共池。
+		return c.getPhoneRound(ctx, sid, selection.UID)
 	}
 	// 轮换池模式：逐码尝试（每码内部仍按 ISP 降级）。
 	if len(c.uidsSnapshot()) > 0 {
@@ -594,9 +598,33 @@ func (c *Client) getPhoneRound(ctx context.Context, sid, uid string) (string, er
 	if uid != "" {
 		base.Set("uid", uid)
 	}
+	if selection, ok := ctx.Value(phoneSelectionKey{}).(PhoneSelection); ok {
+		province, err := NormalizeProvince(selection.Province)
+		if err != nil {
+			return "", err
+		}
+		if province != "" {
+			base.Set("Province", province)
+		}
+		card, err := NormalizeCardType(selection.CardType)
+		if err != nil {
+			return "", err
+		}
+		if card != "" {
+			base.Set("ascription", card)
+		}
+	}
 
 	var lastErr error
-	for _, isp := range c.ispCandidates() {
+	candidates := c.ispCandidates()
+	if selection, ok := ctx.Value(phoneSelectionKey{}).(PhoneSelection); ok && selection.ISP != nil {
+		isp, err := NormalizeISP(*selection.ISP)
+		if err != nil {
+			return "", err
+		}
+		candidates = strings.Split(isp, ",") // 独立筛选不追加“不限”兜底。
+	}
+	for _, isp := range candidates {
 		params := cloneValues(base)
 		if isp != "" {
 			params.Set("isp", isp)
@@ -607,6 +635,9 @@ func (c *Client) getPhoneRound(ctx context.Context, sid, uid string) (string, er
 			// 无号 = 这一档没货，继续试下一档；其余（余额/项目）直接抛。
 			var ae *APIError
 			if errors.As(err, &ae) && !ae.Fatal() {
+				if selection, ok := ctx.Value(phoneSelectionKey{}).(PhoneSelection); ok && selection.UID != "" && ae.UnknownUID() {
+					return "", err
+				}
 				continue
 			}
 			return "", err
@@ -639,7 +670,7 @@ func (c *Client) ispCandidates() []string {
 		return []string{""}
 	}
 	var out []string
-	for _, part := range strings.Split(c.ISP, ",") {
+	for _, part := range strings.Split(legacyISP(c.ISP), ",") {
 		if p := strings.TrimSpace(part); p != "" {
 			out = append(out, p)
 		}
@@ -728,7 +759,7 @@ func (c *Client) releaseAllDirect(ctx context.Context) error {
 	return err
 }
 
-// Blacklist 拉黑号码（收不到码的号）。
+// Blacklist 拉黑号码，避免该项目再次分配同一号码。
 func (c *Client) blacklistDirect(ctx context.Context, sid, phone string) error {
 	if c.Provider == "ecode" {
 		return nil

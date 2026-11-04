@@ -39,6 +39,26 @@ func TestWatchConfigFromPriceRange(t *testing.T) {
 	}
 }
 
+func TestWatchConfigFromProjectSelection(t *testing.T) {
+	var cfg Config
+	if err := json.Unmarshal([]byte(`{"autoenroll":{"watch":{"workers":3,"projects":[{"sid":"52283","hex_sid":"a1b2c3d4e5f60718","max_price":1,"min_stock":1,"isp":"5,9","province":"44","card_type":"2"}]}}}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	watch := watchConfigFrom(&cfg)
+	if len(watch.Projects) != 1 || watch.Projects[0].ISP == nil || *watch.Projects[0].ISP != "5,9" || watch.Projects[0].Province != "44" || watch.Projects[0].CardType != "2" || watch.Workers != 3 {
+		t.Fatalf("selection lost on restart: %+v", watch)
+	}
+	*cfg.AutoEnroll.Watch.Projects[0].ISP = "2"
+	if len(watchConfigFrom(&cfg).Projects) != 0 {
+		t.Fatal("invalid ISP survived restart")
+	}
+	cfg.AutoEnroll.Watch.Projects[0].ISP = nil
+	cfg.AutoEnroll.Watch.Projects[0].Province = "10"
+	if len(watchConfigFrom(&cfg).Projects) != 0 {
+		t.Fatal("invalid province survived restart")
+	}
+}
+
 // 流式超时默认值：不限总时长（否则长回答仍会被整请求超时掐断，正是本次改造要解决的问题），
 // 但空闲窗口必须非零，否则上游卡住时没有任何保护。
 func TestStreamTimeoutDefaults(t *testing.T) {

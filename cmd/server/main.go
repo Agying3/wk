@@ -971,7 +971,29 @@ func watchConfigFrom(cfg *Config) server.WatchConfig {
 			log.Printf("uid-watcher: 跳过非法监控项目 %q（sid/hex_sid/价格/库存校验不过）", p.Name)
 			continue
 		}
+		var isp *string
+		card, err := haozhuma.NormalizeCardType(p.CardType)
+		if err != nil {
+			log.Printf("uid-watcher: 跳过非法监控项目 %q（卡类型校验不过）", p.Name)
+			continue
+		}
+		province, err := haozhuma.NormalizeProvince(p.Province)
+		if err != nil {
+			log.Printf("uid-watcher: 跳过非法监控项目 %q（省份校验不过）", p.Name)
+			continue
+		}
+		if p.ISP != nil {
+			value, err := haozhuma.NormalizeISP(*p.ISP)
+			if err != nil {
+				log.Printf("uid-watcher: 跳过非法监控项目 %q（运营商校验不过）", p.Name)
+				continue
+			}
+			isp = &value
+		}
 		out.Projects = append(out.Projects, server.WatchProject{
+			ISP:      isp,
+			Province: province,
+			CardType: card,
 			Sid:      sid,
 			HexSID:   hex,
 			Name:     strings.TrimSpace(p.Name),
