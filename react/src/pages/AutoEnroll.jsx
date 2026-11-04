@@ -5,6 +5,7 @@ import AutoEnrollAdvanced from './AutoEnrollAdvanced';
 import WatchCard from './WatchCard';
 import SMSPlatforms from './SMSPlatforms';
 import { compatibleGroups, createTaskPoller, platformNames, readyPlatforms, taskPlatformOptions, taskProgress, validTaskPlatform } from '../lib/autoEnroll.js';
+import { haozhumaCardTypes } from '../lib/haozhumaFilters.js';
 import './autoEnroll.css';
 const { Text } = Typography;
 const Field = ({ label, children, wide }) => <div className={`enroll-field ${wide ? 'enroll-field-wide' : ''}`}><label>{label}</label>{children}</div>;
@@ -19,6 +20,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [provider, setProvider] = useState('auto');
+  const [haozhumaCardType, setHaozhumaCardType] = useState('');
   const [count, setCount] = useState(5);
   const [workers, setWorkers] = useState(3);
   const [pollCount, setPollCount] = useState(18);
@@ -54,13 +56,14 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
   const busy = status?.running || status?.config_busy || (status?.held || 0) > 0 || starting || stopping;
   const progress = taskProgress(status);
   const loaded = status !== null;
+  const usesHaozhuma = ready.haozhuma && provider !== 'ecode';
   const refresh = async () => { await refreshConfig?.(); poller.current?.refresh(); };
   const start = async () => {
     if (![count, workers, pollCount].every(Number.isInteger) || !count || !workers || !pollCount || (maxAttempts !== null && (!Number.isInteger(maxAttempts) || maxAttempts < 1))) { message.error('目标数、并发和轮询次数需要填写正整数'); return; }
     if (provider !== validTaskPlatform(provider, ready)) { message.error('所选平台尚未配置完整'); return; }
     setStarting(true); setActionError('');
     try {
-      await api('/admin/account/sms/auto-enroll', { method: 'POST', body: JSON.stringify({ count, workers, poll_count: pollCount, max_attempts: maxAttempts || 0, groups, provider, use_saved_platforms: true }) });
+      await api('/admin/account/sms/auto-enroll', { method: 'POST', body: JSON.stringify({ count, workers, poll_count: pollCount, max_attempts: maxAttempts || 0, groups, provider, use_saved_platforms: true, ...(usesHaozhuma ? { haozhuma_card_type: haozhumaCardType } : {}) }) });
       setFollow(true); message.success('任务已启动');
     } catch (e) { setActionError(e.message); }
     finally { if (alive.current) { setStarting(false); poller.current?.refresh(); } }
@@ -83,10 +86,12 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
         {!busy ? <>
         <div className="enroll-fields">
           <Field label="本次任务使用的平台" wide><Select aria-label="本次任务平台" value={provider} onChange={setProvider} disabled={!!busy} options={taskPlatformOptions(ready)} /></Field>
+          {usesHaozhuma && <Field label="豪猪号码类型"><Select aria-label="豪猪号码类型" value={haozhumaCardType} onChange={setHaozhumaCardType} disabled={!!busy} options={[{ value: '', label: '不限' }, ...haozhumaCardTypes]} /></Field>}
           <Field label="目标账号数"><InputNumber aria-label="目标账号数" min={1} max={50} precision={0} value={count} onChange={setCount} disabled={!!busy} /></Field>
           <Field label="并发数"><InputNumber aria-label="并发数" min={1} max={8} precision={0} value={workers} onChange={setWorkers} disabled={!!busy} /></Field>
           <Field label="新账号所属分组" wide><Select aria-label="新账号所属分组" mode="multiple" value={groups} onChange={setGroups} disabled={!!busy || !!groupError} options={groupOptions} placeholder="留空使用 default" /></Field>
         </div>
+        {usesHaozhuma && <div className="enroll-muted" style={{ marginTop: 10 }}>号码类型仅用于本批豪猪取号，不修改监控项目。E码云沿用其平台配置。</div>}
         {groupError && <Alert type="warning" message="分组列表不可用，本次将使用 default" style={{ marginTop: 12 }} />}
         <Collapse style={{ marginTop: 20 }} items={[{ key: 'task', label: '等待与重试参数', children: <div className="enroll-fields">
           <Field label={`每号最多查询短信次数 · 约 ${pollCount * 5} 秒起`}><InputNumber aria-label="收码轮询次数" min={1} max={36} precision={0} value={pollCount} onChange={setPollCount} disabled={!!busy} /></Field>
@@ -117,6 +122,7 @@ export default function AutoEnroll({ api, config, refreshConfig, onSaveHaozhuma,
       {status?.monitor_enabled && <Alert type="info" showIcon message="豪猪监控已开启，会按监控设置自动创建批次" action={<Button size="small" onClick={() => setTab('monitor')}>管理监控</Button>} />}
       {progress.want > 0 ? <>
         <div className="enroll-muted" style={{ marginTop: 14 }}>来源：{status.source === 'monitor' ? '豪猪监控' : '手动启动'} · 平台：{platformNames[status.provider] || '自动选择'} · 并发 {status.workers} · 每号查询 {status.poll_count} 次 · 最多尝试 {status.max_attempts} 次</div>
+        {status.haozhuma_card_type && <div className="enroll-muted" style={{ marginTop: 8 }}>本批豪猪号码类型：{haozhumaCardTypes.find(option => option.value === status.haozhuma_card_type)?.label || status.haozhuma_card_type}</div>}
         <div className="enroll-stats">{[['成功账号', status.ok || 0], ['已收到验证码', status.received || 0], ['尝试号码', status.consumed || 0], ['在途号码', status.held || 0]].map(([label, value]) => <div className="enroll-stat" key={label}><Text type="secondary">{label}</Text><strong>{value}</strong></div>)}</div>
         {status.supplier_counts && <div className="enroll-muted" style={{ marginBottom: 12 }}>实际取号：豪猪 {status.supplier_counts.haozhuma || 0} 个 · E码云 {status.supplier_counts.ecode || 0} 个</div>}
         <Progress percent={progress.percent} status={status.running ? 'active' : progress.ok >= progress.want ? 'success' : 'normal'} format={() => `${progress.ok} / ${progress.want}`} />

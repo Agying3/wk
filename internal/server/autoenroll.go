@@ -36,6 +36,7 @@ type AutoEnroller struct {
 	runSupplierCounts                     map[string]int
 	runWant                               int
 	runProvider, runSource                string
+	runHaozhumaCardType                   string
 	runReceived, runNoSMS, runOtherErrors int
 	manualStop, fetchLease                bool
 	clientPreparing                       bool
@@ -214,6 +215,7 @@ type AutoEnrollStatus struct {
 	Want             int            `json:"want"`
 	Provider         string         `json:"provider"`
 	Source           string         `json:"source"`
+	HaozhumaCardType string         `json:"haozhuma_card_type,omitempty"`
 	Groups           []string       `json:"groups"`
 	Received         int            `json:"received"`
 	NoSMS            int            `json:"no_sms"`
@@ -414,7 +416,8 @@ func (a *AutoEnroller) Status() AutoEnrollStatus {
 	}
 	return AutoEnrollStatus{
 		SupplierCounts: counts, MessagesReceived: a.runBillable,
-		Want: a.runWant, Provider: a.runProvider, Source: a.runSource, Groups: append([]string(nil), a.runGroups...), Received: a.runReceived, NoSMS: a.runNoSMS, OtherErrors: a.runOtherErrors, ManualStop: a.manualStop, ConfigBusy: a.fetchLease || a.clientPreparing,
+		HaozhumaCardType: a.runHaozhumaCardType,
+		Want:             a.runWant, Provider: a.runProvider, Source: a.runSource, Groups: append([]string(nil), a.runGroups...), Received: a.runReceived, NoSMS: a.runNoSMS, OtherErrors: a.runOtherErrors, ManualStop: a.manualStop, ConfigBusy: a.fetchLease || a.clientPreparing,
 		Running:     a.running,
 		Attempts:    a.attempts,
 		OK:          a.ok,
@@ -549,7 +552,7 @@ func (a *AutoEnroller) FetchSnapshot() (sid, author, uid string, uids []string, 
 // 零值成员一律取默认值，所以调用方只填用户显式给的部分即可——这样新增参数
 // 不会打破既有调用点。
 type AutoRunOptions struct {
-	// PhoneSelection 只作用于当前监控批次，手动任务不传。
+	// PhoneSelection 只作用于当前批次；手动任务可单独指定豪猪号码类型。
 	PhoneSelection *haozhuma.PhoneSelection
 	Client         *haozhuma.Client
 	Source         string
@@ -643,6 +646,10 @@ func (a *AutoEnroller) AutoRunWith(opts AutoRunOptions) error {
 		a.sid = target.Project()
 	}
 	a.runWant, a.runProvider, a.runSource = n, opts.ProviderMode, opts.Source
+	a.runHaozhumaCardType = ""
+	if opts.PhoneSelection != nil {
+		a.runHaozhumaCardType = opts.PhoneSelection.CardType
+	}
 	if a.runProvider == "" {
 		a.runProvider = target.Mode()
 	}

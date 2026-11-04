@@ -3412,6 +3412,8 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		// haozhuma/ecode/both/auto；空 = 用全局 mode。
 		Provider          string `json:"provider"`
 		UseSavedPlatforms bool   `json:"use_saved_platforms"`
+		// 仅作用于本批豪猪取号，不改监控项目或 E码云设置。
+		HaozhumaCardType *string `json:"haozhuma_card_type"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求格式不正确"})
@@ -3465,6 +3467,19 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	var selection *haozhuma.PhoneSelection
+	if req.HaozhumaCardType != nil {
+		card, err := haozhuma.NormalizeCardType(*req.HaozhumaCardType)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+			return
+		}
+		if card != "" && strings.TrimSpace(req.Provider) == "ecode" {
+			writeJSON(w, 400, map[string]string{"error": "豪猪号码类型不适用于仅 E码云任务，请使用 E码云平台配置"})
+			return
+		}
+		selection = &haozhuma.PhoneSelection{CardType: card}
+	}
 	var taskClient *haozhuma.Client
 	if req.UseSavedPlatforms {
 		var err error
@@ -3476,12 +3491,13 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	err := h.cfg.AutoEnroll.AutoRunWith(AutoRunOptions{
 		Client: taskClient, Source: "manual",
-		Want:         req.Count,
-		Workers:      req.Workers,
-		PollCount:    req.PollCount,
-		MaxAttempts:  req.MaxAttempts,
-		Groups:       req.Groups,
-		ProviderMode: strings.TrimSpace(req.Provider),
+		PhoneSelection: selection,
+		Want:           req.Count,
+		Workers:        req.Workers,
+		PollCount:      req.PollCount,
+		MaxAttempts:    req.MaxAttempts,
+		Groups:         req.Groups,
+		ProviderMode:   strings.TrimSpace(req.Provider),
 	})
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -3490,12 +3506,13 @@ func (h *Handler) accountSMSAutoEnroll(w http.ResponseWriter, r *http.Request) {
 	// 回显**生效值**：前端据此显示"这次真的按几次轮询跑"。
 	st := h.cfg.AutoEnroll.Status()
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"ok":           true,
-		"count":        req.Count,
-		"workers":      st.Workers,
-		"poll_count":   st.PollCount,
-		"max_attempts": st.MaxAttempts,
-		"note":         "任务已在后台运行，用 GET /admin/account/sms/auto-enroll 查看进度",
+		"ok":                 true,
+		"count":              req.Count,
+		"workers":            st.Workers,
+		"poll_count":         st.PollCount,
+		"max_attempts":       st.MaxAttempts,
+		"haozhuma_card_type": st.HaozhumaCardType,
+		"note":               "任务已在后台运行，用 GET /admin/account/sms/auto-enroll 查看进度",
 	})
 }
 
@@ -3513,6 +3530,7 @@ func (h *Handler) accountSMSAutoEnrollStatus(w http.ResponseWriter, r *http.Requ
 		"consumed": st.Consumed, "supplier_counts": st.SupplierCounts, "want": st.Want, "provider": st.Provider, "source": st.Source, "config_busy": st.ConfigBusy, "groups": st.Groups, "received": st.Received, "stopping": st.ManualStop,
 		// held > 0 表示还有号占着豪猪额度（会拖累后续取号），控制台要能看见。
 		"held": st.Held, "released": st.Released,
+		"haozhuma_card_type": st.HaozhumaCardType,
 	}
 	if h.cfg.UIDWatcher != nil {
 		body["monitor_enabled"] = h.cfg.UIDWatcher.Status().Enabled
