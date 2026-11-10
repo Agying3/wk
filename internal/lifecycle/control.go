@@ -27,13 +27,33 @@ func ListenControl(path string, handler http.Handler) (*http.Server, error) {
 
 // Control is available only on the private Unix socket, not public HTTP routes.
 func Control(release string, foreground *Gate, ready func() bool, finalize func() error, stop func()) http.Handler {
+	return ControlWithOptions(release, foreground, ready, finalize, stop, ControlOptions{})
+}
+
+// ControlOptions enables opt-in overlap controls. Callbacks must acquire their
+// shared ownership before returning; a failed promotion keeps dispatch paused.
+type ControlOptions struct {
+	Status             func() map[string]any
+	ActivateBackground func() error
+	ActivateManagement func() error
+}
+
+func ControlWithOptions(release string, foreground *Gate, ready func() bool, finalize func() error, stop func(), options ControlOptions) http.Handler {
 	m := http.NewServeMux()
 	var mu sync.Mutex
 	stopping := false
 	m.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		p, n := foreground.Status()
 		b, tasks := Default.Status()
-		_ = json.NewEncoder(w).Encode(map[string]any{"release": release, "paused": p, "active": n, "background_paused": b, "background": tasks, "ready": ready()})
+		status := map[string]any{}
+		if options.Status != nil {
+			for key, value := range options.Status() {
+				status[key] = value
+			}
+		}
+		status["release"], status["paused"], status["active"] = release, p, n
+		status["background_paused"], status["background"], status["ready"] = b, tasks, ready()
+		_ = json.NewEncoder(w).Encode(status)
 	})
 	m.HandleFunc("POST /{action}", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -47,6 +67,38 @@ func Control(release string, foreground *Gate, ready func() bool, finalize func(
 			return
 		}
 		switch r.PathValue("action") {
+		case "pause-background", "activate-background", "activate-management":
+			var status map[string]any
+			if options.Status != nil {
+				status = options.Status()
+			}
+			if status["mode"] != "overlap" || status["overlap_protocol"] != 1 {
+				http.Error(w, "overlap protocol unavailable", http.StatusConflict)
+				return
+			}
+			switch r.PathValue("action") {
+			case "pause-background":
+				Default.Pause()
+			case "activate-background":
+				if options.ActivateBackground == nil {
+					http.Error(w, "background promotion unavailable", http.StatusConflict)
+					return
+				}
+				if err := options.ActivateBackground(); err != nil {
+					http.Error(w, "background promotion failed", http.StatusConflict)
+					return
+				}
+				Default.Resume()
+			case "activate-management":
+				if options.ActivateManagement == nil {
+					http.Error(w, "management promotion unavailable", http.StatusConflict)
+					return
+				}
+				if err := options.ActivateManagement(); err != nil {
+					http.Error(w, "management promotion failed", http.StatusConflict)
+					return
+				}
+			}
 		case "pause":
 			foreground.Pause()
 		case "quiesce":
@@ -57,7 +109,13 @@ func Control(release string, foreground *Gate, ready func() bool, finalize func(
 			}
 			Default.Pause()
 		case "resume":
-			Default.Resume()
+			var status map[string]any
+			if options.Status != nil {
+				status = options.Status()
+			}
+			if status["mode"] != "overlap" || status["background_owner"] == true {
+				Default.Resume()
+			}
 			foreground.Resume()
 		case "stop":
 			p, n := foreground.Status()

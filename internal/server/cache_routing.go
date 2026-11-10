@@ -25,6 +25,8 @@ type chatRoute struct {
 	queueReason        string
 	cacheKnown         bool
 	tenant             string
+	authorityErr       error
+	poolLeases         map[string]pool.Lease
 }
 
 func (c *chatRoute) admissionEnabled() bool {
@@ -34,12 +36,36 @@ func (c *chatRoute) request(related bool) pool.RouteRequest {
 	return pool.RouteRequest{Tenant: c.tenant, Session: c.key, Prefix: c.trace.Root, Related: related}
 }
 func (c *chatRoute) pickUID(uid string, related bool, tried, allow map[string]bool) *auth.Auth {
+	if c.authorityErr != nil {
+		return nil
+	}
+	if p := c.h.cfg.Pool; p.SharedEnabled() {
+		a, l, err := p.AcquireShared(c.model, c.request(related), tried, allow, uid, c.admissionEnabled())
+		c.authorityErr = err
+		if a != nil {
+			if c.poolLeases == nil {
+				c.poolLeases = map[string]pool.Lease{}
+			}
+			c.poolLeases[a.UID] = l
+		}
+		return a
+	}
 	if c.admissionEnabled() {
 		return c.h.cfg.Pool.PickAndAcquireByUIDForRoute(uid, c.model, c.request(related), tried, allow)
 	}
 	return c.h.cfg.Pool.PickAndAcquireByUIDForModel(uid, c.model)
 }
 func (c *chatRoute) release(uid string) {
+	if p := c.h.cfg.Pool; p.SharedEnabled() {
+		if l, ok := c.poolLeases[uid]; ok {
+			delete(c.poolLeases, uid)
+			if err := p.ReleaseLease(l); err != nil {
+				c.authorityErr = err
+				log.Printf("[cache_route] shared lease release failed")
+			}
+		}
+		return
+	}
 	if c.admissionEnabled() {
 		c.h.cfg.Pool.ReleaseRoute(uid, c.request(false))
 	} else {
@@ -56,6 +82,9 @@ func (h *Handler) beginResolvedChatRoute(r *http.Request, identity session.Ident
 	c := &chatRoute{h: h, source: identity.Source, model: model, reason: "rotation"}
 	preferred := ""
 	states := h.cfg.Pool.RoutingStates(model, allow)
+	if c.authorityErr = h.cfg.Pool.SharedError(); c.authorityErr != nil {
+		return c
+	}
 	if h.cacheRouter != nil {
 		c.tenant = h.cacheRouter.Hash(routeNamespace(r))
 		c.trace = h.cacheRouter.Build(routeNamespace(r), model, doc)
@@ -95,16 +124,22 @@ func (h *Handler) beginResolvedChatRoute(r *http.Request, identity session.Ident
 	}
 	sort.Strings(healthy)
 	sort.Strings(available)
-	c.lease, _ = h.cfg.Session.ResolveLeaseWithCandidates(c.key, allow, preferred, healthy, available)
+	c.lease, _, c.authorityErr = h.cfg.Session.ResolveLeaseWithCandidatesChecked(c.key, allow, preferred, healthy, available)
 	return c
 }
 
 func (c *chatRoute) acquire(ctx context.Context, tried, allow map[string]bool) (*auth.Auth, error) {
+	if c.authorityErr != nil {
+		return nil, c.authorityErr
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	p := c.h.cfg.Pool
 	states := p.RoutingStates(c.model, allow)
+	if err := p.SharedError(); err != nil {
+		return nil, err
+	}
 	var acct *auth.Auth
 	c.predicted = 0
 	if c.h.cacheRouter != nil {
@@ -127,17 +162,34 @@ func (c *chatRoute) acquire(ctx context.Context, tried, allow map[string]bool) (
 					}
 				}
 				acct = c.pickUID(plan.UID, plan.CacheTokens >= 512, tried, allow)
+				if c.authorityErr != nil {
+					return nil, c.authorityErr
+				}
 				if acct == nil && remaining > 0 {
 					start := time.Now()
 					waitCtx, cancel := context.WithTimeout(ctx, remaining)
 					var waitErr error
-					acct, waitErr = p.WaitAndAcquireByUIDForRoute(waitCtx, plan.UID, c.model, cfg.MaxPending, cfg.MaxPendingTotal, c.request(plan.CacheTokens >= 512), tried, allow)
+					if p.SharedEnabled() {
+						var lease pool.Lease
+						acct, lease, waitErr = p.WaitAcquireShared(waitCtx, plan.UID, c.model, cfg.MaxPending, cfg.MaxPendingTotal, c.request(plan.CacheTokens >= 512), tried, allow)
+						if acct != nil {
+							if c.poolLeases == nil {
+								c.poolLeases = map[string]pool.Lease{}
+							}
+							c.poolLeases[acct.UID] = lease
+						}
+					} else {
+						acct, waitErr = p.WaitAndAcquireByUIDForRoute(waitCtx, plan.UID, c.model, cfg.MaxPending, cfg.MaxPendingTotal, c.request(plan.CacheTokens >= 512), tried, allow)
+					}
 					if waitErr != nil {
 						c.queueReason = waitErr.Error()
 					} else {
 						c.queueReason = "slot_released"
 					}
 					cancel()
+					if err := p.SharedError(); err != nil {
+						return nil, err
+					}
 					c.wait += time.Since(start)
 					if err := ctx.Err(); err != nil {
 						if acct != nil {
@@ -173,7 +225,19 @@ func (c *chatRoute) acquire(ctx context.Context, tried, allow map[string]bool) (
 		}
 	}
 	if acct == nil {
-		if c.admissionEnabled() && !c.h.cacheRouter.Config().ProtectionDisabled {
+		if c.authorityErr != nil {
+			return nil, c.authorityErr
+		}
+		if p.SharedEnabled() {
+			var lease pool.Lease
+			acct, lease, c.authorityErr = p.AcquireShared(c.model, c.request(false), tried, allow, "", c.admissionEnabled() && !c.h.cacheRouter.Config().ProtectionDisabled)
+			if acct != nil {
+				if c.poolLeases == nil {
+					c.poolLeases = map[string]pool.Lease{}
+				}
+				c.poolLeases[acct.UID] = lease
+			}
+		} else if c.admissionEnabled() && !c.h.cacheRouter.Config().ProtectionDisabled {
 			acct = p.PickAndAcquireRoute(c.model, c.request(false), tried, allow)
 		} else {
 			acct = p.PickAndAcquireForModelAllow(c.model, tried, allow)
@@ -183,7 +247,7 @@ func (c *chatRoute) acquire(ctx context.Context, tried, allow map[string]bool) (
 		}
 	}
 	if acct == nil {
-		return nil, nil
+		return nil, c.authorityErr
 	}
 	if err := ctx.Err(); err != nil {
 		c.release(acct.UID)
@@ -191,14 +255,27 @@ func (c *chatRoute) acquire(ctx context.Context, tried, allow map[string]bool) (
 	}
 	if c.key != "" && c.lease.UID != "" && acct.UID != c.lease.UID {
 		healthy := p.HealthyForModel(c.lease.UID, c.model) && (allow == nil || allow[c.lease.UID])
+		if err := p.SharedError(); err != nil {
+			c.release(acct.UID)
+			return nil, err
+		}
 		if !healthy {
-			if lease, ok := c.h.cfg.Session.ReplaceIfCurrent(c.key, c.lease, acct.UID); ok {
+			lease, ok, err := c.h.cfg.Session.ReplaceIfCurrentChecked(c.key, c.lease, acct.UID)
+			if err != nil {
+				c.release(acct.UID)
+				return nil, err
+			}
+			if ok {
 				c.lease = lease
 				c.reason = "primary_unavailable"
 			}
 		} else if c.reason == "prefix" {
 			c.reason = "warm_borrow"
 		}
+	}
+	if err := p.SharedError(); err != nil {
+		c.release(acct.UID)
+		return nil, err
 	}
 	return acct, nil
 }

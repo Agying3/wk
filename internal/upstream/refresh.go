@@ -23,6 +23,14 @@ func (c *Client) RefreshTokenContext(ctx context.Context, a *auth.Auth) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if enabled, err := a.RefreshShared(ctx, func(current auth.Credentials) (auth.Credentials, error) {
+		if strings.TrimSpace(current.RefreshToken) == "" {
+			return current, fmt.Errorf("no refreshToken")
+		}
+		return c.refreshCredential(ctx, authFromCredentials(current), current)
+	}); enabled {
+		return err
+	}
 	before := a.Snapshot()
 	if strings.TrimSpace(before.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")

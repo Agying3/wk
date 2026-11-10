@@ -30,11 +30,15 @@ type Service struct {
 }
 
 func New(store collection.Store, p *pool.Pool, up *upstream.Client, metrics metricsstore.Backend, lock *sync.Mutex) (*Service, error) {
+	return NewWithOptions(store, p, up, metrics, lock, false)
+}
+
+func NewWithOptions(store collection.Store, p *pool.Pool, up *upstream.Client, metrics metricsstore.Backend, lock *sync.Mutex, startPaused bool) (*Service, error) {
 	if lock == nil {
 		lock = &sync.Mutex{}
 	}
 	s := &Service{Pool: p, Upstream: up, Metrics: metrics, AccountLock: lock}
-	m, err := collection.New(collection.Options{Store: store, Run: s.run, UIDs: func() []string {
+	m, err := collection.New(collection.Options{StartPaused: startPaused, Store: store, Run: s.run, UIDs: func() []string {
 		out := []string{}
 		for _, st := range p.List() {
 			out = append(out, st.UID)

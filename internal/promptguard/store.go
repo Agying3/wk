@@ -117,7 +117,7 @@ type Probe func(context.Context, []Message, bool) ProbeResult
 type ProbeFactory func(Case) Probe
 
 type Manager struct {
-	mu             sync.Mutex
+	mu             guardMutex
 	state          diskState
 	path           string
 	aead           cipher.AEAD
@@ -131,10 +131,16 @@ type Manager struct {
 	storageError   string
 	stop           chan struct{}
 	bindings       *session.BindingStore[map[string]string]
+	background     bool
 }
 
 func Open(path, secret string) (*Manager, error) {
+	return open(path, secret, false)
+}
+
+func open(path, secret string, paused bool) (*Manager, error) {
 	m := &Manager{path: path, stop: make(chan struct{}), cancel: map[string]context.CancelFunc{}, state: diskState{Config: Config{Revision: 1, Settings: Settings{ProbeBudget: 64, RetentionDays: 30, MaxCases: 200}, Rules: []Rule{}}, Cases: map[string]*Case{}}}
+	m.mu.manager = m
 	if path != "" {
 		if secret == "" {
 			return nil, errors.New("prompt guard storage requires an administrator secret")
@@ -172,36 +178,68 @@ func Open(path, secret string) (*Manager, error) {
 		m.state.WeightRefreshes = map[string]weightRefresh{}
 	}
 	m.resetBindingsLocked()
+	if paused {
+		return m, nil
+	}
+	if err := m.ActivateBackground(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ActivateBackground is called only after the process holds exclusive owner
+// authority. The shared mutex reloads the final state before recovery.
+func (m *Manager) ActivateBackground() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mu.err != nil {
+		return m.mu.err
+	}
+	if m.closed {
+		return errors.New("prompt guard closed")
+	}
+	if m.background {
+		return nil
+	}
+	m.background = true
+	changed := false
 	for _, c := range m.state.Cases {
 		if c.Job != nil && (c.Job.Status == "running" || c.Job.Status == "queued") {
 			c.Job.Status = "interrupted"
 			c.Job.Note = "服务重启，需手动重新启动诊断"
+			changed = true
 		}
 	}
-	if m.pruneLocked() {
+	if m.pruneLocked() || changed {
 		if err := m.saveLocked(); err != nil {
-			return nil, err
+			m.background = false
+			return err
 		}
 	}
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		timer := time.NewTicker(time.Hour)
+		timer := time.NewTicker(time.Second)
 		defer timer.Stop()
+		lastPrune := time.Now()
 		for {
 			select {
 			case <-m.stop:
 				return
 			case <-timer.C:
 				m.mu.Lock()
-				if m.pruneLocked() {
+				if time.Since(lastPrune) >= time.Hour && m.pruneLocked() {
 					_ = m.saveLocked()
 				}
+				if time.Since(lastPrune) >= time.Hour {
+					lastPrune = time.Now()
+				}
 				m.mu.Unlock()
+				m.next()
 			}
 		}
 	}()
-	return m, nil
+	return nil
 }
 func (m *Manager) SetProbeFactory(f ProbeFactory) {
 	m.mu.Lock()
@@ -447,6 +485,11 @@ func (m *Manager) capture(model, uid string, original, outbound []Message, scope
 	hash := sha256.Sum256(b)
 	id := hex.EncodeToString(hash[:16])
 	m.mu.Lock()
+	if m.mu.err != nil {
+		err := m.mu.err
+		m.mu.Unlock()
+		return "", err
+	}
 	if m.closed {
 		m.mu.Unlock()
 		return "", errors.New("prompt guard closed")
@@ -489,12 +532,18 @@ func (m *Manager) capture(model, uid string, original, outbound []Message, scope
 	// failures do not create an unbounded loop or resume interrupted jobs.
 	auto := err == nil && !exists && m.state.Config.Settings.AutoLocate
 	m.mu.Unlock()
+	if sharedErr := m.SharedError(); sharedErr != nil {
+		return "", sharedErr
+	}
 	if auto {
 		_, _ = m.Start(id, "locate", true)
 	}
 	return id, err
 }
 func (m *Manager) pruneLocked() bool {
+	if m.mu.shared != nil && !m.background {
+		return false
+	}
 	before := len(m.state.Cases)
 	cut := time.Now().Add(-time.Duration(m.state.Config.Settings.RetentionDays) * 24 * time.Hour)
 	for id, c := range m.state.Cases {
@@ -517,6 +566,9 @@ func (m *Manager) pruneLocked() bool {
 	return before != len(m.state.Cases)
 }
 func (m *Manager) saveLocked() error {
+	if m.mu.shared != nil {
+		return m.saveSharedLocked()
+	}
 	if m.path == "" {
 		return nil
 	}

@@ -31,6 +31,8 @@ type entry = Binding[string]
 // Config 路由依赖；Available 返回未占满在途的可用账号，Healthy 校验绑定时忽略暂时满载。
 // 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
 type Config struct {
+	// Authority enables synchronous cross-process binding ownership.
+	Authority  SharedAuthority
 	TTL        time.Duration
 	GCInterval time.Duration
 	Store      redisstore.Store
@@ -74,7 +76,9 @@ func New(cfg Config) *Router {
 		log.Printf("[session] sticky salt is empty; session keys are not keyed (set session_sticky.salt)")
 	}
 	bindings := NewBindingStore[string](BindingPolicy{TTL: cfg.TTL, MaxEntries: cfg.MaxEntries}, nil)
-	bindings.onDelete = cfg.Store.DelBind
+	if cfg.Authority == nil {
+		bindings.onDelete = cfg.Store.DelBind
+	}
 	return &Router{BindingStore: bindings, cfg: cfg}
 }
 
@@ -137,6 +141,9 @@ func (r *Router) StopGC() {
 // LoadFromStore 启动时从 redisstore 恢复绑定（内存覆盖本地，读操作仅此处发生）。
 // 已有本地绑定被保留——Redis 仅为恢复备份，本地一旦建立即为权威。
 func (r *Router) LoadFromStore() {
+	if r.cfg.Authority != nil {
+		return
+	}
 	binds := r.cfg.Store.LoadBinds()
 	if len(binds) == 0 {
 		return
@@ -182,6 +189,12 @@ func (r *Router) Resolve(key string) (string, bool) {
 // used to carry legacy explicit bindings into the namespaced routing scheme;
 // the caller must validate account health and authorization before reuse.
 func (r *Router) LookupLease(raw string) (Lease, bool) {
+	if r.cfg.Authority != nil {
+		var out Lease
+		var ok bool
+		err := r.shared(func(local *Router) error { out, ok = local.LookupLease(raw); return nil })
+		return out, ok && err == nil
+	}
 	key := r.normalizeKey(raw)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -214,6 +227,10 @@ func (r *Router) ResolveLease(raw string, allow map[string]bool, preferred strin
 // ResolveLeaseWithCandidates accepts a model-aware snapshot supplied by the
 // pool. Authorization filtering remains mandatory even for restored bindings.
 func (r *Router) ResolveLeaseWithCandidates(raw string, allow map[string]bool, preferred string, healthyUIDs, availableUIDs []string) (Lease, bool) {
+	if r.cfg.Authority != nil {
+		out, ok, _ := r.ResolveLeaseWithCandidatesChecked(raw, allow, preferred, healthyUIDs, availableUIDs)
+		return out, ok
+	}
 	key := r.normalizeKey(raw)
 	if key == "" {
 		return Lease{}, false
@@ -280,6 +297,10 @@ func (r *Router) assignLocked(key, uid string, now time.Time) entry {
 // Bind is an administrative/unconditional assignment. Request completion
 // should use TouchIfCurrent or ReplaceIfCurrent instead.
 func (r *Router) Bind(raw, uid string) {
+	if r.cfg.Authority != nil {
+		_ = r.shared(func(local *Router) error { local.Bind(raw, uid); return nil })
+		return
+	}
 	key := r.normalizeKey(raw)
 	if key == "" || uid == "" {
 		return
@@ -291,6 +312,12 @@ func (r *Router) Bind(raw, uid string) {
 }
 
 func (r *Router) BindIfAbsent(raw, uid string) (Lease, bool) {
+	if r.cfg.Authority != nil {
+		var out Lease
+		var ok bool
+		err := r.shared(func(local *Router) error { out, ok = local.BindIfAbsent(raw, uid); return nil })
+		return out, ok && err == nil
+	}
 	key := r.normalizeKey(raw)
 	if key == "" || uid == "" {
 		return Lease{}, false
@@ -307,6 +334,12 @@ func (r *Router) BindIfAbsent(raw, uid string) (Lease, bool) {
 }
 
 func (r *Router) ReplaceIfCurrent(raw string, old Lease, uid string) (Lease, bool) {
+	if r.cfg.Authority != nil {
+		var out Lease
+		var ok bool
+		err := r.shared(func(local *Router) error { out, ok = local.ReplaceIfCurrent(raw, old, uid); return nil })
+		return out, ok && err == nil
+	}
 	key := r.normalizeKey(raw)
 	if key == "" || uid == "" {
 		return Lease{}, false
@@ -326,6 +359,11 @@ func (r *Router) ReplaceIfCurrent(raw string, old Lease, uid string) (Lease, boo
 }
 
 func (r *Router) TouchIfCurrent(raw string, old Lease) bool {
+	if r.cfg.Authority != nil {
+		var ok bool
+		err := r.shared(func(local *Router) error { ok = local.TouchIfCurrent(raw, old); return nil })
+		return ok && err == nil
+	}
 	key := r.normalizeKey(raw)
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -338,6 +376,11 @@ func (r *Router) TouchIfCurrent(raw string, old Lease) bool {
 }
 
 func (r *Router) UnbindIfCurrent(raw string, old Lease) bool {
+	if r.cfg.Authority != nil {
+		var ok bool
+		err := r.shared(func(local *Router) error { ok = local.UnbindIfCurrent(raw, old); return nil })
+		return ok && err == nil
+	}
 	key := r.normalizeKey(raw)
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -349,6 +392,11 @@ func (r *Router) UnbindIfCurrent(raw string, old Lease) bool {
 }
 
 func (r *Router) Unbind(raw string) bool {
+	if r.cfg.Authority != nil {
+		var ok bool
+		err := r.shared(func(local *Router) error { ok = local.Unbind(raw); return nil })
+		return ok && err == nil
+	}
 	key := r.normalizeKey(raw)
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -361,6 +409,14 @@ func (r *Router) Unbind(raw string) bool {
 
 // Count 返回当前绑定数（供 /status 观测）。
 func (r *Router) Count() int {
+	if r.cfg.Authority != nil {
+		var n int
+		err := r.shared(func(local *Router) error { n = local.Count(); return nil })
+		if err != nil {
+			return 0
+		}
+		return n
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.entries)
@@ -368,6 +424,14 @@ func (r *Router) Count() int {
 
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
 func (r *Router) gcOnce(now time.Time) int {
+	if r.cfg.Authority != nil {
+		var n int
+		err := r.shared(func(local *Router) error { n = local.gcOnce(now); return nil })
+		if err != nil {
+			return 0
+		}
+		return n
+	}
 	r.mu.Lock()
 	n := r.BindingStore.pruneLocked(now)
 	r.mu.Unlock()

@@ -14,6 +14,11 @@ type bindingWire struct {
 
 // Export contains only salted key digests, never raw conversation identifiers.
 func (r *Router) Export() ([]byte, error) {
+	if r.cfg.Authority != nil {
+		var out []byte
+		err := r.shared(func(local *Router) error { var err error; out, err = local.Export(); return err })
+		return out, err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := map[string]bindingWire{}
@@ -25,6 +30,9 @@ func (r *Router) Export() ([]byte, error) {
 	return json.Marshal(out)
 }
 func (r *Router) Import(raw []byte) error {
+	if r.cfg.Authority != nil {
+		return r.InitializeShared(raw)
+	}
 	var in map[string]bindingWire
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return err

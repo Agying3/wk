@@ -43,6 +43,7 @@ type Manager struct {
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 	closed       bool
+	active       bool
 	storageError string
 	rateMu       sync.Mutex
 	nextRequest  time.Time
@@ -54,31 +55,63 @@ func New(opt Options) (*Manager, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{opt: opt, settings: DefaultSettings(), jobs: map[string]*Job{}, snapshots: map[string]Snapshot{}, works: map[string]*work{}, versions: map[string]uint64{}, wake: make(chan struct{}, 1), ctx: ctx, cancel: cancel}
-	records, err := opt.Store.CollectionLoad()
-	if err != nil {
+	if err := m.loadLocked(!opt.StartPaused); err != nil {
 		cancel()
 		return nil, err
 	}
+	if !opt.StartPaused {
+		m.active = true
+		m.wg.Add(1)
+		go m.loop()
+	}
+	return m, nil
+}
+
+// ActivateBackground reloads the previous owner's final state before recovering
+// unfinished work. Merely constructing a relay never interrupts live jobs.
+func (m *Manager) ActivateBackground() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return fmt.Errorf("采集器已停止")
+	}
+	if m.active {
+		return nil
+	}
+	if err := m.loadLocked(true); err != nil {
+		return err
+	}
+	m.active = true
+	m.wg.Add(1)
+	go m.loop()
+	return nil
+}
+
+func (m *Manager) loadLocked(recover bool) error {
+	records, err := m.opt.Store.CollectionLoad()
+	if err != nil {
+		return err
+	}
+	m.settings = DefaultSettings()
+	m.jobs = map[string]*Job{}
+	m.snapshots = map[string]Snapshot{}
 	changed := map[string][]byte{}
 	for key, raw := range records {
 		switch {
 		case key == "settings":
 			if json.Unmarshal(raw, &m.settings) != nil || m.settings.Validate() != nil {
-				cancel()
-				return nil, fmt.Errorf("invalid persisted collection settings")
+				return fmt.Errorf("invalid persisted collection settings")
 			}
 		case strings.HasPrefix(key, "job/"):
 			var j Job
 			if err = json.Unmarshal(raw, &j); err != nil {
-				cancel()
-				return nil, err
+				return err
 			}
 			m.jobs[j.ID] = &j
 		case strings.HasPrefix(key, "snapshot/"):
 			var s Snapshot
 			if err = json.Unmarshal(raw, &s); err != nil {
-				cancel()
-				return nil, err
+				return err
 			}
 			m.snapshots[s.Target.key()] = s
 		}
@@ -87,14 +120,16 @@ func New(opt Options) (*Manager, error) {
 		if strings.HasPrefix(key, "item/") {
 			var i Item
 			if err = json.Unmarshal(raw, &i); err != nil {
-				cancel()
-				return nil, err
+				return err
 			}
 			id := strings.Split(key, "/")[1]
 			if j := m.jobs[id]; j != nil {
 				j.Items = append(j.Items, &i)
 			}
 		}
+	}
+	if !recover {
+		return nil
 	}
 	for _, j := range m.jobs {
 		if j.Status == "queued" || j.Status == "running" || j.Status == "cancelling" {
@@ -121,13 +156,12 @@ func New(opt Options) (*Manager, error) {
 			changed["snapshot/"+k] = encode(s)
 		}
 	}
-	if err = opt.Store.CollectionSave(changed, nil); err != nil {
-		cancel()
-		return nil, err
+	if len(changed) > 0 {
+		if err = m.opt.Store.CollectionSave(changed, nil); err != nil {
+			return err
+		}
 	}
-	m.wg.Add(1)
-	go m.loop()
-	return m, nil
+	return nil
 }
 func encode(v any) []byte                { b, _ := json.Marshal(v); return b }
 func jobJSON(j *Job) []byte              { c := *j; c.Items = nil; return encode(c) }
@@ -142,6 +176,9 @@ func (m *Manager) poke() {
 	}
 }
 func (m *Manager) save(rows map[string][]byte, deletes []string) error {
+	if !m.active {
+		return fmt.Errorf("采集后台尚未接管")
+	}
 	err := m.opt.Store.CollectionSave(rows, deletes)
 	if err != nil {
 		m.storageError = "采集记录写入失败，请检查数据库"
@@ -201,6 +238,9 @@ func (m *Manager) Submit(req Request) (Job, error) {
 	defer m.mu.Unlock()
 	if m.closed {
 		return Job{}, fmt.Errorf("采集器已停止")
+	}
+	if !m.active {
+		return Job{}, fmt.Errorf("采集后台尚未接管")
 	}
 	if len(m.works) > 10000 {
 		return Job{}, fmt.Errorf("采集队列已满")
@@ -366,11 +406,13 @@ func (m *Manager) list() []Job {
 func (m *Manager) List() ([]Job, string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.refreshRelayLocked()
 	return m.list(), m.storageError
 }
 func (m *Manager) Job(id string) (Job, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.refreshRelayLocked()
 	j, ok := m.jobs[id]
 	if !ok {
 		return Job{}, false
@@ -380,6 +422,7 @@ func (m *Manager) Job(id string) (Job, bool) {
 func (m *Manager) Snapshot(uid, r string) Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.refreshRelayLocked()
 	s := m.snapshots[(Target{uid, r}).key()]
 	s.Target = Target{uid, r}
 	if s.State == "" {
@@ -392,6 +435,7 @@ func (m *Manager) Snapshot(uid, r string) Snapshot {
 func (m *Manager) Settings() Settings {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.refreshRelayLocked()
 	s := m.settings
 	s.Intervals = map[string]int{}
 	for k, v := range m.settings.Intervals {
@@ -400,11 +444,22 @@ func (m *Manager) Settings() Settings {
 	return s
 }
 
+func (m *Manager) refreshRelayLocked() {
+	if !m.active && !m.closed {
+		if err := m.loadLocked(false); err != nil {
+			m.storageError = "采集记录读取失败，请检查数据库"
+		}
+	}
+}
+
 // Forget invalidates all snapshots on credential replacement/deletion. Any
 // response already in flight belongs to the previous account generation.
 func (m *Manager) Forget(uid string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.active {
+		return
+	}
 
 	del := []string{}
 	for _, r := range Resources {
@@ -419,6 +474,9 @@ func (m *Manager) Forget(uid string) {
 func (m *Manager) Invalidate(uid string, resources []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.active {
+		return
+	}
 	rows := map[string][]byte{}
 	for _, r := range resources {
 		t := Target{uid, r}
@@ -476,6 +534,9 @@ func (m *Manager) WaitRequest(ctx context.Context) error {
 func (m *Manager) Cancel(id string) (Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.active {
+		return Job{}, fmt.Errorf("采集后台尚未接管")
+	}
 	j := m.jobs[id]
 	if j == nil {
 		return Job{}, fmt.Errorf("任务不存在")

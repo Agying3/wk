@@ -48,6 +48,11 @@ import (
 
 // Config handler 依赖。
 type Config struct {
+	// Authority is required by overlap mode. It stores only session digests and
+	// unlock counters; unavailable authority never falls back to local sessions.
+	Authority WebAuthority
+	// RelayOnly prevents a standby release from seeding management-owned state.
+	RelayOnly          bool
 	Collection         *collection.Manager
 	CollectionRequired bool
 	AccountAdminLock   *sync.Mutex
@@ -209,6 +214,7 @@ type ResponseStore interface {
 
 // Handler 主路由。
 type Handler struct {
+	webAuthority      webAuthorityState
 	requestCapture    captureManager
 	cacheRouter       *cacheroute.Router
 	sessionResolver   *session.Resolver
@@ -340,7 +346,13 @@ func NewHandler(cfg Config) *Handler {
 	if err := policy.Validate(); err != nil {
 		panic(err) // main validates configuration before constructing a handler.
 	}
-	h.setResponseHistoryPolicy(policy)
+	if cfg.RelayOnly {
+		// A candidate reads history but cannot overwrite the active owner's
+		// retention policy with its startup configuration.
+		h.responsePolicy = policy
+	} else {
+		h.setResponseHistoryPolicy(policy)
+	}
 	if h.cfg.Traffic == nil {
 		h.cfg.Traffic = traffic.New(nil)
 	}
@@ -351,7 +363,7 @@ func NewHandler(cfg Config) *Handler {
 			log.Printf("cache routing disabled: %v", err)
 		}
 	}
-	if cfg.Pool != nil && h.cacheRouter != nil {
+	if cfg.Pool != nil && h.cacheRouter != nil && !cfg.RelayOnly {
 		c := h.cacheRouter.Config()
 		cfg.Pool.ConfigureAdmission(pool.AdmissionConfig{
 			Enabled:              !c.Shadow && !c.ProtectionDisabled,
@@ -364,7 +376,11 @@ func NewHandler(cfg Config) *Handler {
 			MaxPendingPerSession: c.MaxPendingPerSession,
 		})
 	}
-	h.growthLedger = newGrowthLedger(cfg.GrowthLedgerPath, cfg.GrowthLedgerStore)
+	ledgerImportPath := cfg.GrowthLedgerPath
+	if cfg.RelayOnly {
+		ledgerImportPath = "" // Importing legacy state is a management-owner action.
+	}
+	h.growthLedger = newGrowthLedger(ledgerImportPath, cfg.GrowthLedgerStore)
 	// 运行时特性开关/费率从启动配置拷贝一份；WebUI 保存时经 updateFeatures
 	// 同时改这里和 upstream Client（见 saveAdminConfig）。sanitizeHooks 为 nil
 	// 时（单测直接构造 Handler）只更新本地副本。
@@ -391,7 +407,7 @@ func NewHandler(cfg Config) *Handler {
 		// 默认绑定种子：default 账号分组首次没有代理绑定时自动绑定到
 		// 默认代理分组（pg_default）。仅在该键不存在时写入——管理员
 		// 之后可改可清空（清空 = 回到"不限制"），种子不再复活。
-		if binds := cfg.Groups.ProxyBindingsOf(groups.DefaultGroup); len(binds) == 0 {
+		if binds := cfg.Groups.ProxyBindingsOf(groups.DefaultGroup); !cfg.RelayOnly && len(binds) == 0 {
 			// 区分"键不存在"与"键存在但为空列表"：后者是管理员显式
 			// 清空过的，尊重之。SnapshotProxyBindings 里两者都表现为
 			// 空，这里直接看原始存储。
@@ -919,12 +935,15 @@ func (h *Handler) validAPIKey(r *http.Request) bool {
 }
 
 func (h *Handler) frontendSession(r *http.Request) bool {
-	if h.cfg.FrontendPassword == "" {
+	if h.cfg.FrontendPassword == "" && h.cfg.APIKey == "" {
 		return false
 	}
 	c, err := r.Cookie("wb2api_frontend")
 	if err != nil {
 		return false
+	}
+	if h.cfg.Authority != nil {
+		return h.sharedFrontendSession(r.Context(), c.Value)
 	}
 	h.sessionsMu.Lock()
 	defer h.sessionsMu.Unlock()
@@ -950,6 +969,10 @@ func (h *Handler) withFrontend(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) unlock(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Authority != nil {
+		h.sharedUnlock(w, r)
+		return
+	}
 	// 用 clientHost 而不是裸的 RemoteAddr：只有配置了可信代理时才采信 XFF，
 	// 否则攻击者能靠换头把每次尝试放进新的限流桶，锁定形同虚设。
 	clientKey := h.clientHost(r)
@@ -3114,7 +3137,11 @@ func (h *Handler) persistAccount(cred accountCredential, region string) (map[str
 	if _, err := auth.Parse(raw); err != nil {
 		return nil, http.StatusBadGateway, errors.New("授权返回的凭证字段无效")
 	}
-	if err := writeFileAtomic(path, append(raw, '\n'), 0600); err != nil {
+	credentialCtx, credentialCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer credentialCancel()
+	if err := auth.WithCredentialWrite(credentialCtx, path, func() error {
+		return writeFileAtomic(path, append(raw, '\n'), 0600)
+	}); err != nil {
 		return nil, 500, err
 	}
 
@@ -3818,10 +3845,14 @@ func (h *Handler) removeAccountFile(uid string, account *auth.Auth) error {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
 		return fmt.Errorf("账号文件不在 auth_dir 内")
 	}
-	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return auth.WithCredentialWrite(ctx, target, func() error {
+		if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	})
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {

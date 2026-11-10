@@ -322,7 +322,7 @@ type snapshot struct {
 
 // Pool 账号池。
 type Pool struct {
-	mu         sync.RWMutex
+	mu         poolMutex
 	byUID      map[string]*entry
 	stateFp    string
 	lastPickAt time.Time // monotonic tie-breaker for coarse system clocks
@@ -336,6 +336,7 @@ type Pool struct {
 	dirtySet  map[string]dirtyOp // uid → 待写操作（DB 模式；受 p.mu 保护）
 	versionC  uint64             // 全局版本计数器（受 p.mu 保护；dirtyOp.version 的来源）
 	persister StatePersister     // DB 后端；nil = 文件模式
+	shared    atomic.Pointer[sharedPool]
 	// dbFreshAt DB 最后成功写入的时间（loadFromPersister 记录）。Redis
 	// 择新比较用：DB 模式下 state.json 不再更新，mtime 恒旧，比较基准
 	// 必须换成 DB 的新鲜度，否则旧的 Redis 快照会被误采用。零值 = 未记录
@@ -430,6 +431,7 @@ func New(stateFp string, persister ...StatePersister) *Pool {
 		idleWeightPerHour:    defaultIdleWeightPerHour,
 		idleWeightMax:        defaultIdleWeightMax,
 	}
+	p.mu.pool = p
 	if len(persister) > 0 && persister[0] != nil {
 		p.persister = persister[0]
 	}
@@ -455,6 +457,9 @@ type PoolFreshnessChecker interface {
 // 调用（main 的装配顺序：New → SetStatePersister → RestoreFromSnapshot
 // → SyncToDir）：DB 先恢复成基础状态，Redis 快照只在比 DB 新时覆盖。
 func (p *Pool) SetStatePersister(s StatePersister) {
+	if p.SharedEnabled() {
+		return
+	}
 	p.mu.Lock()
 	p.persister = s
 	p.mu.Unlock()
@@ -580,6 +585,9 @@ func (p *Pool) SetMaxInFlight(n int) {
 // SetStore 注入池状态快照镜像（redisstore.Store）。nil 表示不镜像（纯本地恢复）。
 // 必须在 SyncToDir 之前调用，使"择新恢复"发生在账号对齐之前。
 func (p *Pool) SetStore(s StoreSnapshotter) {
+	if p.SharedEnabled() {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.store = s
@@ -592,6 +600,9 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 // "本地"的新鲜度基准：DB 模式（dbFreshAt 非零）用 DB 的最后写入时间，
 // 文件模式用 state.json 的 mtime——DB 模式下本地文件不再更新，mtime 恒旧。
 func (p *Pool) RestoreFromSnapshot() {
+	if p.SharedEnabled() {
+		return
+	}
 	store := p.store
 	if store == nil || p.stateFp == "" {
 		return
@@ -638,6 +649,9 @@ func (p *Pool) RestoreFromSnapshot() {
 // Acquire 为账号占一个在途名额；false 表示该账号已达上限（或不存在）。
 // 必须在成功 Pick 后调用；调用方负责 defer Release。
 func (p *Pool) Acquire(uid string) bool {
+	if p.SharedEnabled() {
+		return false
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	e, ok := p.byUID[uid]
@@ -666,6 +680,9 @@ func (p *Pool) Acquire(uid string) bool {
 
 // Release 释放一个在途名额。幂等减到 0 为止（防重复释放扣成负数）。
 func (p *Pool) Release(uid string) {
+	if p.SharedEnabled() {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -700,6 +717,9 @@ func (p *Pool) startFlusher() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for range t.C {
+			if p.SharedEnabled() {
+				continue
+			}
 			p.mu.RLock()
 			hasPersister := p.persister != nil
 			hasDirty := len(p.dirtySet) > 0
@@ -724,6 +744,10 @@ func (p *Pool) startFlusher() {
 
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
+	if p.SharedEnabled() {
+		_ = p.FlushWithError()
+		return
+	}
 	p.mu.RLock()
 	hasPersister := p.persister != nil
 	p.mu.RUnlock()
@@ -743,6 +767,11 @@ func (p *Pool) Flush() {
 // snapshot even if a periodic flusher already consumed the dirty flag. Database
 // mode serializes snapshot collection and commit, retaining later dirty versions.
 func (p *Pool) FlushWithError() error {
+	if p.SharedEnabled() {
+		p.mu.Lock()
+		p.mu.Unlock()
+		return p.SharedError()
+	}
 	p.mu.RLock()
 	hasPersister := p.persister != nil
 	p.mu.RUnlock()
@@ -884,6 +913,9 @@ func (p *Pool) pickForModel(model string, tried map[string]bool) *auth.Auth {
 // pool lock. Competing requests cannot consume its slot between Pick and Acquire.
 // The caller must Release every non-nil result.
 func (p *Pool) PickAndAcquireForModel(model string, tried map[string]bool) *auth.Auth {
+	if p.SharedEnabled() {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	a := p.pickForModelLocked(normalizeModel(model), tried)
@@ -898,6 +930,9 @@ func (p *Pool) PickAndAcquireForModel(model string, tried map[string]bool) *auth
 // 账号（返回 nil，不回落全池——分组语义）。
 // 分组路由用：密钥绑定分组后，选号范围收窄到该分组的账号。
 func (p *Pool) PickAndAcquireForModelAllow(model string, tried map[string]bool, allow map[string]bool) *auth.Auth {
+	if p.SharedEnabled() {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var a *auth.Auth
@@ -1079,6 +1114,9 @@ func (p *Pool) pickEarliestExpiryLocked(model string, tried map[string]bool, now
 // inFlightFull 报告账号是否已占满在途名额（max=0 不限 → 恒 false）。
 // 调用方需已持 p.mu（读锁或写锁均可，本方法只读 p.maxInFlight）。
 func (p *Pool) inFlightFull(e *entry) bool {
+	if p.SharedError() != nil {
+		return true
+	}
 	if len(p.waiters[e.a.UID]) > 0 {
 		return true
 	}
@@ -1621,6 +1659,9 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 
 // PickAndAcquireByUIDForModel atomically reserves a sticky account's slot.
 func (p *Pool) PickAndAcquireByUIDForModel(uid, model string) *auth.Auth {
+	if p.SharedEnabled() {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	a := p.pickByUIDForModelLocked(uid, normalizeModel(model))

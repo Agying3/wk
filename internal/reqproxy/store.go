@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -360,7 +359,7 @@ func (s *State) Normalize() {
 
 // Store 状态持久化：内存态 + 周期落盘（沿用项目 state.json 的模式）。
 type Store struct {
-	mu    sync.Mutex
+	mu    *stateMutex
 	fp    string
 	st    *State
 	dirty bool
@@ -372,6 +371,7 @@ type Store struct {
 // fp 为空时纯内存（测试用）。
 func NewStore(fp string) (*Store, error) {
 	s := &Store{
+		mu:   &stateMutex{},
 		fp:   fp,
 		st:   DefaultState(),
 		stop: make(chan struct{}),
@@ -414,6 +414,9 @@ func (s *Store) flusher() {
 func (s *Store) Flush() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.mu.shared != nil {
+		return
+	}
 	if !s.dirty || s.fp == "" {
 		return
 	}

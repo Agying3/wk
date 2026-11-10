@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -41,7 +40,7 @@ type Node struct {
 
 // Pool 节点池 + 槽位 + 绑定的内存态（持久化经 Store）。
 type Pool struct {
-	mu      sync.Mutex
+	mu      *stateMutex
 	store   *Store
 	nodes   map[string]*Node   // node_id → node
 	slots   map[string]*Slot   // slot_id → slot
@@ -75,6 +74,7 @@ type Pool struct {
 // NewPool 构建池。portMin/portMax 是槽位端口段。
 func NewPool(store *Store, portMin, portMax int) *Pool {
 	p := &Pool{
+		mu:           store.mu,
 		store:        store,
 		nodes:        map[string]*Node{},
 		slots:        map[string]*Slot{},
@@ -287,6 +287,9 @@ func (p *Pool) healthLocked(nodeID string) *NodeHealth {
 func (p *Pool) Candidates(region string) []Node {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.mu.err != nil {
+		return nil
+	}
 	out := p.candidatesLocked(region, nil)
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -312,6 +315,9 @@ type KernelOp struct {
 func (p *Pool) Assign(uid, region string) (int, *KernelOp, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.mu.err != nil {
+		return 0, nil, p.mu.err
+	}
 
 	// 账号的代理分组约束（D4）：所有归属分组都绑定了代理分组时限制为并集；
 	// 任一分组未绑定（或未登记）则不限制。resolver 未注入 = 不限制。
@@ -551,6 +557,9 @@ func (p *Pool) Views() (slots []Slot, bindings []BindingView) {
 func (p *Pool) NodesSnapshot() []Node {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.mu.err != nil {
+		return nil
+	}
 	out := make([]Node, 0, len(p.nodes))
 	for _, n := range p.nodes {
 		out = append(out, *n)

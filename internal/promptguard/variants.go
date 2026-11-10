@@ -168,9 +168,17 @@ func (m *Manager) applySessionAt(doc map[string]any, session string, now time.Ti
 	return m.applyBindingAt(doc, session, "", now)
 }
 
-func (m *Manager) applyBindingAt(doc map[string]any, identity, legacy string, now time.Time) error {
+func (m *Manager) applyBindingAt(doc map[string]any, identity, legacy string, now time.Time) (err error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer func() {
+		m.mu.Unlock()
+		if sharedErr := m.SharedError(); sharedErr != nil {
+			err = sharedErr
+		}
+	}()
+	if m.mu.err != nil {
+		return m.mu.err
+	}
 	if m.closed {
 		return errors.New("prompt guard closed")
 	}

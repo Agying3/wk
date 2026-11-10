@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/pbkdf2"
@@ -333,14 +334,23 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 		json.Unmarshal(item.Credential, &credentialDoc)
 		credentialDoc["_import_disabled"] = true
 		credentialRaw, _ := json.Marshal(credentialDoc)
-		if err := writeNewAccountFile(path, credentialRaw); err != nil {
+		if err := auth.WithCredentialWrite(r.Context(), path, func() error {
+			return writeNewAccountFile(path, credentialRaw)
+		}); err != nil {
 			results = append(results, map[string]any{"uid": uid, "ok": false, "detail": "写入授权文件失败，未导入"})
 			continue
 		}
 		a.FilePath = path
 		a.ImportDisabled = true
 		if !h.cfg.Pool.AddDisabled(a, "imported; awaiting administrator enable") {
-			os.Remove(path)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = auth.WithCredentialWrite(cleanupCtx, path, func() error {
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+				return nil
+			})
+			cleanupCancel()
 			results = append(results, map[string]any{"uid": uid, "ok": false, "skipped": true, "detail": "账号已存在，未覆盖"})
 			skipped++
 			continue

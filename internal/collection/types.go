@@ -106,6 +106,9 @@ type Runner func(context.Context, Target, Snapshot) (json.RawMessage, error)
 type Options struct {
 	Store Store
 	Run   Runner
+	// StartPaused loads a read-only relay. ActivateBackground must only be called
+	// after exclusive background ownership has been acquired.
+	StartPaused bool
 	// Eligible is rechecked immediately before dispatch, including disabled state.
 	Eligible func(uid string, includeDisabled bool) bool
 	UIDs     func() []string

@@ -13,6 +13,9 @@ import (
 
 // List 返回全部分组（有序，default 排最前）。
 func (s *Store) List() []string {
+	if err := s.reloadShared(); err != nil {
+		return []string{}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := append([]string(nil), s.groups...)
@@ -32,6 +35,9 @@ func (s *Store) List() []string {
 // 字符集收窄到字母数字加 -_.：分组名会进 URL 路径与 JSON 键，
 // 放开空格/中文只会让两端各自做一遍转义。
 func (s *Store) ValidateName(name string) error {
+	if err := s.reloadShared(); err != nil {
+		return err
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return fmt.Errorf("分组名不能为空")
@@ -61,6 +67,9 @@ func (s *Store) ValidateName(name string) error {
 
 // Rename 重命名分组：同步迁移账号归属与密钥引用。default 不可改。
 func (s *Store) Rename(oldName, newName string) error {
+	if err := s.prepareWrite(); err != nil {
+		return err
+	}
 	if oldName == DefaultGroup {
 		return ErrImmutable
 	}
@@ -112,6 +121,9 @@ func (s *Store) Rename(oldName, newName string) error {
 // 账号归属引用删除的组时只解除引用本身（账号还可能在别的组）；
 // "组内有账号"的判定 = 该组是某些账号的**唯一**归属。
 func (s *Store) Delete(name string) error {
+	if err := s.prepareWrite(); err != nil {
+		return err
+	}
 	if name == DefaultGroup {
 		return ErrImmutable
 	}
@@ -162,6 +174,9 @@ func (s *Store) Delete(name string) error {
 // AccountGroups 返回账号的归属分组；未登记的账号返回 [default]
 // （旧数据兼容：分组功能上线前加的账号自动视为 default）。
 func (s *Store) AccountGroups(uid string) []string {
+	if err := s.reloadShared(); err != nil {
+		return []string{}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.accountGroupsLocked(uid)
@@ -177,6 +192,9 @@ func (s *Store) accountGroupsLocked(uid string) []string {
 // SetAccountGroups 设置账号归属。空列表 = 清空归属（仅在管理密钥下可用）。
 // 引用的分组必须存在；uid 本身是否在池里由调用方校验。
 func (s *Store) SetAccountGroups(uid string, gs []string) error {
+	if err := s.prepareWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	valid := map[string]bool{}
@@ -202,6 +220,9 @@ func (s *Store) SetAccountGroups(uid string, gs []string) error {
 // AccountsInGroup 返回属于指定分组的账号 uid 集合（多归属账号会同时
 // 出现在多个分组）。查询热路径用（请求选号过滤）。
 func (s *Store) AccountsInGroup(group string) map[string]bool {
+	if err := s.reloadShared(); err != nil {
+		return map[string]bool{}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := map[string]bool{}
@@ -218,6 +239,9 @@ func (s *Store) AccountsInGroup(group string) map[string]bool {
 
 // RemoveAccount 账号被删（auths 文件移除）时清理归属记录。
 func (s *Store) RemoveAccount(uid string) {
+	if err := s.prepareWrite(); err != nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.accountOf[uid]; ok {
@@ -242,6 +266,9 @@ func (s *Store) RemoveAccount(uid string) {
 //
 // 返回补登记的账号数（0 = 无需迁移）。
 func (s *Store) MigrateUnregistered(uids []string, regionOf func(string) string) int {
+	if err := s.prepareWrite(); err != nil {
+		return 0
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	migrated := 0
@@ -277,6 +304,9 @@ func (s *Store) MigrateUnregistered(uids []string, regionOf func(string) string)
 
 // SnapshotAccountGroups 导出全量归属（管理页展示用）。
 func (s *Store) SnapshotAccountGroups() map[string][]string {
+	if err := s.reloadShared(); err != nil {
+		return map[string][]string{}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string][]string, len(s.accountOf))
@@ -306,6 +336,9 @@ func maskKey(k string) string {
 
 // ListKeys 返回密钥列表（脱敏）。
 func (s *Store) ListKeys() []KeyInfo {
+	if err := s.reloadShared(); err != nil {
+		return []KeyInfo{}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]KeyInfo, 0, len(s.keys))
@@ -318,6 +351,9 @@ func (s *Store) ListKeys() []KeyInfo {
 // CreateKey 生成新密钥并绑定分组（空 = 不限）。返回完整密钥——
 // 只在此处完整出现一次，列表/日志一律脱敏。
 func (s *Store) CreateKey(name, group string) (Key, error) {
+	if err := s.prepareWrite(); err != nil {
+		return Key{}, err
+	}
 	if group != "" {
 		s.mu.RLock()
 		ok := s.hasGroupLocked(group)
@@ -349,6 +385,9 @@ func (s *Store) CreateKey(name, group string) (Key, error) {
 
 // UpdateKey 改备注名或改绑分组。空 group = 不限分组。
 func (s *Store) UpdateKey(id, name, group string) error {
+	if err := s.prepareWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx := -1
@@ -374,6 +413,9 @@ func (s *Store) UpdateKey(id, name, group string) error {
 
 // DeleteKey 删除密钥。
 func (s *Store) DeleteKey(id string) error {
+	if err := s.prepareWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx := -1
@@ -394,6 +436,9 @@ func (s *Store) DeleteKey(id string) error {
 // LookupKey 按完整密钥查记录；不存在返回 ErrNotFound。
 // 鉴权热路径用，RLock 只读。
 func (s *Store) LookupKey(key string) (Key, error) {
+	if err := s.reloadShared(); err != nil {
+		return Key{}, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, k := range s.keys {

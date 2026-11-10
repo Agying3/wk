@@ -27,6 +27,7 @@ func main() {
 	body := flag.Int64("body-bytes", 8000000, "maximum request bytes; match application limit")
 	queued := flag.Int64("queued-bytes", 64000000, "maximum reserved queued bytes")
 	trustIngress := flag.Bool("trust-ingress", false, "trust forwarded headers from the local TLS ingress; restrict local access")
+	overlap := flag.Bool("overlap", false, "enable coordinated overlap release switching")
 	flag.Parse()
 	if *socket == "" {
 		log.Fatal("-control required in a private directory")
@@ -43,7 +44,7 @@ func main() {
 	if *state == "" {
 		*state = *socket + ".state"
 	}
-	g, err := handoff.New(handoff.Config{Target: *target, Release: *release, MaxPending: *pending, MaxActive: *active, MaxBody: *body, MaxQueuedBytes: *queued, Wait: *wait, TrustIngress: *trustIngress, StatePath: *state})
+	g, err := handoff.New(handoff.Config{Target: *target, Release: *release, MaxPending: *pending, MaxActive: *active, MaxBody: *body, MaxQueuedBytes: *queued, Wait: *wait, TrustIngress: *trustIngress, StatePath: *state, Overlap: *overlap})
 	if err != nil {
 		log.Fatal(err)
 	}

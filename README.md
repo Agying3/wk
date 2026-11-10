@@ -50,13 +50,15 @@ Chat 消息中连续的 assistant 工具调用会在结果配对前合并，保�
 
 ### 无缝业务升级（Linux 单主机）
 
+默认使用下述串行交接。新增显式 `overlap` 模式：新推理请求立即切到候选版本，旧版本继续完成已有请求；管理和后台保持单一 owner。该模式要求 PostgreSQL 与同机共享持久目录，首次迁移仍需串行交接一次。参数和限制见下文「overlap 并行交接」。
+
 新增 `handoff-gateway` 稳定入口和业务生命周期协议。升级时入口暂存新请求，等待旧聊天/SSE 与已接收的后台任务结束，提交状态后退出旧版本，再启动新版本释放队列。排空超预算会恢复旧版本接单；不强杀已有流、不重放可能已经生成的请求。
 
 这是**短时排队的单写交接**。请求必须在客户端、NewAPI、各层反代与 gateway 的共同等待预算内完成；队满或等待到期返回 503。无限长流、数据库重大迁移、宿主机/gateway 自身升级和崩溃恢复不承诺无中断。首次接入入口及首次从不支持本协议的旧版本迁移，需单独安排。
 
-构建与测试按工作区要求在 SSH `tdog` 宿主机执行，先检查连通性，加载 `/srv/build-server/env/workbuddy2api.sh`，使用隔离源码目录。发布时使用下文「宿主机发布构建与许可打包」的完整流程；运行镜像只打包宿主机产物：应用用 `Dockerfile` / `Dockerfile.local`，稳定入口用 `Dockerfile.gateway`。
+构建与测试按当前工作区要求在 SSH `tyy2` 宿主机执行，先检查连通性与数据盘，加载 `/srv/build-server/env/workbuddy2api.sh`，使用隔离源码目录。发布时使用下文「宿主机发布构建与许可打包」的完整流程；运行镜像只打包宿主机产物：应用用 `Dockerfile` / `Dockerfile.local`，稳定入口用 `Dockerfile.gateway`。
 
-宿主机构建命令（在 tdog 项目环境内）：
+宿主机构建命令（在 tyy2 项目环境内）：
 
 ```bash
 go test -p=2 ./...
@@ -122,6 +124,26 @@ python3 scripts/seamless-upgrade.py \
 - 控制命令通过私有 Unix HTTP socket 发出：gateway 支持 `/hold`、`/switch`、`/resume`（`expected` 参数）；业务支持 `/pause`、`/quiesce`、`/resume`、`/stop`（`release` 参数）。`quiesce` 要求前台已经排空，`stop` 要求前台后台均归零且最终持久化成功。均不是公网 API。
 
 发布期间不删除旧镜像和备份，不顺手升级 PostgreSQL。旧页面可能仍引用前一版静态资源，发布制品应保留上一版带 hash 的资源；管理 API 不兼容变更需单独处理。
+
+#### overlap 并行交接
+
+两个业务版本都必须支持 overlap 协议，在原有 `-release`、`-control`、`-state-lock` 参数上增加：
+
+```text
+-upgrade-mode overlap -coordination-dir /opt/wb2api-upgrade/members
+```
+
+使用同一 Linux 宿主机、相同 UID、同一 PostgreSQL、相同的私有持久目录（0700）、凭证目录及状态目录。启动会检查配置摘要和目录设备号/inode，业务监听、前端资源和 pprof 可以不同。持久 `domain.json` 使 `/run` 锁目录重建后保持原 PG 协调域；不得删除它或绕过旧 writer.lock。共享协调不可用时拒绝操作，无 SQLite/内存降级。旧二进制需先按上面的串行流程迁移一次。
+
+稳定入口增加 `-overlap`，发布脚本在上述命令上增加 `--mode overlap`。B 先以 standby 接受推理，再用 gateway 私有 `/switch-live` 原子切新请求到 B；已准入 A 的 HTTP/SSE 继续由 A 完成。账号名额、余额消耗、冷却、凭证刷新、会话、提示词状态和代理绑定由共享权威协调，代理的实际监听端口在各进程内独立。
+
+重叠期间管理读取仍到 A，管理写入返回 503（解锁使用共享 Cookie/限流）；新推理没有发布 hold。原有全局容量与账号排队限制仍保留。A 前后台排空后，仅短暂 hold 管理入口，等待 A 最终提交并真实退出，B 才重读最终管理状态、接管后台。若候选启动后共享配置被旧后台改变，拒绝携带过期配置晋升。gateway 的管理等待预算至少为 `drain-seconds + 2 × start-seconds + 15` 秒。
+
+切流后但 stop 提交前可以回切未来推理到 A，再等待 B 已准入请求完成。切流/stop 回执不明、晋升失败或 gateway 重启丢失计数时进入 `recovery_required`，不能自动清零旧活动或恢复整库；计划发布不强杀长流。此模式用于兼容版本的有限重叠，不支持跨机多活、入口重启不断流或不兼容 schema 迁移。
+
+隔离验证使用假账号、本地上游桩和临时 PostgreSQL，在宿主机执行 `go test ./...`、共享协调的 `-race` 回归、`go vet ./...`、`scripts/test-upgrade-controller.py`、`scripts/test-seamless-upgrade.py` 与 `scripts/test-overlap-server.py`。后两个脚本需要宿主机构建的 server/gateway 路径；overlap 测试另从环境读取 `WB2API_TEST_POSTGRES_DSN`，只允许本机临时数据库。不要向这些测试提供生产凭证。
+
+2026-11-10 已在 SSH `tyy2` 对当前未提交源码完成隔离验收：Go 全量回归 1657 个通过项（含子用例），共享逻辑 race 回归 46 项无跳过，`go vet`、两个宿主机程序构建、10 项发布控制器回归及串行/overlap 真实 HTTP/SSE 集成均通过。验证了 A 旧 SSE 未结束时 B 已处理新请求，A 完整排空退出后 B 接管后台，共享 Cookie 保留；也覆盖协调域在 `/run` 重建后不变。全量回归按原有开关跳过 12 项，其中流量与响应历史两个 PostgreSQL 用例已使用专用临时库补跑通过；其余为未配置 Redis、可选负载/性能与真实上游审计，以及 root 下无法验证的只读权限探针。未访问真实供应商、未部署。日志保留于 `tyy2:/srv/build-server/logs/workbuddy2api/overlap-20261110-12293583/`，宿主机产物位于对应 `artifacts/workbuddy2api/overlap-20261110-12293583/`。
 
 控制台新增「采集中心」，统一执行积分余额、请求用量、凭证有效期、模型权限和成长任务状态的在线采集。账号管理中可以按单账号、已选账号、当前筛选结果或全池发起，任务离开页面后继续执行。刷新列表只读取本地状态；`/v1/models` 从按账号隔离的模型快照汇总，首次成功采集前回退静态模型表。
 

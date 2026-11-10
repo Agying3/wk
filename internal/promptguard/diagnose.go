@@ -23,7 +23,7 @@ func (m *Manager) Start(id, kind string, automatic bool) (Job, error) {
 	return m.start(id, kind, automatic, nil)
 }
 
-func (m *Manager) start(id, kind string, automatic bool, override *AccountScope) (Job, error) {
+func (m *Manager) start(id, kind string, automatic bool, override *AccountScope) (result Job, err error) {
 	done, admitted := lifecycle.Default.Enter()
 	if !admitted {
 		return Job{}, errors.New("服务正在排空")
@@ -33,7 +33,19 @@ func (m *Manager) start(id, kind string, automatic bool, override *AccountScope)
 		return Job{}, errors.New("未知诊断操作")
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	defer func() {
+		m.mu.Unlock()
+		if sharedErr := m.SharedError(); sharedErr != nil {
+			result = Job{}
+			err = sharedErr
+		}
+	}()
+	if m.mu.err != nil {
+		return Job{}, m.mu.err
+	}
+	if !m.background && !automatic {
+		return Job{}, errors.New("诊断后台尚未接管")
+	}
 	c := m.state.Cases[id]
 	if c == nil {
 		return Job{}, errors.New("记录不存在")
@@ -47,7 +59,7 @@ func (m *Manager) start(id, kind string, automatic bool, override *AccountScope)
 	if c.Job != nil && (c.Job.Status == "running" || c.Job.Status == "queued") {
 		return Job{}, errors.New("该记录已在诊断队列中")
 	}
-	if m.factory == nil && m.sessionFactory == nil {
+	if m.background && m.factory == nil && m.sessionFactory == nil {
 		return Job{}, errors.New("诊断上游未配置")
 	}
 	if automatic && !m.state.Config.Settings.AutoLocate {
@@ -65,7 +77,7 @@ func (m *Manager) start(id, kind string, automatic bool, override *AccountScope)
 	if kind == "verify" {
 		job.Budget = 2
 	}
-	if m.active {
+	if m.active || !m.background {
 		job.Status = "queued"
 	}
 	previous := c.Job
@@ -109,9 +121,14 @@ func (m *Manager) Cancel(id string) error {
 }
 
 func (m *Manager) next() {
+	done, admitted := lifecycle.Default.Enter()
+	if !admitted {
+		return
+	}
+	defer done()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed || m.active || !m.state.Config.Settings.AutoLocate {
+	if m.closed || !m.background || m.mu.err != nil || m.active || !m.state.Config.Settings.AutoLocate || (m.factory == nil && m.sessionFactory == nil) {
 		return
 	}
 	var item *Case

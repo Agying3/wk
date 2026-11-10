@@ -15,9 +15,10 @@ var ErrRouteReserved = errors.New("account reserved for active sessions")
 var ErrSessionQueueFull = errors.New("session wait queue full")
 
 type slotWaiter struct {
-	notify   chan struct{}
-	route    RouteRequest
-	enqueued time.Time
+	id, owner string // populated only for cross-process overlap queues
+	notify    chan struct{}
+	route     RouteRequest
+	enqueued  time.Time
 }
 
 type queueTurn struct {
@@ -180,6 +181,9 @@ func (p *Pool) WaitAndAcquireByUIDForModel(ctx context.Context, uid, model strin
 }
 
 func (p *Pool) WaitAndAcquireByUIDForRoute(ctx context.Context, uid, model string, maxPending, maxTotal int, route RouteRequest, tried, allow map[string]bool) (*auth.Auth, error) {
+	if p.SharedEnabled() {
+		return nil, errors.New("shared admission requires an explicit request lease")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

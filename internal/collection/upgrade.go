@@ -5,6 +5,9 @@ package collection
 func (m *Manager) FlushChecked() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !m.active {
+		return nil
+	}
 	rows := map[string][]byte{"settings": encode(m.settings)}
 	for id, j := range m.jobs {
 		rows["job/"+id] = jobJSON(j)

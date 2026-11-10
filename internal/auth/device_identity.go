@@ -50,6 +50,12 @@ func savedDeviceIdentity(path, uid string) string {
 // publishes the ID only after the atomic write succeeds. Read-only auths and
 // in-memory accounts retain legacy behavior instead of blocking model calls.
 func (a *Auth) DeviceIdentity() string {
+	// A refresh may call this while holding its shared credential transaction.
+	// In overlap mode, legacy files retain their deterministic legacy identity;
+	// lazy initialization must never write outside that transaction or reenter it.
+	if currentSharedAuthority() != nil {
+		return a.Snapshot().DeviceID
+	}
 	a.saveMu.Lock()
 	defer a.saveMu.Unlock()
 	c := a.Snapshot()

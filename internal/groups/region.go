@@ -59,6 +59,9 @@ type GroupInfo struct {
 
 // CreateWithRegion 新建分组并指定区域。region ∈ cn|global|all。
 func (s *Store) CreateWithRegion(name, region string) error {
+	if err := s.prepareWrite(); err != nil {
+		return err
+	}
 	name = strings.TrimSpace(name)
 	if err := s.ValidateName(name); err != nil {
 		return err
@@ -81,6 +84,9 @@ func (s *Store) Create(name string) error {
 
 // RegionOf 查询分组区域。未知分组返回 all（读路径兜底，不报错）。
 func (s *Store) RegionOf(name string) string {
+	if err := s.reloadShared(); err != nil {
+		return sharedUnavailable
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if r, ok := s.regions[name]; ok && r != "" {
@@ -94,6 +100,9 @@ func (s *Store) RegionOf(name string) string {
 // 成员校验由调用方（server 层）完成——这里只管存储；理由：成员账号区域
 // 需要 Pool/Auth 依赖，groups 包不引入。
 func (s *Store) SetGroupRegion(name, region string) error {
+	if err := s.prepareWrite(); err != nil {
+		return err
+	}
 	if !ValidRegion(region, true) {
 		return fmt.Errorf("分组区域不合法（cn/global/all）: %q", region)
 	}
@@ -109,6 +118,9 @@ func (s *Store) SetGroupRegion(name, region string) error {
 
 // ListDetailed 全部分组 + 区域 + 代理绑定（管理页渲染）。
 func (s *Store) ListDetailed() []GroupInfo {
+	if err := s.reloadShared(); err != nil {
+		return []GroupInfo{}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]GroupInfo, 0, len(s.groups))
@@ -140,6 +152,9 @@ func (s *Store) ListDetailed() []GroupInfo {
 // 分组必须存在；pgID 不做存在性校验（reqproxy 侧的状态，groups 包不依赖），
 // 失效引用由解析方忽略、删除代理分组时由 server 调 RemoveProxyGroupRef 清理。
 func (s *Store) SetProxyBindings(group string, pgIDs []string) error {
+	if err := s.prepareWrite(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.hasGroupLocked(group) {
@@ -169,6 +184,9 @@ func (s *Store) SetProxyBindings(group string, pgIDs []string) error {
 
 // ProxyBindingsOf 查询账号分组绑定的代理分组 ID（快照）。
 func (s *Store) ProxyBindingsOf(group string) []string {
+	if err := s.reloadShared(); err != nil {
+		return []string{sharedUnavailable}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := append([]string(nil), s.pgBindings[group]...)
@@ -179,6 +197,9 @@ func (s *Store) ProxyBindingsOf(group string) []string {
 // HasProxyBindings 报告账号分组是否有绑定记录（即便列表已被清空）。
 // 用于区分"从未绑定"（可种子默认绑定）与"管理员显式清空"（不再种子）。
 func (s *Store) HasProxyBindings(group string) bool {
+	if err := s.reloadShared(); err != nil {
+		return true
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.hasBindingLocked(group)
@@ -186,6 +207,9 @@ func (s *Store) HasProxyBindings(group string) bool {
 
 // SnapshotProxyBindings 导出全量绑定（管理页/测试用）。
 func (s *Store) SnapshotProxyBindings() map[string][]string {
+	if err := s.reloadShared(); err != nil {
+		return map[string][]string{}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string][]string, len(s.pgBindings))
@@ -198,6 +222,9 @@ func (s *Store) SnapshotProxyBindings() map[string][]string {
 // RemoveProxyGroupRef 从所有账号分组的绑定里移除对某代理分组的引用。
 // 返回受影响的账号分组数（删除代理分组后清理用）。
 func (s *Store) RemoveProxyGroupRef(pgID string) int {
+	if err := s.prepareWrite(); err != nil {
+		return 0
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	affected := 0
@@ -232,6 +259,9 @@ func (s *Store) hasBindingLocked(group string) bool {
 // 与 AccountGroups 的区别：不做 default 回落——用于代理绑定解析
 // （未登记账号不受绑定限制，与 keys.json 选号只看归属表的语义一致）。
 func (s *Store) RegisteredGroups(uid string) []string {
+	if err := s.reloadShared(); err != nil {
+		return []string{sharedUnavailable}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if gs, ok := s.accountOf[uid]; ok && len(gs) > 0 {

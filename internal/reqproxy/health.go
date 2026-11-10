@@ -191,7 +191,7 @@ func (h *Health) probe(n Node) (int64, error) {
 		defer release()
 	}
 
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	proxyURL := fmt.Sprintf("http://%s:%d", proxyHost(h.dial), port)
 	req, err := http.NewRequest(http.MethodHead, target, nil)
 	if err != nil {
 		return -1, err

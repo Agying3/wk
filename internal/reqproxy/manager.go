@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/coordination"
 	"workbuddy2api/internal/lifecycle"
 )
 
@@ -71,11 +72,21 @@ type Manager struct {
 	scanDone chan struct{}
 
 	// 内核热替换期间的槽位出站保护
-	kernMu sync.Mutex
+	kernMu       sync.Mutex
+	bgMu         sync.Mutex
+	background   bool
+	initOnce     sync.Once
+	listenIP     string
+	localTargets map[string]string
+	localPorts   map[string]int
 }
 
 // NewManager 构建并启动模块。kernel 为 nil 时纯逻辑模式（测试）。
 func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
+	return newManager(cfg, kernel, nil, "127.0.0.1", true)
+}
+
+func newManager(cfg Config, kernel *Kernel, shared *coordination.Store, listenIP string, owner bool) (*Manager, error) {
 	if cfg.StateFile == "" {
 		cfg = DefaultConfig()
 	}
@@ -83,17 +94,32 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	if shared != nil {
+		if err = store.enableShared(shared, owner); err != nil {
+			store.Close()
+			return nil, err
+		}
+	}
 	m := &Manager{
-		initialized: make(chan struct{}),
-		cfg:         cfg,
-		store:       store,
-		kernel:      kernel,
-		subStop:     make(chan struct{}),
-		subDone:     make(chan struct{}),
-		scanStop:    make(chan struct{}),
-		scanDone:    make(chan struct{}),
+		listenIP:     listenIP,
+		localTargets: map[string]string{},
+		localPorts:   map[string]int{},
+		initialized:  make(chan struct{}),
+		cfg:          cfg,
+		store:        store,
+		kernel:       kernel,
+		subStop:      make(chan struct{}),
+		subDone:      make(chan struct{}),
+		scanStop:     make(chan struct{}),
+		scanDone:     make(chan struct{}),
 	}
 	m.pool = NewPool(store, cfg.PortMin, cfg.PortMax)
+	if shared != nil {
+		store.mu.local.Lock()
+		store.mu.pool = m.pool
+		m.pool.nodes = store.mu.nodes
+		store.mu.local.Unlock()
+	}
 	if cfg.UnhealthyCooldown > 0 {
 		m.pool.SetUnhealthyCooldown(cfg.UnhealthyCooldown)
 	}
@@ -127,6 +153,31 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 		m.PrewarmIfDue()
 		m.Rebalance()
 	})
+	if owner {
+		if err := m.ActivateBackground(); err != nil {
+			m.Close()
+			return nil, err
+		}
+	} else {
+		if err := m.restoreSlots(); err != nil {
+			m.Close()
+			return nil, err
+		}
+		m.initOnce.Do(func() { close(m.initialized) })
+	}
+	return m, nil
+}
+
+func (m *Manager) ActivateBackground() error {
+	m.bgMu.Lock()
+	defer m.bgMu.Unlock()
+	if m.background {
+		return nil
+	}
+	if err := m.SharedError(); err != nil {
+		return err
+	}
+	m.background = true
 	m.health.Start()
 	go m.subscriptionLoop()
 	go m.autoTTFBScanLoop()
@@ -136,7 +187,7 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 	// 注意：先拷出订阅 ID 再刷新——RefreshSubscription 内部要拿 Store.mu，
 	// 不能在 View 回调（已持锁）里调用（自死锁，线上抓过）。
 	lifecycle.Go(func() {
-		defer close(m.initialized)
+		defer m.initOnce.Do(func() { close(m.initialized) })
 		var subIDs []string
 		m.store.View(func(st *State) {
 			for _, sub := range st.Subscriptions {
@@ -159,16 +210,21 @@ func NewManager(cfg Config, kernel *Kernel) (*Manager, error) {
 		time.Sleep(2 * time.Second)
 		m.PrewarmIfDue()
 	})
-	return m, nil
+	return nil
 }
 
 // Close 停止全部后台任务。
 func (m *Manager) Close() {
-	close(m.subStop)
-	<-m.subDone
-	close(m.scanStop)
-	<-m.scanDone
-	m.health.Stop()
+	m.bgMu.Lock()
+	background := m.background
+	m.bgMu.Unlock()
+	if background {
+		close(m.subStop)
+		<-m.subDone
+		close(m.scanStop)
+		<-m.scanDone
+		m.health.Stop()
+	}
 	if m.kernel != nil {
 		m.kernel.Close()
 	}
@@ -325,6 +381,9 @@ func (m *Manager) clearScanWarn() {
 func (m *Manager) DialProxy(uid, region string) (*url.URL, error) {
 	enabled := false
 	m.store.View(func(st *State) { enabled = st.Enabled })
+	if err := m.SharedError(); err != nil {
+		return nil, err
+	}
 	if !enabled {
 		return nil, nil
 	}
@@ -333,8 +392,22 @@ func (m *Manager) DialProxy(uid, region string) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err = m.SharedError(); err != nil {
+		return nil, err
+	}
 	if port == 0 {
 		return nil, nil // 空池降级直连
+	}
+	if m.store.mu.shared != nil {
+		port, err = m.ensureLocalSlot(uid)
+		if err != nil {
+			return nil, err
+		}
+		m.pool.CountRequest(uid)
+		if err = m.SharedError(); err != nil {
+			return nil, err
+		}
+		return mustParseURL(fmt.Sprintf("http://%s:%d", m.ProxyHost(), port)), nil
 	}
 	// 新建槽位 → 内核开槽（锁外）
 	if op != nil && m.kernel != nil {
@@ -348,7 +421,7 @@ func (m *Manager) DialProxy(uid, region string) (*url.URL, error) {
 	}
 	// 负载计数：真实请求数是均衡的依据（账号数会骗人）
 	m.pool.CountRequest(uid)
-	return mustParseURL(fmt.Sprintf("http://127.0.0.1:%d", port)), nil
+	return mustParseURL(fmt.Sprintf("http://%s:%d", m.ProxyHost(), port)), nil
 }
 
 // rollbackSlotBindings 撤掉所有指向该槽位的绑定并删除槽位记录。
@@ -383,6 +456,10 @@ func (m *Manager) rollbackKernelSlot(uid, slotID string) {
 
 // applyKernelOp 执行内核操作（add-slot / retarget）。
 func (m *Manager) applyKernelOp(op KernelOp) error {
+	if m.store.mu.shared != nil {
+		_, err := m.ensureLocalSlotSpec(Slot{ID: op.SlotID, Port: op.Port}, op.NodeSpec)
+		return err
+	}
 	m.kernMu.Lock()
 	defer m.kernMu.Unlock()
 	switch op.Kind {
@@ -398,12 +475,26 @@ func (m *Manager) applyKernelOp(op KernelOp) error {
 // restoreSlots 恢复内核槽位：对 state 里的每个槽位，其节点已在池里但内核
 // 还没这个槽位时 AddSlot。幂等（已存在的先 Remove 再 Add），可安全重入——
 // 订阅刷新成功后、周期兜底时都再调一次，保证节点池就绪后槽位最终被接上。
-func (m *Manager) restoreSlots() {
+func (m *Manager) restoreSlots() error {
+	if m.kernel == nil {
+		return nil
+	}
 	slots, _ := m.pool.Views()
 	nodes := indexNodes(m.pool.NodesSnapshot())
+	if m.store.mu.shared != nil {
+		for _, s := range slots {
+			if node, ok := nodes[s.NodeID]; ok {
+				if _, err := m.ensureLocalSlotSpec(s, node.NodeSpec); err != nil {
+					return err
+				}
+			}
+		}
+		return m.SharedError()
+	}
 	// 内核操作统一走 kernMu（与 applyNodeDiff/fixup 的锁序一致：kernMu → kernel.mu）
 	m.kernMu.Lock()
 	defer m.kernMu.Unlock()
+	var firstError error
 	for _, s := range slots {
 		if s.NodeID == "" {
 			continue
@@ -417,8 +508,12 @@ func (m *Manager) restoreSlots() {
 		}
 		if err := m.kernel.AddSlot(s.ID, s.Port, node.NodeSpec); err != nil {
 			m.emit("warn", fmt.Sprintf("恢复槽位 %s 失败: %v", s.ID, err))
+			if firstError == nil {
+				firstError = err
+			}
 		}
 	}
+	return firstError
 }
 
 // RefreshSubscription 手动/定时刷新一个订阅。
@@ -433,6 +528,9 @@ func (m *Manager) RefreshSubscription(subID string) error {
 			}
 		}
 	})
+	if err := m.SharedError(); err != nil {
+		return err
+	}
 	if sub == nil {
 		return fmt.Errorf("订阅 %s 不存在", subID)
 	}
@@ -611,6 +709,9 @@ func (m *Manager) subscriptionLoop() {
 
 // TempPort 实现 TempPortDialer：为测速临时开节点 outbound + 本地端口。
 func (m *Manager) TempPort(node NodeSpec, region string) (int, func(), error) {
+	if err := m.SharedError(); err != nil {
+		return 0, nil, err
+	}
 	if m.kernel == nil {
 		return 0, nil, fmt.Errorf("内核未启用")
 	}
@@ -618,11 +719,29 @@ func (m *Manager) TempPort(node NodeSpec, region string) (int, func(), error) {
 	slots, _ := m.pool.Views()
 	for _, s := range slots {
 		if s.NodeID == node.ID {
+			if m.store.mu.shared != nil {
+				port, err := m.ensureLocalSlotSpec(s, node)
+				return port, nil, err
+			}
 			return s.Port, nil, nil
 		}
 	}
 	// 临时通道：开一个专用槽位（用完删）
 	tag := "probe_" + node.ID
+	if m.store.mu.shared != nil {
+		m.kernMu.Lock()
+		port, err := m.freeLocalPort()
+		if err != nil {
+			m.kernMu.Unlock()
+			return 0, nil, err
+		}
+		if err = m.kernel.AddSlot(tag, port, node); err != nil {
+			m.kernMu.Unlock()
+			return 0, nil, err
+		}
+		m.kernMu.Unlock()
+		return port, func() { _ = m.kernel.RemoveSlot(tag) }, nil
+	}
 	port, err := m.pool.allocProbePort()
 	if err != nil {
 		return 0, nil, err

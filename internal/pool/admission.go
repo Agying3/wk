@@ -203,6 +203,9 @@ func (p *Pool) NoteRouteSuccess(uid string, r RouteRequest, service time.Duratio
 }
 
 func (p *Pool) ReleaseRoute(uid string, r RouteRequest) {
+	if p.SharedEnabled() {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if l := p.routeLeases[uid][routeLeaseKey(r)]; l != nil && l.active > 0 {
@@ -243,6 +246,9 @@ func (p *Pool) alternativeLocked(uid, model string, r RouteRequest, tried, allow
 // A soft reservation is enforced only when another authorized ready account
 // can serve the request. Decision and slot acquisition share the pool lock.
 func (p *Pool) PickAndAcquireByUIDForRoute(uid, model string, r RouteRequest, tried, allow map[string]bool) *auth.Auth {
+	if p.SharedEnabled() {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -298,6 +304,9 @@ func (p *Pool) recommendRouteLocked(model string, r RouteRequest, tried, allow m
 }
 
 func (p *Pool) PickAndAcquireRoute(model string, r RouteRequest, tried, allow map[string]bool) *auth.Auth {
+	if p.SharedEnabled() {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()

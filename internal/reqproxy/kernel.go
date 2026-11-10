@@ -7,9 +7,10 @@
 //   - 换节点只换 slot_id 的 outbound（RemoveHandler + AddOutboundHandler）。
 //
 // 实现路径（经 Xray-core 调研确认）：
-//   JSON 片段 → conf.InboundDetourConfig/OutboundDetourConfig.Build()
-//   → core.AddInboundHandler/AddOutboundHandler；删除经
-//   inbound/outbound Manager.RemoveHandler；路由经 routing.Router.AddRule。
+//
+//	JSON 片段 → conf.InboundDetourConfig/OutboundDetourConfig.Build()
+//	→ core.AddInboundHandler/AddOutboundHandler；删除经
+//	inbound/outbound Manager.RemoveHandler；路由经 routing.Router.AddRule。
 package reqproxy
 
 import (
@@ -17,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 
@@ -41,10 +43,27 @@ type Kernel struct {
 	ctx       context.Context
 	outbounds map[string]bool // 已存在的出站 tag
 	rules     map[string]bool // 已存在的路由 ruleTag（= slot_id）
+	listenIP  string
 }
 
 // NewKernel 启动最小 Xray 实例（dispatcher + proxyman + 默认 blackhole 出口）。
 func NewKernel() (*Kernel, error) {
+	return NewKernelAt("127.0.0.1")
+}
+
+func validateListenIP(address string) error {
+	ip := net.ParseIP(address)
+	if ip == nil || ip.To4() == nil || !ip.IsLoopback() {
+		return fmt.Errorf("proxy listen address must be an IPv4 loopback address")
+	}
+	return nil
+}
+
+// NewKernelAt isolates overlapping releases' local inbounds on Linux's 127/8.
+func NewKernelAt(listenIP string) (*Kernel, error) {
+	if err := validateListenIP(listenIP); err != nil {
+		return nil, err
+	}
 	cfg := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
@@ -71,6 +90,7 @@ func NewKernel() (*Kernel, error) {
 		return nil, fmt.Errorf("启动 Xray 实例: %w", err)
 	}
 	return &Kernel{
+		listenIP:  listenIP,
 		inst:      inst,
 		ctx:       context.Background(),
 		outbounds: map[string]bool{},
@@ -109,9 +129,9 @@ func (k *Kernel) AddSlot(slotID string, port int, node NodeSpec) error {
 	}
 	// inbound JSON（标准 xray 配置片段格式）
 	inJSON := fmt.Sprintf(`{
-		"tag": %q, "listen": "127.0.0.1", "port": %d,
+		"tag": %q, "listen": %q, "port": %d,
 		"protocol": "http", "settings": {}
-	}`, slotID, port)
+	}`, slotID, k.listenIP, port)
 	var ic conf.InboundDetourConfig
 	if err := json.Unmarshal([]byte(inJSON), &ic); err != nil {
 		return fmt.Errorf("inbound 配置构造: %w", err)

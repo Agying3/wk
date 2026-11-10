@@ -93,6 +93,11 @@ def validate_containers(args):
     locations = lambda x: sorted((m["Source"], m["Destination"]) for m in x["Mounts"])
     if locations(check) != locations(new):
         raise RuntimeError("preflight must inspect the candidate's mounts")
+    if getattr(args, "mode", "serial") == "overlap":
+        if any(argument(info, "-upgrade-mode") != "overlap" for info in (old, new)):
+            raise RuntimeError("both releases must support overlap; first migrate serially")
+        if argument(old, "-coordination-dir") != argument(new, "-coordination-dir"):
+            raise RuntimeError("coordination directories differ")
 
 
 def main():
@@ -102,6 +107,7 @@ def main():
         p.add_argument("--" + name, required=True)
     p.add_argument("--drain-seconds", type=float, default=20)
     p.add_argument("--start-seconds", type=float, default=20)
+    p.add_argument("--mode", choices=("serial", "overlap"), default="serial")
     args = p.parse_args()
     if args.old_release == args.new_release or args.drain_seconds <= 0 or args.start_seconds <= 0:
         p.error("distinct releases and positive budgets required")
@@ -112,6 +118,8 @@ def main():
 
 
 def release(args):
+    if getattr(args, "mode", "serial") == "overlap":
+        return release_overlap(args)
     if os.path.exists(args.journal):
         raise RuntimeError("journal already exists; inspect recorded stage before recovery, use a fresh journal for a new attempt")
     phase = "prepare"
@@ -124,6 +132,11 @@ def release(args):
             f.flush()
             os.fsync(f.fileno())
         os.replace(args.journal + ".tmp", args.journal)
+        directory = os.open(os.path.dirname(args.journal) or ".", os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         print(value, flush=True)
 
     def wait_for(predicate, timeout):
@@ -209,6 +222,158 @@ def release(args):
         else:
             # A failed/lost stop reply is ambiguous: never restart either writer
             # or restore a database snapshot automatically.
+            record("recovery_required")
+        raise
+
+
+def release_overlap(args):
+    """Switch relay traffic immediately; hold only the final management transfer."""
+    if os.path.exists(args.journal):
+        raise RuntimeError("journal already exists; inspect recorded stage before recovery")
+    phase = "prepare"
+
+    def record(value):
+        nonlocal phase
+        phase = value
+        with open(args.journal + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"phase": value, "mode": "overlap", "old": args.old_release,
+                       "new": args.new_release, "at": time.time()}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(args.journal + ".tmp", args.journal)
+        directory = os.open(os.path.dirname(args.journal) or ".", os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        print(value, flush=True)
+
+    def wait_for(predicate, seconds):
+        deadline = time.monotonic() + seconds
+        while True:
+            if predicate():
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("release stage exceeded budget")
+            time.sleep(0.1)
+
+    def protocol(state):
+        return state.get("mode") == "overlap" and state.get("overlap_protocol") == 1
+
+    def backend_ready():
+        if not inspect(args.new_container)["State"]["Running"]:
+            raise RuntimeError("candidate exited; inspect protected logs")
+        try:
+            status = call(args.new_control)
+        except (OSError, http.client.HTTPException):
+            return False
+        if status.get("release") != args.new_release or not status.get("ready"):
+            return False
+        if not protocol(status) or status.get("coordination_domain") != domain or status.get("background_owner"):
+            raise RuntimeError("candidate overlap coordination or standby mismatch")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(args.new_target + "/readyz", timeout=2) as response:
+                return json.load(response).get("release") == args.new_release
+        except (OSError, http.client.HTTPException):
+            return False
+
+    def release_counts(release):
+        status = call(args.gateway_control)
+        if status.get("recovery_required"):
+            raise RuntimeError("gateway recovery required")
+        return status.get("releases", {}).get(release, {})
+
+    validate_containers(args)
+    gateway, old = call(args.gateway_control), call(args.old_control)
+    if (not protocol(gateway) or gateway.get("release") != args.old_release
+            or gateway.get("management_release") != args.old_release or gateway.get("held")
+            or gateway.get("management_held") or gateway.get("recovery_required")
+            or gateway.get("transition") or set(gateway.get("releases", {})) != {args.old_release}):
+        raise RuntimeError("gateway not in a stable overlap state")
+    if not protocol(old) or old.get("release") != args.old_release or not old.get("ready") or not old.get("background_owner") or old.get("paused") or old.get("background_paused"):
+        raise RuntimeError("old release must be the serving overlap owner")
+    domain = old.get("coordination_domain")
+    if not isinstance(domain, str) or not domain:
+        raise RuntimeError("missing coordination domain")
+    if gateway["wait_seconds"] < args.drain_seconds + 2 * args.start_seconds + 15:
+        raise RuntimeError("management queue budget must cover final drain, stop and promotion")
+    target = urllib.parse.urlsplit(args.new_target)
+    if target.scheme != "http" or target.hostname not in ("127.0.0.1", "::1") or not target.port or target.path or target.query or target.fragment or target.username is not None:
+        raise RuntimeError("new target must be an explicit loopback HTTP origin")
+    record("preflight")
+    docker("start", args.check_container)
+    wait_for(lambda: not inspect(args.check_container)["State"]["Running"], args.start_seconds)
+    if inspect(args.check_container)["State"]["ExitCode"] != 0:
+        raise RuntimeError("candidate preflight failed; old release unchanged")
+    started = switched = stop_committed = False
+    try:
+        record("standby")
+        started = True
+        docker("start", args.new_container)
+        wait_for(backend_ready, args.start_seconds)
+        record("pause_background")
+        call(args.old_control, "pause-background", release=args.old_release)
+        record("switch_live")
+        call(args.gateway_control, "switch-live", expected=args.old_release,
+             next=args.new_release, target=args.new_target)
+        switched = True
+        record("drain_old_relay")
+        wait_for(lambda: release_counts(args.old_release).get("relay_active") == 0, args.drain_seconds)
+        wait_for(lambda: call(args.old_control).get("background") == 0, args.drain_seconds)
+        record("hold_management")
+        call(args.gateway_control, "hold-management", expected=args.old_release)
+        wait_for(lambda: release_counts(args.old_release).get("management_active") == 0, args.drain_seconds)
+        wait_for(lambda: call(args.old_control).get("active") == 0, args.drain_seconds)
+        call(args.old_control, "pause", release=args.old_release)
+        call(args.old_control, "quiesce", release=args.old_release)
+        record("finalize")
+        # An error or lost reply from stop has an ambiguous commit outcome.
+        stop_committed = True
+        call(args.old_control, "stop", release=args.old_release)
+        record("old_stopping")
+        wait_for(lambda: not inspect(args.old_container)["State"]["Running"], args.start_seconds)
+        if inspect(args.old_container)["State"]["ExitCode"] != 0:
+            raise RuntimeError("old release did not exit cleanly")
+        record("promote")
+        call(args.new_control, "activate-management", release=args.new_release)
+        call(args.new_control, "activate-background", release=args.new_release)
+        status = call(args.new_control)
+        if not protocol(status) or status.get("coordination_domain") != domain or not status.get("background_owner") or not status.get("ready"):
+            raise RuntimeError("candidate owner promotion incomplete")
+        call(args.gateway_control, "switch-management", expected=args.old_release, next=args.new_release)
+        call(args.gateway_control, "resume-management", expected=args.new_release)
+        call(args.gateway_control, "retire", expected=args.new_release, release=args.old_release)
+        call(args.gateway_control, "complete", expected=args.new_release)
+        record("serving")
+    except BaseException:
+        if stop_committed or phase == "switch_live":
+            record("recovery_required")
+            raise
+        try:
+            current = call(args.gateway_control)
+            if current.get("recovery_required"):
+                raise RuntimeError("gateway recovery required")
+            if switched:
+                call(args.old_control, "resume", release=args.old_release)
+                call(args.gateway_control, "rollback-live", expected=args.new_release, next=args.old_release)
+                call(args.gateway_control, "resume-management", expected=args.old_release)
+                wait_for(lambda: release_counts(args.new_release).get("relay_active") == 0, args.drain_seconds)
+            elif current.get("release") != args.old_release:
+                raise RuntimeError("gateway switch outcome unknown")
+            if started and inspect(args.new_container)["State"]["Running"]:
+                call(args.new_control, "pause", release=args.new_release)
+                wait_for(lambda: call(args.new_control).get("active") == 0, args.drain_seconds)
+                call(args.new_control, "quiesce", release=args.new_release)
+                wait_for(lambda: call(args.new_control).get("background") == 0, args.drain_seconds)
+                call(args.new_control, "stop", release=args.new_release)
+                wait_for(lambda: not inspect(args.new_container)["State"]["Running"], args.start_seconds)
+            call(args.old_control, "resume", release=args.old_release)
+            if switched:
+                call(args.gateway_control, "retire", expected=args.old_release, release=args.new_release)
+                call(args.gateway_control, "complete", expected=args.old_release)
+            record("aborted_old_serving")
+        except BaseException:
             record("recovery_required")
         raise
 

@@ -64,6 +64,18 @@ func (m *Manager) StartWithAccountScope(id, kind string, scope AccountScope) (Jo
 }
 
 func (m *Manager) launch(ctx context.Context, item Case, factory ProbeFactory, sessions SessionFactory) {
+	// The scheduling transaction commits in the parent's deferred Unlock. Do
+	// not select/refresh an account if that commit fenced this process.
+	m.mu.Lock()
+	ready := m.mu.err == nil && m.background && !m.closed
+	if !ready {
+		m.active = false
+		delete(m.cancel, item.ID)
+	}
+	m.mu.Unlock()
+	if !ready {
+		return
+	}
 	if sessions == nil {
 		m.run(ctx, item, factory(item), nil)
 		return

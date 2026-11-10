@@ -1,20 +1,41 @@
 package reqproxy
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
-// fakeUpstream 一个返回固定 IP 头的上游：验证流量确实经代理出去。
+// fakeUpstream serves a fixed exit identity for ordinary GET and tunneled GET.
+// Xray's HTTP outbound uses CONNECT even when the target is cleartext HTTP.
 func fakeUpstream(t *testing.T, body string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 回显连接的对端信息（经 socks/http 代理时是代理进程的出口）
-		_, _ = w.Write([]byte(body))
+		if r.Method != http.MethodConnect {
+			_, _ = io.WriteString(w, body)
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+			return
+		}
+		request, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		request.Body.Close()
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
 	}))
 	return srv
 }
@@ -57,7 +78,9 @@ func TestKernelSlotLifecycle(t *testing.T) {
 	if err := k.RetargetSlot(slotID, nodeB); err != nil {
 		t.Fatalf("RetargetSlot: %v", err)
 	}
-	got = proxyGet(t, port, upB.URL)
+	// Keep the target unchanged: the response must follow the selected exit,
+	// so a direct request or an unchanged outbound cannot satisfy this check.
+	got = proxyGet(t, port, upA.URL)
 	if got != "node-B" {
 		t.Fatalf("换指向后出口 = %q, want node-B（端口 %d 应不变）", got, port)
 	}
@@ -75,18 +98,25 @@ func TestKernelSlotLifecycle(t *testing.T) {
 func proxyGet(t *testing.T, port int, target string) string {
 	t.Helper()
 	client := &http.Client{
+		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
 			Proxy: http.ProxyURL(mustParseURL(fmt.Sprintf("http://127.0.0.1:%d", port))),
 		},
 	}
+	defer client.CloseIdleConnections()
 	resp, err := client.Get(target)
 	if err != nil {
 		t.Fatalf("代理请求失败: %v", err)
 	}
 	defer resp.Body.Close()
-	buf := make([]byte, 64)
-	n, _ := resp.Body.Read(buf)
-	return string(buf[:n])
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取代理响应失败: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("代理响应状态: %d", resp.StatusCode)
+	}
+	return string(buf)
 }
 
 // httpNodeSpec 构造指向 host:port 的 http 代理节点。

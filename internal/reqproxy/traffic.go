@@ -3,9 +3,20 @@ package reqproxy
 // RouteAtPort captures the node actually selected for a request's local slot.
 // Only safe identity fields are returned; protocol credentials stay internal.
 func (m *Manager) RouteAtPort(port int) (nodeID, nodeName, groupID, groupName string, ok bool) {
+	localSlot := ""
+	if m.store.mu.shared != nil {
+		m.kernMu.Lock()
+		for id, localPort := range m.localPorts {
+			if localPort == port {
+				localSlot = id
+				break
+			}
+		}
+		m.kernMu.Unlock()
+	}
 	m.pool.mu.Lock()
 	for _, slot := range m.pool.slots {
-		if slot.Port != port {
+		if m.store.mu.shared != nil && slot.ID != localSlot || m.store.mu.shared == nil && slot.Port != port {
 			continue
 		}
 		if n := m.pool.nodes[slot.NodeID]; n != nil {

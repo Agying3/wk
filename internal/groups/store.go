@@ -39,7 +39,10 @@ var ErrGroupInUse = errors.New("分组内仍有账号，请先移出")
 
 // Store 分组 + 账号归属 + 密钥 + 分组区域 + 代理绑定的联合存储。
 type Store struct {
-	mu sync.RWMutex
+	mu        sync.RWMutex
+	shared    SharedAuthority
+	sharedKey string
+	readOnly  bool
 
 	fp        string // groups.json 路径（目录即数据目录）
 	groups    []string
@@ -74,7 +77,15 @@ type Key struct {
 
 // New 打开或初始化存储。dir 为数据目录；文件不存在时创建含 default 的初始状态。
 func New(dir string) (*Store, error) {
+	return openStore(dir, false)
+}
+
+// NewReadOnly loads a relay candidate without rewriting shared management files.
+func NewReadOnly(dir string) (*Store, error) { return openStore(dir, true) }
+
+func openStore(dir string, readOnly bool) (*Store, error) {
 	s := &Store{
+		readOnly:   readOnly,
 		fp:         filepath.Join(dir, "groups.json"),
 		accFp:      filepath.Join(dir, "account-groups.json"),
 		keysFp:     filepath.Join(dir, "keys.json"),
@@ -84,7 +95,15 @@ func New(dir string) (*Store, error) {
 		regions:    map[string]string{},
 		pgBindings: map[string][]string{},
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if readOnly {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("management data path is not a directory")
+		}
+	} else if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
 	if err := s.loadAll(); err != nil {
@@ -95,8 +114,10 @@ func New(dir string) (*Store, error) {
 	if !s.hasGroupLocked(DefaultGroup) {
 		s.groups = append(s.groups, DefaultGroup)
 	}
-	if err := s.persistLocked(); err != nil {
-		return nil, err
+	if !readOnly {
+		if err := s.persistLocked(); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -202,6 +223,16 @@ func cleanGroups(in []string, valid map[string]bool) []string {
 
 // persistLocked 落盘所有脏文件。调用方必须持锁。
 func (s *Store) persistLocked() error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
+	if s.shared != nil {
+		return s.persistSharedLocked()
+	}
+	return s.persistFilesLocked()
+}
+
+func (s *Store) persistFilesLocked() error {
 	if raw, err := json.MarshalIndent(s.groups, "", "  "); err == nil {
 		if err := writeFileAtomic(s.fp, append(raw, '\n')); err != nil {
 			return fmt.Errorf("写 groups.json: %w", err)

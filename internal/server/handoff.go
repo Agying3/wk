@@ -49,6 +49,9 @@ func (h *Handler) handoffCipher() (cipher.AEAD, error) {
 
 // SaveHandoff must be called after both foreground and background are drained.
 func (h *Handler) SaveHandoff(path string, bindings []byte) error {
+	if h.cfg.Authority != nil {
+		return errors.New("overlap mode persists sessions through shared authority")
+	}
 	s := handoffWire{Version: 1, Bindings: bindings, Attempts: map[string]unlockWire{}}
 	h.sessionsMu.Lock()
 	s.Sessions = make(map[string]time.Time, len(h.sessions))
@@ -81,6 +84,9 @@ func (h *Handler) SaveHandoff(path string, bindings []byte) error {
 	return writeFileAtomic(path, a.Seal(n, n, raw, []byte("wb2api-handoff-v1")), 0600)
 }
 func (h *Handler) LoadHandoff(path string) ([]byte, error) {
+	if h.cfg.Authority != nil && h.webAuthority.ready.Load() {
+		return nil, errors.New("cannot import legacy handoff into active shared authority")
+	}
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil, nil

@@ -5,6 +5,9 @@ import "fmt"
 // FlushChecked is the handoff commit barrier; normal periodic flush retains
 // its historical retry behavior. Call only after all producers are drained.
 func (p *Pool) FlushChecked() error {
+	if p.SharedEnabled() {
+		return p.FlushWithError()
+	}
 	p.Flush()
 	p.persistMu.Lock()
 	defer p.persistMu.Unlock()

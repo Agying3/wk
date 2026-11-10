@@ -17,9 +17,10 @@ import (
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或 CPA 面板扁平形）。
 type Auth struct {
-	mu        sync.RWMutex
-	refreshMu sync.Mutex
-	saveMu    sync.Mutex
+	mu             sync.RWMutex
+	refreshMu      sync.Mutex
+	saveMu         sync.Mutex
+	sharedBaseline string
 
 	AccessToken  string
 	RefreshToken string
@@ -53,6 +54,7 @@ type Credentials struct {
 	DeviceID      string
 	DeviceProfile device.Profile
 	Authority
+	ImportDisabled bool
 }
 
 // Lock serializes account maintenance callers. Upstream refreshes coalesce
@@ -69,7 +71,7 @@ func (a *Auth) Snapshot() Credentials {
 	return Credentials{
 		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresAt: a.ExpiresAt,
 		Domain: a.Domain, UID: a.UID, EnterpriseID: a.EnterpriseID,
-		Nickname: a.Nickname, FilePath: a.FilePath, DeviceID: a.DeviceID, DeviceProfile: a.DeviceProfile, Authority: a.Authority,
+		Nickname: a.Nickname, FilePath: a.FilePath, DeviceID: a.DeviceID, DeviceProfile: a.DeviceProfile, Authority: a.Authority, ImportDisabled: a.ImportDisabled,
 	}
 }
 
@@ -263,6 +265,7 @@ func Parse(raw []byte) (*Auth, error) {
 			return nil, fmt.Errorf("parse_error: invalid device profile")
 		}
 	}
+	a.sharedBaseline = credentialDigest(a.Snapshot())
 	return &a, nil
 }
 
@@ -285,9 +288,15 @@ func isSafeCredentialField(value string) bool {
 // 使用一致快照写回，防止与 RefreshToken 并发时落盘半更新 token。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
 func (a *Auth) SaveAtomic() error {
+	if authority := currentSharedAuthority(); authority != nil {
+		return a.saveShared(authority, a.Snapshot())
+	}
 	a.saveMu.Lock()
 	defer a.saveMu.Unlock()
-	snapshot := a.Snapshot()
+	return a.saveAtomicSnapshot(a.Snapshot())
+}
+
+func (a *Auth) saveAtomicSnapshot(snapshot Credentials) error {
 	if strings.TrimSpace(snapshot.AccessToken) == "" {
 		return fmt.Errorf("save refused: empty accessToken (uid=%s)", snapshot.UID)
 	}
@@ -313,7 +322,7 @@ func (a *Auth) SaveAtomic() error {
 		snapshot.DeviceProfile = device.LegacyWindows(snapshot.UID, snapshot.DeviceID)
 	}
 	doc := map[string]any{
-		"_import_disabled": a.ImportDisabled,
+		"_import_disabled": snapshot.ImportDisabled,
 		"auth": map[string]any{
 			"accessToken":  snapshot.AccessToken,
 			"refreshToken": snapshot.RefreshToken,
@@ -332,8 +341,21 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := snapshot.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	file, err := os.CreateTemp(filepath.Dir(snapshot.FilePath), ".auth-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	if _, err := file.Write(raw); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
 		return err
 	}
 	// WriteFile 的 perm 参数只在**新建**文件时生效：如果上一轮留下了同名的

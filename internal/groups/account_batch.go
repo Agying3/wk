@@ -11,6 +11,9 @@ import (
 // lock. Only account-groups.json is written, once; a write failure leaves the
 // in-memory memberships unchanged. Invalid accounts do not block valid ones.
 func (s *Store) ChangeAccounts(regions map[string]string, targets []string, mode string) (map[string]error, error) {
+	if err := s.prepareWrite(); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if mode != "replace" && mode != "append" && mode != "remove" {
@@ -76,7 +79,7 @@ func (s *Store) ChangeAccounts(regions map[string]string, targets []string, mode
 	}
 	raw, err := json.MarshalIndent(next, "", "  ")
 	if err == nil {
-		err = writeFileAtomic(s.accFp, append(raw, '\n'))
+		err = s.persistAccountBatchLocked(append(raw, '\n'))
 	}
 	if err != nil {
 		return results, fmt.Errorf("分组保存失败，当前批次未修改")

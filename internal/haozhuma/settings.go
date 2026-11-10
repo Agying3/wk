@@ -8,6 +8,7 @@ import (
 
 // Settings 保留旧 sms.haozhuma 配置路径；豪猪项目 ID 和 E码云关键词独立。
 type Settings struct {
+	standby          bool
 	Credentials      *PlatformCredentials `json:"credentials,omitempty"`
 	Provider         string               `json:"provider"`
 	User             string               `json:"user"`
@@ -126,6 +127,28 @@ func sameFallback(a, b Settings) bool {
 
 // Build 先构造并验证新客户端，绝不修改 previous。未改变的凭据不重复请求供应商。
 func Build(ctx context.Context, s Settings, haoBase string, previous *Client, verify bool) (*Client, error) {
+	return buildSettings(ctx, s, haoBase, previous, verify, true)
+}
+
+// BuildStandby validates and assembles the complete client without contacting
+// either supplier. ActivateStandby must run after management ownership transfers.
+func BuildStandby(s Settings, haoBase string) (*Client, error) {
+	return buildSettings(context.Background(), s, haoBase, nil, false, false)
+}
+
+// ActivateStandby returns a ready replacement while leaving the candidate
+// untouched on login failure. Already active clients return themselves.
+func (c *Client) ActivateStandby(ctx context.Context) (*Client, error) {
+	if c == nil || c.settings == nil || !c.settings.standby {
+		return c, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return Build(ctx, *c.settings, c.Base, c, false)
+}
+
+func buildSettings(ctx context.Context, s Settings, haoBase string, previous *Client, verify, allowNetwork bool) (*Client, error) {
 	s = s.Normalized()
 	s.User, s.Token, s.Sid = strings.TrimSpace(s.User), strings.TrimSpace(s.Token), strings.TrimSpace(s.Sid)
 	s.EcodeKeyword, s.EcodeBase = strings.TrimSpace(s.EcodeKeyword), strings.TrimSpace(s.EcodeBase)
@@ -164,7 +187,7 @@ func Build(ctx context.Context, s Settings, haoBase string, previous *Client, ve
 		if same {
 			c.Token = previous.tokenValue()
 		}
-		if s.User != "" && (!same || c.Token == "") {
+		if allowNetwork && s.User != "" && (!same || c.Token == "") {
 			if err := c.Relogin(); err != nil {
 				if s.Token == "" {
 					return nil, err
@@ -200,6 +223,7 @@ func Build(ctx context.Context, s Settings, haoBase string, previous *Client, ve
 	if err := c.SetMode(s.Mode); err != nil {
 		return nil, err
 	}
+	s.standby = !allowNetwork
 	c.settings = &s
 	return c, nil
 }

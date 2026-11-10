@@ -329,7 +329,7 @@ func (p *TTFBProber) probeNode(n Node, acct TTFBAccount, body []byte, timeout ti
 	client := &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			Proxy:             http.ProxyURL(mustParseURL(fmt.Sprintf("http://127.0.0.1:%d", port))),
+			Proxy:             http.ProxyURL(mustParseURL(fmt.Sprintf("http://%s:%d", proxyHost(p.temp), port))),
 			DisableKeepAlives: true,
 		},
 	}

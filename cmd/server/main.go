@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"workbuddy2api/internal/cacheroute"
 	"workbuddy2api/internal/collection"
 	"workbuddy2api/internal/collectionservice"
+	"workbuddy2api/internal/coordination"
 	"workbuddy2api/internal/groups"
 	"workbuddy2api/internal/haozhuma"
 	"workbuddy2api/internal/lifecycle"
@@ -222,6 +224,8 @@ func main() {
 	release := flag.String("release", "", "immutable release identifier")
 	controlPath := flag.String("control", "", "private Unix lifecycle control socket")
 	stateLock := flag.String("state-lock", "", "shared local exclusive lock path")
+	upgradeMode := flag.String("upgrade-mode", "serial", "upgrade coordination mode: serial or overlap")
+	coordinationDir := flag.String("coordination-dir", "", "private host-local shared overlap membership directory")
 	flag.Parse()
 
 	cfg, err := Load(*cfgPath)
@@ -244,11 +248,57 @@ func main() {
 	if *controlPath != "" && (*release == "" || *stateLock == "") {
 		log.Fatal("-control requires -release and -state-lock")
 	}
+	overlap := *upgradeMode == "overlap"
+	if *upgradeMode != "serial" && !overlap {
+		log.Fatal("unknown -upgrade-mode")
+	}
+	if overlap && (*controlPath == "" || *coordinationDir == "" || cfg.Postgres.DSN == "") {
+		log.Fatal("overlap requires -control, -release, -state-lock, -coordination-dir and PostgreSQL")
+	}
 	if *preflight {
 		log.Print("preflight configuration valid; no storage, scheduler or upstream initialized")
 		return
 	}
-	if *stateLock != "" {
+	var overlapState *overlapRuntime
+	var authority *coordination.Store
+	initialOwner := true
+	bootstrapPool := false
+	var webAuthority server.WebAuthority
+	var sessionAuthority session.SharedAuthority
+	if overlap {
+		member, err := lifecycle.JoinOverlap(*stateLock, *coordinationDir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer member.Close()
+		authority, err = coordination.OpenPostgres(context.Background(), cfg.Postgres.DSN, member.Domain)
+		if err != nil {
+			log.Fatal("overlap coordination unavailable")
+		}
+		defer authority.Close()
+		webAuthority = authority
+		sessionAuthority = authority
+		overlapState = &overlapRuntime{member: member, store: authority, configPath: *cfgPath}
+		if err = overlapState.register(context.Background(), cfg); err != nil {
+			log.Fatal(err)
+		}
+		initialOwner, err = member.ClaimOwner()
+		if err != nil {
+			log.Fatal(err)
+		}
+		overlapState.owner.Store(initialOwner)
+		rawPool, e := authority.View(context.Background(), "pool/runtime")
+		if e != nil {
+			log.Fatal("overlap pool initialization unavailable")
+		}
+		bootstrapPool = initialOwner && string(rawPool) == "null"
+		// All constructors must see standby before they can dispatch new work.
+		if !initialOwner {
+			lifecycle.Default.Pause()
+		}
+		restore := auth.SetSharedAuthority(authority)
+		defer restore()
+	} else if *stateLock != "" {
 		unlock, err := lifecycle.Lock(*stateLock)
 		if err != nil {
 			log.Fatal(err)
@@ -290,10 +340,16 @@ func main() {
 			ps.SetRetention(retention)
 		}
 		if err != nil && cfg.Postgres.FallbackToSQLite {
+			if overlap {
+				log.Fatal("overlap metrics PostgreSQL unavailable; fallback is disabled")
+			}
 			log.Printf("metrics postgres unavailable: %v; falling back to sqlite", err)
 			metricsDB, err = metricsstore.Open(filepath.Join(filepath.Dir(cfg.StateFile), "metrics.db"), retention)
 		}
 		if err != nil {
+			if overlap {
+				log.Fatal("overlap metrics PostgreSQL unavailable")
+			}
 			log.Printf("metrics postgres unavailable: %v; using in-memory metrics", err)
 		}
 	} else {
@@ -334,13 +390,17 @@ func main() {
 	if old, ok := store.(responsehistory.LegacyStore); ok {
 		legacyResponses = old
 	}
-	responseStore, err := openResponseHistoryStore(cfg, metricsDB, legacyResponses)
+	responseStore, err := openResponseHistoryStoreForMode(cfg, metricsDB, legacyResponses, overlap)
 	if err != nil {
 		log.Fatalf("responses history storage unavailable: %v", err)
 	}
 	defer responseStore.Close()
 
-	p := pool.New(cfg.StateFile)
+	poolStatePath := cfg.StateFile
+	if overlap && !bootstrapPool {
+		poolStatePath = ""
+	}
+	p := pool.New(poolStatePath)
 	// Final flush is registered after the state database close defer.
 
 	// statestore：池状态 + 增长台账的数据库后端（PG → SQLite → nil 降级链，
@@ -348,21 +408,36 @@ func main() {
 	// 注入时机在 Redis 择新之前：DB 先恢复成基础状态，Redis 快照只在
 	// 比 DB 新时才覆盖（见 RestoreFromSnapshot 的择新逻辑），保证
 	// "flush 时 DB 写失败但 Redis 镜像成功"的窗口不丢数据。
-	stateDB := openStateStore(cfg)
+	stateDB := openStateStoreForMode(cfg, overlap)
+	if overlap && stateDB == nil {
+		log.Fatal("overlap requires a durable PostgreSQL state store")
+	}
 	if stateDB != nil {
 		defer stateDB.Close()
-		p.SetStatePersister(stateDB)
+		if !overlap || bootstrapPool {
+			p.SetStatePersister(stateDB)
+		}
 	}
 
 	defer p.Flush()
-	p.SetStore(store)
-	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比 DB/本地新才采用，否则本地优先
-	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+	if !overlap || bootstrapPool {
+		p.SetStore(store)
+		p.RestoreFromSnapshot()
+		p.SyncToDir(auths)
+	}
 
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	if overlap {
+		if err := p.EnableShared(context.Background(), authority, overlapState.member.ID, overlapState.member.Alive, bootstrapPool); err != nil {
+			log.Fatal(err)
+		}
+		if err := p.AttachSharedAuths(auths); err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -406,8 +481,11 @@ func main() {
 			Healthy:    p.HealthyUIDs,
 			Salt:       salt,
 			MaxEntries: cfg.SessionSticky.MaxEntries,
+			Authority:  sessionAuthority,
 		})
-		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
+		if !overlap {
+			sessRouter.LoadFromStore()
+		}
 		sessRouter.StartGC()
 		defer sessRouter.StopGC()
 	}
@@ -445,8 +523,11 @@ func main() {
 	// reqproxy：实际请求账号的代理池（区别于 sms 的注册代理）。
 	// 始终构造（WebUI 需要管理界面），enabled 状态在 state.json 里控制。
 	// 启动失败不致命：降级为直连（零回归），控制台仍可诊断。
-	reqProxyMgr, reqProxyKernel, reqProxyErr := newReqProxyManager(cfg)
+	reqProxyMgr, reqProxyKernel, reqProxyErr := newReqProxyManagerWithOverlap(cfg, overlapState, initialOwner)
 	if reqProxyErr != nil {
+		if overlap {
+			log.Fatal("overlap request proxy unavailable; refusing direct fallback")
+		}
 		log.Printf("reqproxy: 启动失败，账号请求直连: %v", reqProxyErr)
 	}
 	if reqProxyMgr != nil {
@@ -463,7 +544,7 @@ func main() {
 	accountControl := &sync.Mutex{}
 	var collectionManager *collection.Manager
 	if stateDB != nil {
-		service, e := collectionservice.New(stateDB, p, up, metricsDB, accountControl)
+		service, e := collectionservice.NewWithOptions(stateDB, p, up, metricsDB, accountControl, overlap && !initialOwner)
 		if e != nil {
 			log.Printf("collection unavailable: %v", e)
 		} else {
@@ -497,20 +578,23 @@ func main() {
 	// 分组 + 多密钥存储：与 state.json 同目录（部署时已挂载为卷）。
 	// 初始化失败是致命的：密钥文件损坏时宁可不起服务，也不要退化成
 	// "只有管理员密钥"——那会让所有分组密钥静默失效。
-	groupStore, err := groups.New(groupsStoreDir(cfg))
+	var groupStore *groups.Store
+	if overlap {
+		groupStore, err = groups.NewReadOnly(groupsStoreDir(cfg))
+	} else {
+		groupStore, err = groups.New(groupsStoreDir(cfg))
+	}
 	if err != nil {
 		log.Fatalf("groups store: %v", err)
+	}
+	if overlap {
+		groupStore.SetSharedAuthority(authority, initialOwner)
 	}
 	// 存量账号显式迁移进 default：读取路径有"未登记=default"的兜底，
 	// 但选号过滤和分组计数只看归属表，不迁移的话 default 密钥会
 	// 选不到任何号。区域过滤：default 分组的区域只收兼容区域的账号，
 	// 不匹配的保持未登记（等管理员建对应的区域分组再入组）。
-	if n := groupStore.MigrateUnregistered(p.UIDs(), func(uid string) string {
-		if a := p.AuthByUID(uid); a != nil {
-			return a.Region()
-		}
-		return ""
-	}); n > 0 {
+	if n := migrateOwnerGroups(groupStore, p, !overlap || initialOwner); n > 0 {
 		log.Printf("groups: %d 个存量账号已归入 default 分组", n)
 	}
 
@@ -521,12 +605,20 @@ func main() {
 	}
 	if promptSecret != "" {
 		var err error
-		promptManager, err = promptguard.Open(filepath.Join(filepath.Dir(cfg.StateFile), "prompt-guard.enc"), promptSecret)
+		promptPath := filepath.Join(filepath.Dir(cfg.StateFile), "prompt-guard.enc")
+		if overlap {
+			promptManager, err = promptguard.OpenShared(promptPath, promptSecret, authority, initialOwner)
+		} else {
+			promptManager, err = promptguard.Open(promptPath, promptSecret)
+		}
 		if err != nil {
 			log.Fatalf("prompt guard: %v", err)
 		}
 		defer promptManager.Close()
-		migrated, err := promptManager.MigrateLegacy(promptguard.LegacyConfig{Codex: cfg.Features.CodexCompat, DSH: cfg.Features.DSHCompat})
+		migrated := false
+		if initialOwner {
+			migrated, err = promptManager.MigrateLegacy(promptguard.LegacyConfig{Codex: cfg.Features.CodexCompat, DSH: cfg.Features.DSHCompat})
+		}
 		if err != nil {
 			log.Fatalf("prompt guard migration: %v", err)
 		}
@@ -535,6 +627,8 @@ func main() {
 		}
 	}
 	h := server.NewHandler(server.Config{
+		Authority:          webAuthority,
+		RelayOnly:          overlap && !initialOwner,
 		Collection:         collectionManager,
 		CollectionRequired: true,
 		AccountAdminLock:   accountControl,
@@ -562,7 +656,7 @@ func main() {
 		Traffic:  trafficTracker,
 		// 豪猪自动加号（可选）：取号→直登→落盘全自动。与手动发码共用代理池；
 		// AutoEnroll 在 NewHandler 内部组装（persist 回调指向 handler）。
-		HaozhumaClient: newSMSCodeClient(cfg),
+		HaozhumaClient: newSMSCodeClient(cfg, overlap && !initialOwner),
 		HaozhumaSid:    strings.TrimSpace(cfg.SMS.Haozhuma.Project()),
 		// 号码账本放在 state.json 同目录（部署时该目录已挂载为卷）。
 		AutoEnrollLedger: autoEnrollLedgerPath(cfg),
@@ -674,7 +768,7 @@ func main() {
 		}
 	}
 
-	if *controlPath != "" {
+	if *controlPath != "" && (!overlap || initialOwner) {
 		bindings, err := h.LoadHandoff(handoffPath)
 		if err != nil {
 			log.Fatalf("load upgrade handoff: %v", err)
@@ -683,6 +777,11 @@ func main() {
 			if err := sessRouter.Import(bindings); err != nil {
 				log.Fatalf("load route handoff: %v", err)
 			}
+		}
+	}
+	if overlap {
+		if err := h.InitializeSharedWeb(context.Background(), initialOwner); err != nil {
+			log.Fatal("overlap web authority initialization failed")
 		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -709,22 +808,84 @@ func main() {
 		if cfg.AutoEnroll.RetryDelaySeconds != nil && *cfg.AutoEnroll.RetryDelaySeconds > 0 {
 			h.AutoEnroller().SetRetryDelay(time.Duration(*cfg.AutoEnroll.RetryDelaySeconds) * time.Second)
 		}
-		if n := h.AutoEnroller().ReclaimOrphans(); n > 0 {
-			log.Printf("auto-enroll: reclaimed %d number(s) left over from a previous run", n)
-		}
-	}
-	if collectionManager != nil {
-		go collectionManager.Schedule("startup")
-	} else {
-		log.Printf("collection disabled: durable state store unavailable")
 	}
 	schedulerDone := make(chan struct{})
-	go func() { defer close(schedulerDone); sch.Run(ctx) }()
-
-	// 对接码监控值班循环（常驻模型：Start 幂等拉起，enabled 由配置控制
-	// tick 是否派活——WebUI 开关切换即时生效，无需重启进程）。
-	if w := h.UIDWatcher(); w != nil {
-		w.Start()
+	var backgroundStarted atomic.Bool
+	var startBackground sync.Once
+	activateManagement := func() error {
+		if !overlap {
+			return nil
+		}
+		if !overlapState.owner.Load() {
+			if err := overlapState.checkConfiguration(); err != nil {
+				return err
+			}
+		}
+		ok, err := overlapState.member.ClaimOwner()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("previous management owner is still alive")
+		}
+		if err := h.ActivateManagementState(); err != nil {
+			return err
+		}
+		groupStore.SetWritable(true)
+		overlapState.owner.Store(true)
+		return nil
+	}
+	activateBackground := func() error {
+		if err := activateManagement(); err != nil {
+			return err
+		}
+		if err := h.ActivateSMSClient(ctx); err != nil {
+			return err
+		}
+		if collectionManager != nil {
+			if err := collectionManager.ActivateBackground(); err != nil {
+				return err
+			}
+		}
+		if promptManager != nil && overlap {
+			if err := promptManager.ActivateBackground(); err != nil {
+				return err
+			}
+		}
+		if reqProxyMgr != nil && overlap {
+			if err := reqProxyMgr.ActivateBackground(); err != nil {
+				return err
+			}
+		}
+		startBackground.Do(func() {
+			// Preserve the serial startup barrier, and finish inherited number
+			// cleanup before the gateway admits management to a promoted owner.
+			if h.AutoEnroller() != nil {
+				h.AutoEnroller().ReclaimOrphans()
+			}
+			backgroundStarted.Store(true)
+			go func() { defer close(schedulerDone); sch.Run(ctx) }()
+			if w := h.UIDWatcher(); w != nil {
+				w.Start()
+			}
+			go func() {
+				done, err := lifecycle.Default.EnterContext(ctx)
+				if err != nil {
+					return
+				}
+				defer done()
+				if collectionManager != nil {
+					collectionManager.Schedule("startup")
+				}
+				h.ResumeGrowthJobsAfterRestart()
+			}()
+		})
+		return nil
+	}
+	if initialOwner {
+		if err := activateBackground(); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	// pprof 性能分析端点（默认关，见 config.Pprof 注释：无鉴权，只允许绑回环）。
@@ -741,9 +902,13 @@ func main() {
 
 	ready := func() bool {
 		paused, _ := foreground.Status()
-		return serving.Load() && !paused && (reqProxyMgr == nil || reqProxyMgr.Ready())
+		return serving.Load() && !paused && (!overlap || p.SharedError() == nil && (promptManager == nil || promptManager.SharedError() == nil)) && (reqProxyMgr == nil || reqProxyMgr.Ready())
 	}
-	guarded := foreground.Middleware(h)
+	var business http.Handler = h
+	if overlap {
+		business = overlapState.manage(business)
+	}
+	guarded := foreground.Middleware(business)
 	publicHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-WorkBuddy-Release", *release)
 		if r.Method == "GET" && (r.URL.Path == "/livez" || r.URL.Path == "/readyz") {
@@ -769,7 +934,7 @@ func main() {
 		IdleTimeout: 120 * time.Second,
 	}
 	if *controlPath != "" {
-		ctl, err := lifecycle.ListenControl(*controlPath, lifecycle.Control(*release, &foreground, ready, func() error {
+		ctl, err := lifecycle.ListenControl(*controlPath, lifecycle.ControlWithOptions(*release, &foreground, ready, func() error {
 			if err := p.FlushChecked(); err != nil {
 				return err
 			}
@@ -801,12 +966,23 @@ func main() {
 					return err
 				}
 			}
-			if err := h.SaveHandoff(handoffPath, bindings); err != nil {
-				return err
+			if !overlap {
+				if err := h.SaveHandoff(handoffPath, bindings); err != nil {
+					return err
+				}
 			}
 			serving.Store(false)
 			return nil
-		}, stop))
+		}, stop, lifecycle.ControlOptions{
+			Status: func() map[string]any {
+				if !overlap {
+					return nil
+				}
+				return map[string]any{"mode": "overlap", "overlap_protocol": 1, "coordination_domain": overlapState.member.Domain, "background_owner": backgroundStarted.Load()}
+			},
+			ActivateBackground: activateBackground,
+			ActivateManagement: activateManagement,
+		}))
 		if err != nil {
 			log.Fatalf("lifecycle socket: %v", err)
 		}
@@ -827,7 +1003,9 @@ func main() {
 		if w := h.UIDWatcher(); w != nil {
 			w.Stop()
 		}
-		<-schedulerDone
+		if backgroundStarted.Load() {
+			<-schedulerDone
+		}
 		<-trafficDone
 		// Already admitted async work is allowed to finish. Complex long-running
 		// tasks may delay shutdown; planned upgrades abort earlier at the gateway.
@@ -845,7 +1023,6 @@ func main() {
 	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
 	// 重启恢复：上次进程死在批跑半路（部署/崩溃）时自动续跑剩余账号。
 	// 动作幂等（已完成的秒级跳过），用户无需手动重新点「一键完成」。
-	h.ResumeGrowthJobsAfterRestart()
 	listener, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		log.Fatal(err)
@@ -878,6 +1055,10 @@ func (s poolAccountSource) RegionOf(uid string) string {
 // 但 kernel 实例的 Close 需要在 manager 停止后仍可控（main defer 里按序关）。
 // 启动失败不致命——降级直连（零回归），控制台可见错误。
 func newReqProxyManager(cfg *Config) (*reqproxy.Manager, *reqproxy.Kernel, error) {
+	return newReqProxyManagerWithOverlap(cfg, nil, true)
+}
+
+func newReqProxyManagerWithOverlap(cfg *Config, overlap *overlapRuntime, owner bool) (*reqproxy.Manager, *reqproxy.Kernel, error) {
 	rc := reqproxy.DefaultConfig()
 	if cfg.ReqProxy.StateFile != "" {
 		rc.StateFile = cfg.ReqProxy.StateFile
@@ -901,11 +1082,22 @@ func newReqProxyManager(cfg *Config) (*reqproxy.Manager, *reqproxy.Kernel, error
 		rc.PortMax = cfg.ReqProxy.PortMax
 	}
 
-	kernel, err := reqproxy.NewKernel()
+	var kernel *reqproxy.Kernel
+	var err error
+	if overlap != nil {
+		kernel, err = reqproxy.NewKernelAt(overlap.member.ListenIP)
+	} else {
+		kernel, err = reqproxy.NewKernel()
+	}
 	if err != nil {
 		return nil, nil, err
 	}
-	mgr, err := reqproxy.NewManager(rc, kernel)
+	var mgr *reqproxy.Manager
+	if overlap != nil {
+		mgr, err = reqproxy.NewSharedManager(rc, kernel, overlap.store, overlap.member.ListenIP, owner)
+	} else {
+		mgr, err = reqproxy.NewManager(rc, kernel)
+	}
 	if err != nil {
 		kernel.Close()
 		return nil, nil, err
@@ -1048,6 +1240,10 @@ func ledgerStoreAdapterOrNull(s *statestore.Store) server.GrowthLedgerStore {
 //   - SQLite 也打不开（卷故障/只读）：返回 nil，pool/growthledger 退化为
 //     现有 JSON 文件模式（零回归），启动日志明示。
 func openStateStore(cfg *Config) *statestore.Store {
+	return openStateStoreForMode(cfg, false)
+}
+
+func openStateStoreForMode(cfg *Config, requirePostgres bool) *statestore.Store {
 	stateDir := groupsStoreDir(cfg)
 	if cfg.Postgres.DSN != "" {
 		s, err := statestore.OpenPostgres(cfg.Postgres.DSN, cfg.Postgres.MaxOpenConns, cfg.Postgres.MaxIdleConns, cfg.PostgresMaxLifetime, cfg.PostgresMaxIdleTime)
@@ -1055,7 +1251,13 @@ func openStateStore(cfg *Config) *statestore.Store {
 			log.Printf("[statestore] 池状态 + 增长台账存储 = postgres")
 			return s
 		}
+		if requirePostgres {
+			return nil
+		}
 		log.Printf("[statestore] postgres 不可用 (%v)，回退 sqlite", err)
+	}
+	if requirePostgres {
+		return nil
 	}
 	s, err := statestore.OpenSQLite(filepath.Join(stateDir, "state.db"))
 	if err != nil {
@@ -1150,14 +1352,20 @@ func newHaozhumaClient(cfg *Config) *haozhuma.Client {
 	return nil
 }
 
-func newSMSCodeClient(cfg *Config) *haozhuma.Client {
+func newSMSCodeClient(cfg *Config, standby ...bool) *haozhuma.Client {
 	s := cfg.SMS.Haozhuma.Normalized()
 	if s.Project() == "" || (s.Token == "" && s.User == "") {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	c, err := haozhuma.Build(ctx, s, "", nil, false)
+	var c *haozhuma.Client
+	var err error
+	if len(standby) > 0 && standby[0] {
+		c, err = haozhuma.BuildStandby(s, "")
+	} else {
+		c, err = haozhuma.Build(ctx, s, "", nil, false)
+	}
 	if err != nil {
 		log.Printf("auto-enroll: 接码配置不可用: %v", err)
 		return nil
