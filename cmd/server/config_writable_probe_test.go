@@ -68,8 +68,8 @@ func TestProbeConfigWritableInPlaceOnly(t *testing.T) {
 }
 
 func TestProbeConfigWritableReadOnlyFile(t *testing.T) {
-	// :ro 挂载形态：temp 可建（目录可写）但 rename 被拒 + 文件本身只读。
-	// 期望：返回带修复指引的错误（main 里以 [warning] 打日志）。
+	// Deny both write paths: a read-only file in a read-only directory.
+	// Merely chmod'ing the file does not block rename in a writable directory.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(path, []byte("cfg"), 0o400); err != nil { // 只读文件
@@ -79,12 +79,33 @@ func TestProbeConfigWritableReadOnlyFile(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("running as root: read-only mode does not block writes, cannot simulate :ro")
 	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
 	err := probeConfigWritable(path)
 	if err == nil {
 		t.Fatal("read-only file must be reported")
 	}
 	if !errors.Is(err, os.ErrPermission) {
 		t.Fatalf("want permission error, got: %v", err)
+	}
+}
+
+func TestProbeConfigWritableReadOnlyFileAllowsAtomicReplace(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("requires an unprivileged user")
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte("cfg"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeConfigWritable(path); err != nil {
+		t.Fatalf("writable directory permits atomic replacement: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || string(raw) != "cfg" {
+		t.Fatal("probe changed the configuration content")
 	}
 }
 
