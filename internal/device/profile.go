@@ -72,11 +72,22 @@ func NewMac() (string, Profile, error) {
 		return "", Profile{}, err
 	}
 	id := hex.EncodeToString(random[:])
+	p, err := MacProfileForIdentity(id)
+	return id, p, err
+}
+
+// MacProfileForIdentity fills a missing profile without replacing an account's
+// existing opaque identity. It uses the same hardware and derivation as NewMac.
+func MacProfileForIdentity(id string) (Profile, error) {
+	if !validHex(id, 36) {
+		return Profile{}, fmt.Errorf("invalid device identity")
+	}
+	random, _ := hex.DecodeString(id)
 	p := Profile{Version: 1, Platform: "macos", Arch: "arm64", OSVersion: "24.6.0", CPUModel: "Apple M2", CPUCores: 8,
 		MemoryGiB: [...]int{8, 16, 24}[int(random[0])%3], Timezone: "Asia/Shanghai",
 		MachineID: strings.ToUpper(uuid(id, "mac-machine")), CLISessionID: uuid(id, "mac-cli-session"),
 		WebMachineID: digest(id, "mac-web", 16), MPMachineID: LegacyID(id, "mpmachine")}
-	return id, p, nil
+	return p, nil
 }
 
 func uuid(id, purpose string) string {

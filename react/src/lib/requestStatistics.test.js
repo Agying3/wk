@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { buildRequestQuery, createLatestRequestLoader, creditCoverage, hasRequestSummary, requestFilterKey, statisticsFromSummary } from './requestStatistics.js';
+import { loadDashboardData } from './dashboardLoad.js';
 
 const summary = (tokens = 100) => ({ requests: 1, successes: 1, failures: 0, input_tokens: tokens,
   output_tokens: 5, total_tokens: tokens + 5, cache_read_tokens: tokens / 2,
@@ -126,21 +127,27 @@ test('all query filters survive a refresh snapshot', () => {
 
 // Exercise the component's actual refresh and metric selection, not a copy
 // of the algorithm, without a browser or real model endpoints.
-async function dashboardScenario(requestList) {
+async function dashboardScenario(requestList, errors = {}) {
   const source=fs.readFileSync(new URL('../main.jsx',import.meta.url),'utf8').replace(/\r\n/g,'\n');
   const start=source.indexOf('  const refresh = async');
   const end=source.indexOf('\n  useEffect(() => {',start);
   assert.ok(start>=0 && end>start);
-  const state={metricSamples:[{cacheScope:'1h',cacheRate:99,avgTTFB:9999}],dashboardWindow:'24h'};
+  const state={data:{accounts:[],metrics:{},total:0,healthy:0},metricSamples:[{cacheScope:'1h',cacheRate:99,avgTTFB:9999}],dashboardWindow:'24h'};
   const callbacks=Object.fromEntries(['Data','Models','RequestLogs','DashboardSummary','DashboardScope','DashboardError',
     'DashboardUntil','DashboardLoading','Locked'].map(key=>['set'+key,value=>{state[key[0].toLowerCase()+key.slice(1)]=value;}]));
   const globals={...callbacks,AbortController,locked:false,dashboardWindow:'24h',
     refreshSerial:{current:0},refreshController:{current:null},
-    buildRequestQuery,hasRequestSummary,statisticsFromSummary,
+    buildRequestQuery,hasRequestSummary,statisticsFromSummary,loadDashboardData,
     setMetricSamples:fn=>{state.metricSamples=fn(state.metricSamples);},setSelectedModel:()=>{},setConfig:()=>{},
     api:async url=>{
-      if (url==='/status') return {metrics:{requests:1000,input_tokens:10000,cache_read_tokens:9000,avg_ttfb_ms:9000},accounts:[]};
-      if (url==='/v1/models') return {data:[]};
+      if (url==='/status') {
+        if (errors.status) { await new Promise(resolve=>setImmediate(resolve)); throw errors.status; }
+        return {metrics:{requests:1000,input_tokens:10000,cache_read_tokens:9000,avg_ttfb_ms:9000},accounts:[]};
+      }
+      if (url==='/admin/models') {
+        if (errors.models) throw errors.models;
+        return {data:[]};
+      }
       if (url==='/admin/config') return {};
       if (url.startsWith('/requests?')) {
         if (requestList instanceof Error) throw requestList;
@@ -166,6 +173,16 @@ test('dashboard request failure does not display the valid cumulative metrics', 
   assert.equal(state.dashboardError,'summary unavailable');
   assert.equal(state.dashboardLoading,false);
   assert.equal(state.metricSamples.length,1);
+});
+
+test('dashboard relocks when a concurrent path 403 arrives before authentication 401', async () => {
+  const {state}=await dashboardScenario({data:[]}, {
+    models:Object.assign(new Error('403'),{status:403}),
+    status:Object.assign(new Error('authentication required'),{status:401}),
+  });
+  assert.equal(state.locked,true);
+  assert.equal(state.dashboardError,'authentication required');
+  assert.equal(state.dashboardSummary,null);
 });
 
 test('dashboard TTFB and samples use only the selected window summary', async () => {

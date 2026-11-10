@@ -421,7 +421,7 @@ curl http://localhost:7863/v1/messages \
 
 设备平台按账号保存，支持已有 Windows 与新 Mac 账号混用，不设把全池切换平台的全局开关。通过 OAuth、短信登录或自动加号**首次创建**账号时，默认生成 Mac 档案：`darwin/arm64`、Darwin `24.6.0`、Apple M2 8 核，内存在 8/16/24 GiB 中随机选一次。M2 配置范围依据 [Apple 技术规格](https://support.apple.com/en-ie/111867)；Mac 请求字段参考 [客户端研究记录](https://github.com/yreidev/workbuddy2api-panel/blob/39049fcc479c1240d0d80d0404e0308f651424de/docs/official-client.md)。具体硬件、机器标识和浏览器标识保存在授权文件的 `_device_profile`，随机种子继续使用 `_device_identity`。不同账号可以有相同硬件，每个账号的已分配参数不因重启、版本默认值、刷新 token、重新登录或代理变化而重选。当前不向新增账号开放 Windows 选择，后续研究完成后再新增创建选项，不迁移已有设备。
 
-已有授权文件没有 `_device_profile` 时，继续使用原来的 Windows 硬件目录与标识算法，保存时冻结原值；不会按新账号默认值改成 Mac。重新登录已有 UID 会保留原设备元数据。加密迁移文件同时携带完整设备档案，旧迁移文件缺字段时按旧 Windows 行为兼容；直接复制到 auth_dir 的无设备字段文件同样作为旧文件处理，不推断它是一台新 Mac。Mac 档案使用对应的桌面事件、SDK 系统/架构头和 Mac 浏览器 UA；Windows 档案保留既有参数，不套用 Mac 专属字段。SDK 头里的超时描述不改变网关实际超时设置。小程序通道目前只沿用旧 Windows 抓包协议，独立于桌面档案保留兼容行为，不声称已复现 Mac 微信。
+已有授权文件没有 `_device_profile` 时，直接从 `auth_dir` 加载和重新登录仍使用原来的 Windows 兼容规则，保存时冻结原值，不批量迁移存量账号。通过面板/API **新导入**的账号（官方 JSON 或加密迁移包）缺少 `_device_profile` 时，按新账号规则生成并持久化 Mac 档案；已有 `_device_identity` 则保留并据此生成，缺失时才分配新标识。文件中已有合法 Mac/Windows 档案与扩展字段原样保留，已有 UID 或授权文件始终跳过。预览只展示设备处理计划，不生成或写入设备标识；无效设备元数据报错，不通过覆盖来修复。Mac 档案使用对应的桌面事件、SDK 系统/架构头和 Mac 浏览器 UA；Windows 档案保留既有参数，不套用 Mac 专属字段。SDK 头里的超时描述不改变网关实际超时设置。小程序通道目前只沿用旧 Windows 抓包协议，独立于桌面档案保留兼容行为，不声称已复现 Mac 微信。
 
 `upstream.header_profile` 默认 `desktop`：聊天、刷新与已核对的积分/签到接口分别构造请求头。客户端版本集中在 `client_version_cn`（默认 `5.9.3`）、`client_version_global`（`5.9.4`）与 `cli_version`（`2.165.0`）；聊天及桌面事件使用对应区域版本，不沿用旧版本的 commit/releaseDate。账号原有设备档案继续使用。未核对的业务接口保持既有头部契约，独立登录工具和 TTFB 测速不在此配置覆盖范围内。可用 `WB2A_HEADER_PROFILE`、`WB2A_CLIENT_VERSION_CN`、`WB2A_CLIENT_VERSION_GLOBAL`、`WB2A_CLI_VERSION` 覆盖；`header_profile=legacy` 恢复旧头部和版本。版本值必须是安全的版本号，修改需重启。
 
@@ -707,11 +707,17 @@ Tokens prefixed with @ are paths the user explicitly referenced. Relative paths 
 
 控制台「账号管理」（`#/pool`）支持中国区/海外版账号搜索、状态/区域/分组/凭证筛选、跨页多选，以及批量启用、禁用、清冷却、分组调整、签到、保活和删除。默认每页 25 条，可切换 50/100 条；筛选改变会清空选择。启用、禁用、清冷却及分组使用服务端批量接口，每批最多 100 个账号、集中持久化一次；分组在服务端锁内完成读取和追加/移除，保留其他归属。签到、保活及删除继续逐账号执行，最多 4 个账号并发。保留逐项结果、取消后续操作和失败项重试。删除需输入 `DELETE`；签到、保活和刷新上游积分会明确确认真实上游请求。
 
+账号详情通过管理员只读接口 `GET /admin/account/{uid}/details` 按需加载，支持手动刷新，展示账号归属与授权元数据、凭据是否齐全及到期时间、设备平台/硬件/档案来源、脱敏设备标识、运行状态和积分快照。仅管理员密钥或控制台会话可访问，响应 `Cache-Control: no-store`，不返回 token、授权文件路径或未知原始字段，不扩大 `/status` 的字段范围。旧文件没有设备档案时展示明确标注的 Windows 兼容推导值；查看详情不生成设备、不写文件，也不调用上游。导入隔离标记是状态丢失时的兜底信息，不代表账号当前一定停用；当前状态以运行态为准。
+
 分组调整支持替换、追加和移出，遵守区域约束。实例间迁移使用「加密导出」和「导入账号」：密码至少 12 字符，迁移包经 PBKDF2-SHA256（600000 次）与 AES-256-GCM 加密，只包含所选账号凭据与分组。先解密预览、选择后导入，不覆盖已有 UID 或授权文件；新账号均停用，核对后手动启用。导出不会停用或删除来源账号，需在目标验证后自行处理来源。导入仅保留目标已有且区域兼容的分组，不迁移管理员密钥、代理、临时冷却和计费统计。「导出清单」仅包含展示信息，不含凭据。
 
 管理员批量接口：`POST /admin/accounts/batch`，JSON 为 `uids`（1–100 个）、`action`（`enable` / `disable` / `clear-cooldown` / `groups`）；分组另传 `groups`、`mode`（`replace` / `append` / `remove`）。返回逐项 `results`（`uid,status,detail`）及 `stop`；部分账号不存在或区域不兼容时保留其他成功项，持久化故障停止后续批次。状态保存失败会明确提示内存已变更、需刷新核对；分组写入失败保持原归属。离开页面或取消只停止尚未提交的批次，已提交批次继续完成；请求/回执异常不自动重放，也不回退逐账号接口。请先发布支持此接口的服务端，再使用新版页面。
 
-管理员迁移接口：`POST /admin/accounts/export`（`uids,password`），`POST /admin/accounts/import/preview`（`bundle,password`），`POST /admin/accounts/import`（`bundle,password,uids`）。最多 1000 个账号、请求体最多 16 MiB，分组密钥禁止调用，迁移响应 `Cache-Control: no-store`。迁移不会主动登录或探测上游。
+「导入账号」也支持单个官方 `auth + account` JSON 文件，包括没有扩展名的文件；无需迁移密码。分组策略可选保留来源映射、替换为目标分组、追加目标分组；未自定义时普通 JSON 使用兼容的 `default`，迁移包保留目标已有的兼容来源组。自定义组必须存在且区域兼容，不满足时在预览标明问题，导入时重新校验，不静默回退。单账号文件可覆盖昵称（留空保留原值，最多 128 个 Unicode 字符，不含控制字符）。预览展示最终分组、昵称与设备计划，改参数须重新预览；已有 UID 或授权文件跳过，新账号默认停用。分组保存失败会报告账号已停用导入但分组未完成，停止后续账号，不计入完整成功。原始凭据和加密迁移包共用校验及导入流程，不会主动登录或探测上游。
+
+管理员迁移接口：`POST /admin/accounts/export`（`uids,password`），`POST /admin/accounts/import/preview` 和 `POST /admin/accounts/import` 接受加密模式 `bundle,password` 或原始模式 `credential`（官方 JSON 对象），两种模式互斥；实际导入另传所选 `uids`。最多 1000 个账号、请求体最多 16 MiB、解密内容最多 10 MiB、单个账号凭据最多 64 KiB；账号分组不设导入专有的 100 组限制。分组密钥禁止调用，迁移响应 `Cache-Control: no-store`。仅导入其他区域的新账号时才持久化 `region=all`，已为 `all` 或同区导入不重写配置。账号池持久化失败不计成功并停止后续账号；提交结果不确定时返回逐项 `pending` 提示，保留带停用标记的凭据，须恢复存储后核对账号池及文件，不能直接删除可能已经提交的唯一凭据。
+
+导入可选参数：`group_mode=source|replace|append`（默认 `source`）；替换/追加时传 `groups`（1–1000 个目标组），来源模式不传目标组；`nickname` 仅允许整个文件只有一个账号时设置。相同选项传给预览和导入。原始文件还可通过 `credential_json` 传递完整 JSON 文本（与 `credential` 互斥）；面板采用文本形式，保留未知扩展字段的大整数精度。预览行的 `device_action` 为 `generate_mac` / `preserve` / `skip`，`device_platform` 为计划平台，不返回设备标识。补全设备后的凭据仍受 64 KiB 限制；导入选项不能启用账号或触发上游操作。
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|

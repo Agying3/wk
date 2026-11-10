@@ -32,6 +32,7 @@ import GrowthTasksPage from './pages/GrowthTasks';
 import PromptGuardPage, { PromptGuardNotice } from './pages/PromptGuard';
 import RequestSummaryNotice from './components/RequestSummaryNotice';
 import { buildRequestQuery, hasRequestSummary, statisticsFromSummary } from './lib/requestStatistics';
+import { loadDashboardData } from './lib/dashboardLoad';
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text, Paragraph } = Typography;
@@ -167,14 +168,7 @@ function Console() {
     const range = buildRequestQuery({ windowKey: dashboardWindow }, { limit: 200 });
     const requestQuery = `/requests?${range.query}`;
     try {
-      const [status, modelList, requestList] = await Promise.all([
-        api('/status', { signal: controller.signal }),
-        api('/v1/models', { signal: controller.signal }),
-        api(requestQuery, { signal: controller.signal }).catch(error => {
-          if (error.name === 'AbortError') throw error;
-          return { data: [], summaryError: error };
-        }),
-      ]);
+      const [status, modelList, requestList] = await loadDashboardData(api, requestQuery, controller.signal);
       if (serial !== refreshSerial.current) return;
       setData(status);
       setModels(modelList.data || []);

@@ -43,3 +43,19 @@ func TestDeviceRecordValidation(t *testing.T) {
 		t.Fatal("legacy record is not a valid Windows device")
 	}
 }
+
+func TestMacProfileForIdentityPreservesNewAccountDerivation(t *testing.T) {
+	id, profile, err := NewMac()
+	if err != nil {
+		t.Fatal(err)
+	}
+	derived, err := MacProfileForIdentity(id)
+	if err != nil || derived != profile || derived.Validate() != nil {
+		t.Fatal("new and existing identity paths derive different Mac profiles")
+	}
+	for _, invalid := range []string{"", "short", "not-hex-00000000000000000000000000000"} {
+		if _, err := MacProfileForIdentity(invalid); err == nil {
+			t.Fatal("invalid identity accepted")
+		}
+	}
+}

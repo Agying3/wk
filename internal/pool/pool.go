@@ -805,14 +805,29 @@ func (p *Pool) Add(a *auth.Auth) {
 // AddDisabled installs a new imported account without a routable interval.
 // An existing account is never overwritten by an import.
 func (p *Pool) AddDisabled(a *auth.Auth, reason string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if _, exists := p.byUID[a.UID]; exists {
-		return false
-	}
-	p.byUID[a.UID] = &entry{a: a, disabled: true, reason: reason}
-	p.noteChangeLocked(a.UID)
-	return true
+	added, err := p.AddDisabledChecked(a, reason)
+	return added && err == nil
+}
+
+// AddDisabledChecked reports failures from the shared authority after unlocking
+// (which commits the transaction). If added is true and err is non-nil, the
+// commit outcome is uncertain: callers must retain the quarantined credential.
+// added=false with an error means no insertion was attempted.
+func (p *Pool) AddDisabledChecked(a *auth.Auth, reason string) (added bool, err error) {
+	func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.SharedError() != nil {
+			return
+		}
+		if _, exists := p.byUID[a.UID]; exists {
+			return
+		}
+		p.byUID[a.UID] = &entry{a: a, disabled: true, reason: reason}
+		p.noteChangeLocked(a.UID)
+		added = true
+	}()
+	return added, p.SharedError()
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。

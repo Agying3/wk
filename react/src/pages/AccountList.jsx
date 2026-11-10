@@ -1,16 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AccountSnapshots, CollectionLaunch, CollectionTag } from '../components/Collection';
-import { Alert, App, Button, Card, Checkbox, Descriptions, Drawer, Dropdown, Empty, Input, Modal, Progress, Select, Space, Table, Tag, Tooltip, Typography } from 'antd';
+import { Alert, App, Button, Card, Checkbox, Drawer, Dropdown, Empty, Input, Modal, Progress, Select, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import { ApartmentOutlined, DownloadOutlined, MoreOutlined, PlusOutlined, ReloadOutlined, SearchOutlined, SettingOutlined, UploadOutlined } from '@ant-design/icons';
 import { ACCOUNT_BATCH_CONCURRENCY, ACCOUNT_BATCH_SIZE, accountCSV, accountReason, accountState, deadline, downloadFile, filterAccounts, groupsOf, runAccountBatch, runLocalAccountBatch, stateColors, stateLabels, usesLocalAccountBatch } from '../lib/accountManagement';
 import AccountTransfer from '../components/AccountTransfer';
+import AccountDetails from '../components/AccountDetails';
 
 const { Text } = Typography;
 const EMPTY = {};
 const initialFilters = { search: '', status: 'all', region: 'all', group: 'all', expiry: 'all' };
 const labels = { enable: '启用', disable: '禁用', 'clear-cooldown': '清除冷却', checkin: '签到', keepalive: '保活', delete: '删除', groups: '调整分组' };
 const fmt = value => Number(value || 0).toLocaleString();
-const time = value => deadline(value) ? new Date(value).toLocaleString() : '—';
 function expiry(record) {
   const expires = Number(record.token_expires_at || 0) * 1000;
   const remaining = expires - Date.now();
@@ -35,6 +35,7 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
   const [groups, setGroups] = useState([]);
   const [groupsError, setGroupsError] = useState('');
   const [detailUID, setDetailUID] = useState(null);
+  const [detailRevision, setDetailRevision] = useState(0);
   const [columnsShown, setColumnsShown] = useState(['groups', 'credits', 'expiry', 'flight']);
   const [confirm, setConfirm] = useState(null);
   const [deleteText, setDeleteText] = useState('');
@@ -60,7 +61,7 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
   const summary = useMemo(() => { const result = { healthy: 0, cooling: 0, disabled: 0, model_cooling: 0, credits: 0 }; accounts.forEach(a => { result[accountState(a)]++; result.credits += Number(a.credits || 0); }); return result; }, [data.accounts]);
   const setFilter = (key, value) => { setFilters(current => ({ ...current, [key]: value })); setSelected([]); setPage(1); };
   const reset = () => { setFilters(initialFilters); setSelected([]); setPage(1); };
-  const reload = async () => { setRefreshing(true); try { await refresh(); } catch (e) { message.error(e.message); } finally { if (alive.current) setRefreshing(false); } };
+  const reload = async () => { setRefreshing(true); try { await refresh(); } catch (e) { message.error(e.message); } finally { if (alive.current) { setRefreshing(false); setDetailRevision(value => value + 1); } } };
   const ask = (action, uids = selected) => { if (!uids.length || active.current) return; setDeleteText(''); setTargetGroups([]); setGroupMode('replace'); setConfirm({ action, uids: [...uids] }); };
   const execute = async operation => {
     if (active.current) return;
@@ -129,13 +130,11 @@ export default function AccountList({ api, data, refresh, refreshCredits, credit
       <div className="account-target-preview">{confirm?.uids.slice(0, 8).map(uid => <div key={uid}>{byUID.get(uid)?.nickname || '未命名'} · {uid}</div>)}{confirm?.uids.length > 8 && <div>以及另外 {confirm.uids.length - 8} 个账号</div>}</div>
     </Modal>
     <Drawer title="账号详情" open={!!detailUID} onClose={() => setDetailUID(null)} width={600} rootClassName="account-drawer">
-      {detail ? <><Descriptions column={1} bordered size="small" items={[
-        ['昵称', detail.nickname || '未命名'], ['UID', <Text copyable>{detail.uid}</Text>], ['区域', detail.region === 'global' ? '海外版' : '中国区'], ['状态', stateLabels[accountState(detail)]], ['分组', groupsOf(mapping, detail.uid).join('、')], ['原因', detail.reason || '—'], ['剩余积分', fmt(detail.credits)], ['周期积分', `${fmt(detail.cycle_capacity_used)} / ${fmt(detail.cycle_capacity_size)}`], ['累计积分', `${fmt(detail.capacity_used)} / ${fmt(detail.capacity_size)}`], ['积分更新时间', detail.credit_updated_at ? new Date(detail.credit_updated_at * 1000).toLocaleString() : '—'], ['凭证到期', detail.token_expires_at ? new Date(detail.token_expires_at * 1000).toLocaleString() : '未知'], ['冷却截止', time(detail.until)], ['熔断截止', time(detail.breaker_until)], ['鉴权恢复截止', time(detail.auth_until)], ['模型限流', Object.entries(detail.model_cooldowns || {}).map(([model, limit]) => `${model}：${limit.reason || '限流'}；${time(limit.until)}`).join('\n') || '—'], ['成功 / 错误', `${fmt(detail.success_count)} / ${fmt(detail.err_total)}`], ['在途请求', detail.in_flight || 0], ['最近成功', time(detail.last_success)], ['最近错误', time(detail.last_err)],
-      ].map(([label, children]) => ({ key: label, label, children }))} /><AccountSnapshots api={api} uid={detail.uid} /><Space wrap style={{ marginTop: 20 }}><CollectionLaunch api={api} uids={[detail.uid]} title={detail.nickname || detail.uid} onComplete={reload} /><Button disabled={running} onClick={() => ask(detail.disabled ? 'enable' : 'disable', [detail.uid])}>{detail.disabled ? '启用账号' : '禁用账号'}</Button><Button disabled={running} onClick={() => setTransfer({ mode: 'export', uids: [detail.uid] })}>加密导出</Button><Button danger disabled={running} onClick={() => ask('delete', [detail.uid])}>删除</Button></Space></> : <Empty description="账号已不在当前列表中" />}
+      {detail ? <><AccountDetails key={detail.uid} api={api} uid={detail.uid} account={detail} groups={groupsOf(mapping, detail.uid)} refreshKey={detailRevision} /><AccountSnapshots api={api} uid={detail.uid} /><Space wrap style={{ marginTop: 20 }}><CollectionLaunch api={api} uids={[detail.uid]} title={detail.nickname || detail.uid} onComplete={reload} /><Button disabled={running} onClick={() => ask(detail.disabled ? 'enable' : 'disable', [detail.uid])}>{detail.disabled ? '启用账号' : '禁用账号'}</Button><Button disabled={running} onClick={() => setTransfer({ mode: 'export', uids: [detail.uid] })}>加密导出</Button><Button danger disabled={running} onClick={() => ask('delete', [detail.uid])}>删除</Button></Space></> : <Empty description="账号已不在当前列表中" />}
     </Drawer>
     <Drawer title={`${labels[job?.operation.action] || ''}操作结果`} open={jobOpen} onClose={() => setJobOpen(false)} width={720} rootClassName="account-drawer">
       {job && <><Alert type="info" message="离开账号管理页会停止后续操作，已发送的请求仍会完成。不会自动重放失败请求。" /><Progress percent={Math.round(job.rows.length * 100 / job.total)} status={running ? 'active' : count('failed') ? 'exception' : 'normal'} /><Space wrap style={{ marginBottom: 16 }}><Tag color="green">成功 {count('success')}</Tag><Tag color="red">失败 {count('failed')}</Tag><Tag>未执行 {count('cancelled')}</Tag>{running ? <Button onClick={() => { if (active.current) active.current.cancelled = true; }}>取消后续操作</Button> : <>{[['failed', '重试失败项'], ['cancelled', '继续未执行项']].map(([status, label]) => <Button key={status} disabled={!count(status)} onClick={() => ask(job.operation.action, job.rows.filter(r => r.status === status).map(r => r.uid))}>{label}</Button>)}</>}</Space><Table rowKey="uid" size="small" dataSource={job.rows} pagination={{ pageSize: 25, showSizeChanger: false }} columns={[{ title: 'UID', dataIndex: 'uid' }, { title: '结果', dataIndex: 'status', width: 85, render: s => <Tag color={s === 'success' ? 'green' : s === 'failed' ? 'red' : undefined}>{s === 'success' ? '成功' : s === 'failed' ? '失败' : '未执行'}</Tag> }, { title: '详情', dataIndex: 'detail' }]} /></>}
     </Drawer>
-    {transfer && <AccountTransfer api={api} mode={transfer.mode} uids={transfer.uids} onClose={() => setTransfer(null)} onImported={reload} />}
+    {transfer && <AccountTransfer api={api} mode={transfer.mode} uids={transfer.uids} groups={groups} groupsError={groupsError} onClose={() => setTransfer(null)} onImported={reload} />}
   </div>;
 }

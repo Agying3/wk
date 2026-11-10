@@ -150,14 +150,23 @@ func (s *balanceSummary) freeOnly() bool {
 	return true
 }
 
-func (c *Client) UserResourceDetailsContext(ctx context.Context, a *auth.Auth) (ResourceUsage, error) {
+func (c *Client) UserResourceDetailsContext(ctx context.Context, a *auth.Auth) (usage ResourceUsage, err error) {
 	a = authFromCredentials(a.Snapshot())
+	trace := &balanceTrace{}
+	ctx = context.WithValue(ctx, balanceTraceKey{}, trace)
+	defer func() {
+		if err != nil {
+			noteBalanceFailure(ctx, "final", "result", err)
+			trace.logFailure(a.UID)
+		}
+	}()
 	// The new package contract is researched for personal billing only.
 	if a.EnterpriseID != "" {
 		return c.legacyResourceDetails(ctx, a)
 	}
-	usage, err := c.personalResourceDetails(ctx, a)
+	usage, err = c.personalResourceDetails(ctx, a)
 	if err != nil && legacyReadAllowed(ctx, err) {
+		noteBalanceFailure(ctx, "personal", "before_legacy_fallback", err)
 		return c.legacyResourceDetails(ctx, a)
 	}
 	return usage, err
@@ -181,8 +190,12 @@ func (c *Client) personalResourceDetails(ctx context.Context, a *auth.Auth) (Res
 	var summary *balanceSummary
 	if summaryErr == nil {
 		var parsed balanceSummary
-		if json.Unmarshal(data, &parsed) == nil && parsed.Packages != nil {
+		if parseErr := json.Unmarshal(data, &parsed); parseErr != nil {
+			noteBalanceFailure(ctx, "summary", "decode", parseErr)
+		} else if parsed.Packages != nil {
 			summary = &parsed
+		} else {
+			noteBalanceFailure(ctx, "summary", "packages_missing_or_null", errReadSchema)
 		}
 	} else {
 		var e *Error
@@ -275,12 +288,18 @@ func (c *Client) resourcePages(ctx context.Context, a *auth.Auth, path string) (
 			Accounts []resourcePackage `json:"Accounts"`
 			Total    *int              `json:"TotalCount"`
 		}
-		if json.Unmarshal(data, &response) != nil || response.Accounts == nil {
+		if parseErr := json.Unmarshal(data, &response); parseErr != nil {
+			noteBalanceFailure(ctx, balanceStage(path), "decode", parseErr)
+			return nil, fmt.Errorf("resource packages: %w", errReadSchema)
+		}
+		if response.Accounts == nil {
+			noteBalanceFailure(ctx, balanceStage(path), "accounts_missing_or_null", errReadSchema)
 			return nil, fmt.Errorf("resource packages: %w", errReadSchema)
 		}
 		all = append(all, response.Accounts...)
 		if response.Total != nil {
 			if *response.Total < 0 || (len(response.Accounts) == 0 && len(all) < *response.Total) {
+				noteBalanceFailure(ctx, balanceStage(path), "incomplete_page", errReadSchema)
 				return nil, fmt.Errorf("incomplete resource package page")
 			}
 			if len(all) >= *response.Total {
@@ -290,6 +309,7 @@ func (c *Client) resourcePages(ctx context.Context, a *auth.Auth, path string) (
 			return all, nil
 		}
 	}
+	noteBalanceFailure(ctx, balanceStage(path), "pagination_limit", errReadSchema)
 	return nil, fmt.Errorf("resource packages exceed pagination limit")
 }
 

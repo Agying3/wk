@@ -440,10 +440,12 @@ func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error
 func doJSONWithClient(cli *http.Client, req *http.Request) (json.RawMessage, error) {
 	resp, err := doUpstream(cli, req)
 	if err != nil {
+		observeBalanceRead(req, nil, nil, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := readControlBody(resp.Body)
+	observeBalanceRead(req, resp, raw, err)
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +455,7 @@ func doJSONWithClient(cli *http.Client, req *http.Request) (json.RawMessage, err
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
+		noteBalanceFailure(req.Context(), balanceStage(req.URL.Path), "envelope", err)
 		return nil, fmt.Errorf("parse failed: %w", err)
 	}
 	if env.Code != 0 {
@@ -924,9 +927,11 @@ func (c *Client) legacyResourceDetails(ctx context.Context, a *auth.Auth) (Resou
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
+		noteBalanceFailure(ctx, "legacy", "decode", err)
 		return ResourceUsage{}, fmt.Errorf("resource parse: %w", err)
 	}
 	if resp.Response.Data.Accounts == nil {
+		noteBalanceFailure(ctx, "legacy", "accounts_missing_or_null", errReadSchema)
 		return ResourceUsage{}, fmt.Errorf("resource response missing Accounts")
 	}
 	usage := ResourceUsage{}

@@ -445,6 +445,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	h.mux.HandleFunc("POST /admin/unlock", h.unlock)
 	h.mux.HandleFunc("GET /admin/config", h.withFrontend(h.adminConfig))
+	// Console metadata has its own admin-only route. Public model APIs may be
+	// disabled at the ingress without preventing the console from loading.
+	h.mux.HandleFunc("GET /admin/models", h.withFrontend(h.models))
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
 	h.mux.HandleFunc("GET /admin/request-capture", h.withFrontend(h.requestCaptureAPI))
 	h.mux.HandleFunc("GET /admin/request-capture/{id}", h.withFrontend(h.requestCaptureAPI))
@@ -469,6 +472,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/checkin", h.withFrontend(h.runCheckin))
 	h.mux.HandleFunc("POST /admin/credits/refresh", h.withFrontend(h.refreshCredits))
 	h.mux.HandleFunc("POST /admin/account/url", h.withFrontend(h.accountURL))
+	h.mux.HandleFunc("GET /admin/account/{uid}/details", h.withFrontend(h.accountDetails))
 	h.mux.HandleFunc("POST /admin/account/poll", h.withFrontend(h.accountPoll))
 	// 短信直登：发码 + 验码落盘，省掉浏览器授权。
 	h.mux.HandleFunc("POST /admin/account/sms/send", h.withFrontend(h.accountSMSSend))
@@ -3675,6 +3679,9 @@ func (h *Handler) promoteMixedRegionIfNeeded(loginRegion string) error {
 func (h *Handler) promoteMixedRegion() error {
 	h.configMu.Lock()
 	defer h.configMu.Unlock()
+	if strings.EqualFold(strings.TrimSpace(h.cfg.Region), "all") {
+		return nil
+	}
 	if h.cfg.ConfigPath == "" {
 		h.cfg.Region = "all"
 		return nil

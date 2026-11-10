@@ -23,6 +23,8 @@ const accountTransferLimit = 1000
 const accountTransferBytes = 16 << 20
 const accountTransferFormat = "workbuddy2api-accounts"
 const accountTransferRounds = 600000
+const accountCredentialBytes = 64 << 10
+const accountTransferPlainBytes = 10 << 20
 
 type accountTransferBundle struct {
 	Format     string `json:"format"`
@@ -41,9 +43,14 @@ type accountTransferDocument struct {
 	Accounts  []transferredAccount `json:"accounts"`
 }
 type accountImportRequest struct {
-	Bundle   accountTransferBundle `json:"bundle"`
-	Password string                `json:"password"`
-	UIDs     []string              `json:"uids"`
+	Bundle         accountTransferBundle `json:"bundle"`
+	Credential     json.RawMessage       `json:"credential,omitempty"`
+	CredentialJSON string                `json:"credential_json,omitempty"`
+	Password       string                `json:"password"`
+	UIDs           []string              `json:"uids"`
+	GroupMode      string                `json:"group_mode,omitempty"`
+	Groups         []string              `json:"groups,omitempty"`
+	Nickname       string                `json:"nickname,omitempty"`
 }
 type accountImportRow struct {
 	UID            string   `json:"uid"`
@@ -53,6 +60,8 @@ type accountImportRow struct {
 	SourceDisabled bool     `json:"source_disabled"`
 	Groups         []string `json:"groups"`
 	Issue          string   `json:"issue,omitempty"`
+	DeviceAction   string   `json:"device_action"`
+	DevicePlatform string   `json:"device_platform"`
 }
 
 func transferError(w http.ResponseWriter, status int, message string) {
@@ -112,7 +121,7 @@ func sealAccounts(doc accountTransferDocument, password string) (accountTransfer
 	if err != nil {
 		return b, err
 	}
-	if len(raw) > 10<<20 {
+	if len(raw) > accountTransferPlainBytes {
 		return b, errors.New("迁移内容过大")
 	}
 	aead, err := accountTransferCipher(password, b.Salt)
@@ -124,7 +133,7 @@ func sealAccounts(doc accountTransferDocument, password string) (accountTransfer
 }
 func openAccounts(b accountTransferBundle, password string) (accountTransferDocument, error) {
 	var doc accountTransferDocument
-	if !transferPasswordOK(password) || b.Format != accountTransferFormat || b.Version != 1 || len(b.Salt) != 16 || len(b.Nonce) != 12 || len(b.Ciphertext) < 16 || len(b.Ciphertext) > 10<<20 {
+	if !transferPasswordOK(password) || b.Format != accountTransferFormat || b.Version != 1 || len(b.Salt) != 16 || len(b.Nonce) != 12 || len(b.Ciphertext) < 16 || len(b.Ciphertext) > accountTransferPlainBytes+16 {
 		return doc, errors.New("迁移文件格式或密码无效")
 	}
 	aead, err := accountTransferCipher(password, b.Salt)
@@ -135,26 +144,67 @@ func openAccounts(b accountTransferBundle, password string) (accountTransferDocu
 	if err != nil {
 		return doc, errors.New("密码错误或迁移文件已损坏")
 	}
-	if json.Unmarshal(raw, &doc) != nil || len(doc.Accounts) == 0 || len(doc.Accounts) > accountTransferLimit {
-		return doc, errors.New("迁移文件账号数量无效")
+	if json.Unmarshal(raw, &doc) != nil {
+		return doc, errors.New("迁移文件内容无效")
+	}
+	return doc, validateTransferDocument(doc)
+}
+
+// Both export and import use the same limits. Group memberships are bounded by
+// the document size, rather than an import-only per-account group limit.
+func validateTransferDocument(doc accountTransferDocument) error {
+	if len(doc.Accounts) == 0 || len(doc.Accounts) > accountTransferLimit {
+		return errors.New("迁移文件账号数量无效")
 	}
 	seen := map[string]bool{}
 	for _, item := range doc.Accounts {
+		if len(item.Credential) > accountCredentialBytes {
+			return errors.New("单个账号凭据超过 64 KiB，请缩小后重试")
+		}
 		a, err := auth.Parse(item.Credential)
-		if err != nil || a == nil || !validTransferUID(a.UID) || len(item.Credential) > 64<<10 || len(item.Groups) > 100 {
-			return doc, errors.New("迁移文件包含无效账号")
+		if err != nil || a == nil || !validTransferUID(a.UID) {
+			return errors.New("迁移文件包含无效账号")
 		}
 		if seen[a.UID] {
-			return doc, errors.New("迁移文件包含重复 UID")
+			return errors.New("迁移文件包含重复 UID")
 		}
 		seen[a.UID] = true
 	}
-	return doc, nil
+	return nil
+}
+
+func openAccountImport(req accountImportRequest) (accountTransferDocument, error) {
+	if req.CredentialJSON != "" {
+		if len(req.Credential) != 0 {
+			return accountTransferDocument{}, errors.New("请只提供一种原始凭据格式")
+		}
+		req.Credential = json.RawMessage(req.CredentialJSON)
+	}
+	if len(req.Credential) == 0 {
+		return openAccounts(req.Bundle, req.Password)
+	}
+	b := req.Bundle
+	if b.Format != "" || b.Version != 0 || len(b.Salt) != 0 || len(b.Nonce) != 0 || len(b.Ciphertext) != 0 {
+		return accountTransferDocument{}, errors.New("请只提供账号凭据或加密迁移文件中的一种")
+	}
+	var obj map[string]json.RawMessage
+	var token, account map[string]json.RawMessage
+	if len(req.Credential) > accountCredentialBytes || json.Unmarshal(req.Credential, &obj) != nil ||
+		json.Unmarshal(obj["auth"], &token) != nil || len(token) == 0 ||
+		json.Unmarshal(obj["account"], &account) != nil || len(account) == 0 {
+		return accountTransferDocument{}, errors.New("账号文件须为 auth + account JSON，且不超过 64 KiB")
+	}
+	doc := accountTransferDocument{Accounts: []transferredAccount{{Credential: req.Credential, Groups: []string{"default"}}}}
+	return doc, validateTransferDocument(doc)
 }
 func (h *Handler) beginAccountTransfer(w http.ResponseWriter) bool {
 	w.Header().Set("Cache-Control", "no-store")
 	if h.cfg.Pool == nil {
 		transferError(w, 503, "账号池未启用")
+		return false
+	}
+	if h.cfg.Pool.SharedError() != nil {
+		transferError(w, 503, "账号池存储不可用，请恢复后重新预览")
 		return false
 	}
 	if !h.accountTransferMu.TryLock() {
@@ -211,6 +261,14 @@ func (h *Handler) exportAccounts(w http.ResponseWriter, r *http.Request) {
 		doc.Accounts = append(doc.Accounts, transferredAccount{Credential: raw, Groups: gs, Disabled: st.Disabled})
 	}
 	h.accountAdminMu.Unlock()
+	if h.cfg.Pool.SharedError() != nil {
+		transferError(w, 503, "账号池存储不可用，未生成迁移文件")
+		return
+	}
+	if err := validateTransferDocument(doc); err != nil {
+		transferError(w, 400, err.Error())
+		return
+	}
 	bundle, err := sealAccounts(doc, req.Password)
 	if err != nil {
 		transferError(w, 500, "生成迁移文件失败，可能包含过多账号")
@@ -224,20 +282,18 @@ func (h *Handler) importGroups(a *auth.Auth, source []string) []string {
 	}
 	out := []string{}
 	seen := map[string]bool{}
+	compatible := map[string]bool{}
+	for _, g := range h.cfg.Groups.ListDetailed() {
+		compatible[g.Name] = g.Region == "all" || g.Region == a.Region()
+	}
 	for _, name := range source {
-		for _, g := range h.cfg.Groups.ListDetailed() {
-			if g.Name == name && (g.Region == "all" || g.Region == a.Region()) && !seen[name] {
-				out = append(out, name)
-				seen[name] = true
-			}
+		if compatible[name] && !seen[name] {
+			out = append(out, name)
+			seen[name] = true
 		}
 	}
-	if len(out) == 0 {
-		for _, g := range h.cfg.Groups.ListDetailed() {
-			if g.Name == "default" && (g.Region == "all" || g.Region == a.Region()) {
-				out = []string{"default"}
-			}
-		}
+	if len(out) == 0 && compatible["default"] {
+		out = []string{"default"}
 	}
 	return out
 }
@@ -267,8 +323,12 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 		transferError(w, 503, "未配置账号存储目录")
 		return
 	}
-	doc, err := openAccounts(req.Bundle, req.Password)
+	doc, err := openAccountImport(req)
 	if err != nil {
+		transferError(w, 400, err.Error())
+		return
+	}
+	if err := normalizeImportOptions(&req, &doc); err != nil {
 		transferError(w, 400, err.Error())
 		return
 	}
@@ -279,11 +339,19 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 	for _, item := range doc.Accounts {
 		a, _ := auth.Parse(item.Credential)
 		items[a.UID] = item
-		row := accountImportRow{UID: a.UID, Nickname: a.Nickname, Region: a.Region(), Exists: h.importAccountExists(a.UID), SourceDisabled: item.Disabled, Groups: h.importGroups(a, item.Groups)}
-		if len(row.Groups) == 0 {
-			row.Issue = "无兼容目标分组，请先配置 default 区域或来源同名分组"
+		row := accountImportRow{UID: a.UID, Nickname: a.Nickname, Region: a.Region(), Exists: h.importAccountExists(a.UID), SourceDisabled: item.Disabled, DeviceAction: "preserve", DevicePlatform: a.DeviceProfile.Platform}
+		row.Groups, row.Issue = h.resolveImportGroups(a, item.Groups, req)
+		if a.DeviceProfile.Version == 0 {
+			row.DeviceAction, row.DevicePlatform = "generate_mac", "macos"
+		}
+		if row.Exists {
+			row.DeviceAction = "skip"
 		}
 		rows = append(rows, row)
+	}
+	if h.cfg.Pool.SharedError() != nil {
+		transferError(w, 503, "账号池存储不可用，请恢复后重新预览")
+		return
 	}
 	if preview {
 		writeJSON(w, 200, map[string]any{"accounts": rows, "count": len(rows), "created_at": doc.CreatedAt})
@@ -304,19 +372,38 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 		transferError(w, 500, "无法访问账号存储目录")
 		return
 	}
-	// Persist mixed-region support before creating any credentials.
-	if err := h.promoteMixedRegion(); err != nil {
-		transferError(w, 500, "无法保存混合区域配置，尚未导入账号")
-		return
+	// Only change region for new, compatible accounts from another region.
+	for _, row := range rows {
+		if row.Exists || row.Issue != "" {
+			continue
+		}
+		selected := false
+		for _, uid := range uids {
+			selected = selected || uid == row.UID
+		}
+		if selected {
+			if err := h.promoteMixedRegionIfNeeded(row.Region); err != nil {
+				transferError(w, 500, "无法保存混合区域配置，尚未导入账号")
+				return
+			}
+		}
 	}
 	results := []map[string]any{}
 	success := 0
 	skipped := 0
+	stop := false
 	for _, uid := range uids {
-		if r.Context().Err() != nil {
-			break
+		if stop || r.Context().Err() != nil {
+			results = append(results, map[string]any{"uid": uid, "ok": false, "detail": "导入已中止，此账号未处理，请重新预览"})
+			continue
 		}
-		if h.importAccountExists(uid) {
+		exists := h.importAccountExists(uid)
+		if h.cfg.Pool.SharedError() != nil {
+			results = append(results, map[string]any{"uid": uid, "ok": false, "detail": "账号池存储不可用，此账号未导入"})
+			stop = true
+			continue
+		}
+		if exists {
 			results = append(results, map[string]any{"uid": uid, "ok": false, "skipped": true, "detail": "目标已有该账号或授权文件，未覆盖"})
 			skipped++
 			continue
@@ -324,41 +411,72 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 		item := items[uid]
 		a, _ := auth.Parse(item.Credential)
 		path := filepath.Join(h.cfg.AuthDir, "workbuddy-"+uid+".json")
-		if len(h.importGroups(a, item.Groups)) == 0 {
-			results = append(results, map[string]any{"uid": uid, "ok": false, "detail": "目标没有区域兼容的分组，未导入"})
+		targetGroups, groupIssue := h.resolveImportGroups(a, item.Groups, req)
+		if groupIssue != "" {
+			results = append(results, map[string]any{"uid": uid, "ok": false, "detail": groupIssue})
 			continue
 		}
 		// The marker is in the same atomic file as the credential, so a crash
 		// before Pool.Flush cannot activate an imported account on restart.
-		var credentialDoc map[string]any
-		json.Unmarshal(item.Credential, &credentialDoc)
-		credentialDoc["_import_disabled"] = true
-		credentialRaw, _ := json.Marshal(credentialDoc)
+		a, credentialRaw, err := prepareImportedCredential(item.Credential)
+		if err != nil {
+			results = append(results, map[string]any{"uid": uid, "ok": false, "detail": err.Error()})
+			continue
+		}
+		written := false
 		if err := auth.WithCredentialWrite(r.Context(), path, func() error {
-			return writeNewAccountFile(path, credentialRaw)
+			if err := writeNewAccountFile(path, credentialRaw); err != nil {
+				return err
+			}
+			written = true
+			return nil
 		}); err != nil {
-			results = append(results, map[string]any{"uid": uid, "ok": false, "detail": "写入授权文件失败，未导入"})
+			detail := "写入授权文件失败，未导入"
+			if written {
+				detail = "授权存储提交未确认，已保留停用凭据；请恢复存储后核对账号及授权文件"
+				stop = true
+			}
+			results = append(results, map[string]any{"uid": uid, "ok": false, "pending": written, "detail": detail})
 			continue
 		}
 		a.FilePath = path
 		a.ImportDisabled = true
-		if !h.cfg.Pool.AddDisabled(a, "imported; awaiting administrator enable") {
+		added, addErr := h.cfg.Pool.AddDisabledChecked(a, "imported; awaiting administrator enable")
+		if !added {
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = auth.WithCredentialWrite(cleanupCtx, path, func() error {
+			cleanupErr := auth.WithCredentialWrite(cleanupCtx, path, func() error {
 				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 					return err
 				}
 				return nil
 			})
 			cleanupCancel()
+			if addErr != nil || cleanupErr != nil {
+				detail := "账号池存储不可用，未加入账号池"
+				if cleanupErr != nil {
+					detail += "；停用凭据清理未确认，请核对授权文件"
+				}
+				results = append(results, map[string]any{"uid": uid, "ok": false, "pending": cleanupErr != nil, "detail": detail})
+				stop = true
+				continue
+			}
 			results = append(results, map[string]any{"uid": uid, "ok": false, "skipped": true, "detail": "账号已存在，未覆盖"})
 			skipped++
 			continue
 		}
+		if addErr != nil {
+			// A failed shared commit can have an ambiguous outcome. Never remove
+			// the only credential for an account that may have been committed.
+			results = append(results, map[string]any{"uid": uid, "ok": false, "pending": true, "detail": "账号池提交未确认，已保留停用凭据；请恢复存储后核对账号及授权文件"})
+			stop = true
+			continue
+		}
 		detail := "已导入并停用，核对后可手动启用"
 		if h.cfg.Groups != nil {
-			if err := h.setAccountGroupsChecked(uid, h.importGroups(a, item.Groups)); err != nil {
-				detail += "；分组保存失败，请手动设置"
+			if err := h.setAccountGroupsChecked(uid, targetGroups); err != nil {
+				results = append(results, map[string]any{"uid": uid, "ok": false, "pending": true, "detail": "账号已导入并停用，但分组保存失败，请核对分组后再启用"})
+				stop = true
+				continue
 			}
 		}
 		success++
@@ -367,9 +485,18 @@ func (h *Handler) handleAccountImport(w http.ResponseWriter, r *http.Request, pr
 		}
 		results = append(results, map[string]any{"uid": uid, "ok": true, "detail": detail})
 	}
-	h.cfg.Pool.Flush()
+	if err := h.cfg.Pool.FlushWithError(); err != nil {
+		stop = true
+		for _, row := range results {
+			if row["ok"] == true {
+				row["ok"], row["pending"] = false, true
+				row["detail"] = "账号池持久化未确认，凭据保持停用标记；请恢复存储后核对账号及授权文件"
+			}
+		}
+		success = 0
+	}
 	invalidateDynamicModelsCache()
-	writeJSON(w, 200, map[string]any{"ok": success == len(uids), "success": success, "skipped": skipped, "results": results})
+	writeJSON(w, 200, map[string]any{"ok": success == len(uids), "success": success, "skipped": skipped, "stop": stop, "results": results})
 }
 
 // Link a fully synced temporary file into place without overwriting any target.
