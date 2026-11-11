@@ -88,6 +88,28 @@ test('Responses stream retains output and usage but requires a valid completed e
   }
 });
 
+test('Responses reads native reasoning_text deltas and final reasoning without duplicating summaries', () => {
+  const stream = createPlaygroundStream('responses');
+  stream.frame(frame({ type: 'response.reasoning_text.delta', delta: '先思考' }));
+  assert.equal(stream.snapshot().reasoning, '先思考');
+  stream.frame(frame({ type: 'response.output_text.delta', delta: '答案' }));
+  stream.frame(frame({ type: 'response.completed', response: { status: 'completed', output: [
+    { type: 'reasoning', content: [{ type: 'reasoning_text', text: '完整思考' }], summary: [{ type: 'summary_text', text: '完整思考' }] },
+    { type: 'message', content: [{ type: 'output_text', text: '答案' }] },
+  ] } }));
+  assert.equal(stream.finish().reasoning, '完整思考');
+  assert.equal(stream.finish().text, '答案');
+  assert.equal(stream.finish().state, 'completed');
+});
+
+test('Responses nonstream reads summary-only reasoning and caps reasoning output', () => {
+  const parsed = parsePlaygroundJSON({ status: 'completed', output: [{ type: 'reasoning', summary: [{ type: 'summary_text', text: '摘要' }] }] }, 'responses');
+  assert.equal(parsed.reasoning, '摘要');
+  const large = parsePlaygroundJSON({ status: 'completed', output: [{ type: 'reasoning', content: [{ type: 'reasoning_text', text: 'x'.repeat(PLAYGROUND_TEXT_LIMIT + 1) }] }] }, 'responses');
+  assert.equal(large.reasoning.length, PLAYGROUND_TEXT_LIMIT);
+  assert.equal(large.truncated, true);
+});
+
 test('SSE response.failed, response.incomplete, error events and malformed JSON never become successful', () => {
   const failed = createPlaygroundStream('responses');
   failed.frame(frame({ type: 'response.output_text.delta', delta: 'partial' }));

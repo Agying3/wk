@@ -92,6 +92,10 @@ export function parsePlaygroundJSON(body, protocol) {
   if (body?.error) return { ...base, error: parsePlaygroundError(body, 200) };
   if (protocol === 'responses') {
     base.text = responseText(body);
+    base.reasoning = (body?.output || []).filter(item => item.type === 'reasoning').map(item => {
+      const content = (item.content || []).filter(part => part.type === 'reasoning_text').map(part => string(part.text)).join('');
+      return content || (item.summary || []).filter(part => part.type === 'summary_text').map(part => string(part.text)).join('');
+    }).join('\n');
     if (body?.status === 'completed') base.state = 'completed';
     else if (body?.status === 'incomplete') { base.state = 'incomplete'; base.error = incompleteError(`响应未完成：${string(body?.incomplete_details?.reason) || '原因未提供'}`); }
     else base.error = incompleteError(`响应未完成，status=${string(body?.status) || '缺失'}`, 'missing_completion');
@@ -172,10 +176,10 @@ export function createPlaygroundStream(protocol) {
       }
       if (protocol === 'responses') {
         if (type === 'response.output_text.delta') append('text', body.delta);
-        if (type === 'response.reasoning_summary_text.delta') append('reasoning', body.delta);
+        if (type === 'response.reasoning_text.delta' || type === 'response.reasoning_summary_text.delta') append('reasoning', body.delta);
         if (type === 'response.completed' || type === 'response.incomplete') {
           const final = parsePlaygroundJSON({ ...body.response, status: type === 'response.incomplete' ? 'incomplete' : body.response?.status }, protocol);
-          state = { ...state, ...final, text: final.text || state.text, reasoning: state.reasoning, usage: final.usage || state.usage, truncated: state.truncated || final.truncated }; done = true;
+          state = { ...state, ...final, text: final.text || state.text, reasoning: final.reasoning || state.reasoning, usage: final.usage || state.usage, truncated: state.truncated || final.truncated }; done = true;
         }
       } else {
         const choice = body?.choices?.find(item => item.index === 0 || item.index === undefined);
