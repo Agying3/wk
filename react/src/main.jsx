@@ -27,6 +27,7 @@ import TrafficStatistics from './pages/TrafficStatistics';
 import AccountSettingsPage from './pages/AccountSettings';
 import AccountListPage from './pages/AccountList';
 import CollectionCenter from './pages/CollectionCenter';
+import PlaygroundPage from './pages/Playground';
 import { CollectionNotice } from './components/Collection';
 import GrowthTasksPage from './pages/GrowthTasks';
 import PromptGuardPage, { PromptGuardNotice } from './pages/PromptGuard';
@@ -115,12 +116,6 @@ function Console() {
     checkin_hours: [9, 21], keepalive_hours: [22], region: 'cn',
     features: null, billing: null, upstream: null, max_request_body: null,
   });
-  const [selectedModel, setSelectedModel] = useState('');
-  const [promptText, setPromptText] = useState('你好，请简短介绍一下你自己。');
-  const [answer, setAnswer] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [stream, setStream] = useState(true);
-  const [requestInfo, setRequestInfo] = useState(null);
   const [metricSamples, setMetricSamples] = useState([]);
   const [creditRefreshing, setCreditRefreshing] = useState(false);
   const [checkinRunning, setCheckinRunning] = useState(false);
@@ -128,8 +123,6 @@ function Console() {
   // accountRegionFilter 已随账号列表拆到 #/pool 独立页面 AccountList。）
   const refreshController = useRef(null);
   const refreshSerial = useRef(0);
-  const requestController = useRef(null);
-  const requestSerial = useRef(0);
 
   const headers = useMemo(() => (apiKey ? { Authorization: `Bearer ${apiKey}` } : {}), [apiKey]);
   const api = useCallback(async (path, options = {}) => {
@@ -179,7 +172,6 @@ function Console() {
       setDashboardError(summary ? null : requestList.summaryError?.message || '当前服务未提供该窗口的汇总，统计暂不可用。');
       setDashboardUntil(summary ? range.until : null);
       setDashboardLoading(false);
-      setSelectedModel(current => current || modelList.data?.[0]?.id || '');
       const stats = statisticsFromSummary(summary);
       if (stats) {
         setMetricSamples(current => [...current, { at: Date.now(), cacheRate: stats.cacheRate,
@@ -274,7 +266,6 @@ function Console() {
 
   useEffect(() => () => {
     refreshController.current?.abort();
-    requestController.current?.abort();
   }, []);
 
   const unlock = async () => {
@@ -554,95 +545,6 @@ function Console() {
     }
   };
 
-  const send = async () => {
-    const serial = ++requestSerial.current;
-    requestController.current?.abort();
-    const controller = new AbortController();
-    requestController.current = controller;
-    const startedAt = performance.now();
-    let firstTokenAt = 0;
-    setLoading(true);
-    setAnswer('');
-    setRequestInfo({ state: 'running', duration: 0, ttft: 0, usage: null });
-    try {
-      const response = await fetch('/v1/responses', {
-        method: 'POST', signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', ...headers },
-        body: JSON.stringify({ model: selectedModel, input: promptText, stream }),
-      });
-      if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({}));
-        const error = Error(errorBody?.error?.message || errorBody?.error || `请求失败 (${response.status})`);
-        // 会话/密钥失效：Playground 请求 401 时同样要弹解锁框，
-        // 否则用户只看到失败文案，不知道需要重新鉴权。
-        if (response.status === 401) setLocked(true);
-        throw error;
-      }
-      let finalResponse = null;
-      if (!stream) {
-        finalResponse = await response.json();
-        setAnswer(finalResponse.output_text || JSON.stringify(finalResponse, null, 2));
-      } else {
-        const reader = response.body?.getReader();
-        if (!reader) throw Error('浏览器不支持流式响应');
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let finished = false;
-        while (!finished) {
-          const chunk = await reader.read();
-          finished = chunk.done;
-          buffer += decoder.decode(chunk.value || new Uint8Array(), { stream: !finished });
-          const frames = buffer.split('\n\n');
-          buffer = frames.pop() || '';
-          for (const frame of frames) {
-            const payload = frame.split('\n')
-              .filter(line => line.startsWith('data:'))
-              .map(line => line.slice(5).trim())
-              .join('\n');
-            if (!payload || payload === '[DONE]') continue;
-            let event;
-            try { event = JSON.parse(payload); } catch { continue; }
-            if (event.type === 'response.output_text.delta' && event.delta) {
-              if (!firstTokenAt) firstTokenAt = performance.now();
-              setAnswer(current => current + event.delta);
-            }
-            if (event.type === 'response.completed' || event.type === 'response.incomplete') {
-              finalResponse = event.response;
-              if (!firstTokenAt && finalResponse?.output_text) firstTokenAt = performance.now();
-              if (finalResponse?.output_text) {
-                setAnswer(finalResponse.output_text);
-              } else if (finalResponse?.output) {
-                setAnswer(JSON.stringify(finalResponse.output, null, 2));
-              }
-            }
-            if (event.type === 'response.failed') {
-              throw Error(event.response?.error?.message || '上游响应失败');
-            }
-          }
-        }
-      }
-      if (serial !== requestSerial.current) return;
-      setRequestInfo({
-        state: finalResponse?.status || 'completed',
-        duration: performance.now() - startedAt,
-        ttft: firstTokenAt ? firstTokenAt - startedAt : 0,
-        usage: finalResponse?.usage || null,
-        responseID: finalResponse?.id || '',
-      });
-      await refresh();
-    } catch (error) {
-      if (serial !== requestSerial.current) return;
-      if (error.name === 'AbortError') {
-        setRequestInfo({ state: 'cancelled', duration: performance.now() - startedAt, ttft: firstTokenAt ? firstTokenAt - startedAt : 0, usage: null });
-        return;
-      }
-      setAnswer(error.message);
-      setRequestInfo({ state: 'failed', duration: performance.now() - startedAt, ttft: firstTokenAt ? firstTokenAt - startedAt : 0, usage: null, error: error.message });
-    } finally {
-      if (serial === requestSerial.current) setLoading(false);
-    }
-  };
-
   // （账号操作 runAccountAction/runUpstreamAction/accountActionHandler 与账号表
   // columns 已随账号列表一起拆到 #/pool 独立页面 AccountList。）
 
@@ -707,7 +609,7 @@ function Console() {
     pool: ['账号管理', '统一管理账号池，支持多选、批量操作、分组与加密迁移。'],
     collection: ['上游采集中心', '查看采集进度、失败原因与历史记录，配置并发、速率和刷新周期。'],
     models: ['模型与请求', '查看当前可用的上游模型。'],
-    playground: ['请求测试', '发送 Responses API 请求并查看标准化的 output_text。'],
+    playground: ['请求测试', '验证 Responses 与 Chat Completions，查看路由、响应和具体错误。'],
     requests: ['请求日志', '按时间、模型、状态、错误码、端点、账号、版本、首字耗时和请求 ID 筛选历史请求。'],
     accounts: ['账号配置', '添加与授权账号：OAuth 登录链接、短信直登，以及账号池区域信息。'],
     'auto-enroll': ['自动加号', '分别配置接码平台，按批次执行并集中查看进度；豪猪自动监控独立管理。'],
@@ -754,32 +656,7 @@ function Console() {
     },
     {
       key: 'playground', label: '请求测试',
-      children: (
-        <Card title="Responses API 测试">
-          <Space direction="vertical" size={14} style={{ width: '100%' }}>
-            <div className="request-toolbar">
-              <Select style={{ minWidth: 280 }} value={selectedModel} onChange={setSelectedModel} options={models.map(model => ({ value: model.id, label: model.id }))} />
-              <Space><Switch aria-label="流式响应" checked={stream} onChange={setStream} /><Text type="secondary">流式响应</Text></Space>
-            </div>
-            <Input.TextArea rows={5} maxLength={200000} showCount value={promptText} onChange={event => setPromptText(event.target.value)} placeholder="输入测试内容" />
-            <Space>
-              <Button type="primary" icon={<SendOutlined />} loading={loading} disabled={!selectedModel || !promptText.trim()} onClick={send}>发送请求</Button>
-              {loading && <Button onClick={() => requestController.current?.abort()}>停止</Button>}
-            </Space>
-            {requestInfo && (
-              <div className="request-meta" aria-live="polite">
-                <span>状态 <strong>{requestInfo.state}</strong></span>
-                <span>耗时 <strong>{(requestInfo.duration / 1000).toFixed(2)}s</strong></span>
-                <span>首 token <strong>{requestInfo.ttft ? `${(requestInfo.ttft / 1000).toFixed(2)}s` : '-'}</strong></span>
-                <span>输入 <strong>{fmt(requestInfo.usage?.input_tokens)}</strong></span>
-                <span>输出 <strong>{fmt(requestInfo.usage?.output_tokens)}</strong></span>
-                {requestInfo.responseID && <span title={requestInfo.responseID}>响应 ID <strong>{requestInfo.responseID}</strong></span>}
-              </div>
-            )}
-            <Card size="small" title="output_text"><pre className="response-output" aria-live="polite">{answer || '等待响应…'}</pre></Card>
-          </Space>
-        </Card>
-      ),
+      children: <PlaygroundPage api={api} headers={headers} models={models} onUnauthorized={() => setLocked(true)} />,
     },
     {
       key: 'admin', label: '管理设置',
@@ -1058,9 +935,9 @@ function Console() {
           <Menu theme="light" mode="inline" selectedKeys={[activeSection]} items={menuItems} onClick={({ key }) => setActiveSection(key)} />
         </Sider>
         <Layout>
-          <Header style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 26px' }}>
+          <Header className="console-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 26px' }}>
             <Space>
-              <Text strong style={{ color: '#172033' }}>服务控制台</Text>
+              <Text className="console-header-title" strong style={{ color: '#172033' }}>服务控制台</Text>
               {/* healthy 是"可用账号数"，不是布尔量：池非空但全部冷却时同样不可服务，
                   因此这里用「可用数 + 在途占满」共同判定，不能直接拿它当 true/false。 */}
               {(() => {
@@ -1075,7 +952,7 @@ function Console() {
               })()}
             </Space>
             <Space>
-              <Button href="/legal" target="_blank" rel="noopener noreferrer">许可证与源码</Button>
+              <Button aria-label="查看许可证与源码" href="/legal" target="_blank" rel="noopener noreferrer" icon={<FileSearchOutlined />}>许可证与源码</Button>
               <Button aria-label="刷新控制台" icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
               <Button aria-label="设置 API Key" icon={<KeyOutlined />} onClick={() => {
                 // setApiKey 已经足够；不再写 sessionStorage（HIGH-006）。

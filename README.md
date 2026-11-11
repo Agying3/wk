@@ -735,6 +735,22 @@ Tokens prefixed with @ are paths the user explicitly referenced. Relative paths 
 | `POST /admin/account/poll?region=cn|global` | 前端会话/Bearer | 轮询并保存对应区域授权结果 |
 | `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
 
+控制台「请求测试」通过管理员专用入口 `GET /admin/playground/options`、
+`POST /admin/playground/responses` 和 `POST /admin/playground/chat/completions` 工作，
+支持管理员会话或全局管理员密钥，分组密钥不可调用。它不会要求管理域名开放 `/v1/*`，
+因此可以与管理域名禁止客户端 API 的入口策略共存。
+
+测试请求使用 `{ "request": { ...标准协议请求体... }, "group": "", "account_uid": "" }`。
+空选择使用自动路由；选择分组后限定该组，指定账号后只使用该账号，两者同时设置时取交集。
+账号仍受禁用、模型冷却、并发与代理限制，不会因为测试而自动启用，也不会在指定账号失败后换号。
+选项刷新只读当前快照，不触发模型探测、余额采集或凭证刷新；点击发送才产生真实推理请求。
+
+页面提供两种协议与流式/非流式选择、系统指令、输出上限、Temperature、推理档位、
+浏览器等待超时及手动取消。响应正文与错误分开展示，包含 HTTP 状态、错误类型/代码、
+请求 ID、耗时、首 token、输入/输出及缓存用量；HTML/纯文本错误页按文本显示，
+流式失败、未完成和缺少完成标记的断流不会标成成功。请求预览与复制诊断不包含认证头，
+最近 10 次参数及状态只保存在页面内存，载入历史不会自动重发。
+
 ZCode 等使用 OpenAI Compatible 提供商的客户端，Base URL 应填写
 `https://你的域名/v1`（直连本服务时为 `http://服务器地址:7863/v1`），模型名称单独填写。
 客户端会在 Base URL 后追加 `/chat/completions`；如果填写域名根路径，中间网关可能

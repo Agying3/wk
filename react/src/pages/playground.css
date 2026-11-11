@@ -1,0 +1,20 @@
+.playground { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.playground-intro { display: flex; gap: 16px; justify-content: space-between; align-items: flex-start; }
+.playground-intro h4 { margin: 0 0 5px; }
+.playground-layout { display: grid; grid-template-columns: minmax(300px, .9fr) minmax(0, 1.25fr); gap: 20px; align-items: start; }
+.playground-layout > *, .playground-results > * { min-width: 0; }
+.playground-results { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.playground-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 14px; }
+.playground-grid .ant-input-number { width: 100%; }
+.playground-full { grid-column: 1 / -1; }
+.playground-route-heading { display: flex; align-items: center; justify-content: space-between; margin: 2px 0 14px; gap: 10px; }
+.playground-controls .ant-alert { margin-bottom: 12px; }
+.playground-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.playground-metrics > div { display: flex; flex-direction: column; gap: 3px; background: #f5f8fc; border: 1px solid #e7edf5; border-radius: 8px; padding: 10px; overflow-wrap: anywhere; }
+.playground-output, .playground-raw { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; background: #f7f9fc; border: 1px solid #e7edf5; border-radius: 8px; padding: 14px; margin: 14px 0 0; font-family: Consolas, monospace; font-size: 13px; line-height: 1.7; max-height: 620px; overflow: auto; }
+.playground-output { min-height: 120px; }
+.playground-raw { max-height: 240px; margin-top: 0; width: 100%; }
+.playground-error { margin: 14px 0; }
+.playground-error .ant-alert-description, .playground-results .ant-descriptions-item-content { overflow-wrap: anywhere; min-width: 0; }
+@media (max-width: 1100px) { .playground-layout { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .playground-grid { grid-template-columns: 1fr; } .playground-intro { flex-direction: column; gap: 8px; } .playground .ant-card-body { padding: 14px; } .playground-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

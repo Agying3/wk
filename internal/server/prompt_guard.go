@@ -46,6 +46,14 @@ func (h *Handler) capturePrompt(model, uid string, original []byte, outbound map
 	}
 	var doc map[string]any
 	_ = json.Unmarshal(original, &doc)
+	if scope.kind == "playground" && scope.group == "" {
+		// No synthetic group is persisted. Legacy capture is deliberately
+		// restricted to the actual account, including a manually pinned UID.
+		if _, err := h.cfg.PromptGuard.Capture(model, uid, promptguard.Extract(doc), promptguard.Extract(outbound)); err != nil {
+			log.Printf("prompt guard: capture failed (see administrator storage status)")
+		}
+		return
+	}
 	if _, err := h.cfg.PromptGuard.CaptureScoped(model, uid, promptguard.Extract(doc), promptguard.Extract(outbound), capturedPromptScope(scope, allow)); err != nil {
 		log.Printf("prompt guard: capture failed (see administrator storage status)")
 	}

@@ -75,6 +75,9 @@ func (c *chatRoute) release(uid string) {
 
 func routeNamespace(r *http.Request) string {
 	s := scopeFromRequest(r)
+	if s.kind == "playground" {
+		return fmt.Sprintf("%q/%q/%q/%q", s.kind, s.group, s.keyID, s.accountUID)
+	}
 	return fmt.Sprintf("%q/%q/%q", s.kind, s.group, s.keyID)
 }
 

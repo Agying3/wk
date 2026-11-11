@@ -448,6 +448,9 @@ func NewHandler(cfg Config) *Handler {
 	// Console metadata has its own admin-only route. Public model APIs may be
 	// disabled at the ingress without preventing the console from loading.
 	h.mux.HandleFunc("GET /admin/models", h.withFrontend(h.models))
+	h.mux.HandleFunc("GET /admin/playground/options", h.withFrontend(h.playgroundOptions))
+	h.mux.HandleFunc("POST /admin/playground/responses", h.withFrontend(h.playgroundResponses))
+	h.mux.HandleFunc("POST /admin/playground/chat/completions", h.withFrontend(h.playgroundChat))
 	h.mux.HandleFunc("POST /admin/config", h.withFrontend(h.saveAdminConfig))
 	h.mux.HandleFunc("GET /admin/request-capture", h.withFrontend(h.requestCaptureAPI))
 	h.mux.HandleFunc("GET /admin/request-capture/{id}", h.withFrontend(h.requestCaptureAPI))
@@ -855,11 +858,13 @@ func (h *Handler) authOK(r *http.Request) bool {
 //   - group（分组密钥）：keys.json 里的密钥命中。只能用绑定分组的账号；
 //     不能访问 /admin/*。
 type requestScope struct {
-	kind     string // "admin" | "group"
-	group    string // group 密钥的绑定分组（"" = 不限，但 kind=group 时恒非空）
-	keyID    string // 密钥 id（日志归因用）
-	keyName  string // Safe display name; never the Bearer credential.
-	adminKey bool   // true = 命中 config 全局 APIKey
+	kind       string          // "admin" | "group" | "playground"
+	group      string          // group 密钥的绑定分组（"" = 不限，但 kind=group 时恒非空）
+	keyID      string          // 密钥 id（日志归因用）
+	keyName    string          // Safe display name; never the Bearer credential.
+	adminKey   bool            // true = 命中 config 全局 APIKey
+	accountUID string          // Explicit playground account; never permits fallback to another UID.
+	selection  map[string]bool // Playground admission snapshot; may only shrink.
 }
 
 type scopeKey struct{}
@@ -903,6 +908,9 @@ func (h *Handler) resolveScope(r *http.Request) (requestScope, bool) {
 // allowSet 把作用域转成选号过滤集合。管理员/无分组存储返回 nil（不过滤）；
 // 分组密钥返回该分组的 uid 集合（可能为空 map = 该分组无账号，选号直接 nil）。
 func (h *Handler) allowSet(s requestScope) map[string]bool {
+	if s.kind == "playground" {
+		return h.playgroundAllow(s)
+	}
 	if s.kind != "group" || h.cfg.Groups == nil {
 		return nil
 	}
@@ -4229,6 +4237,12 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer release()
+		var permitted bool
+		previousRouteKey, permitted = h.playgroundHistoryRoute(r, previousRouteKey)
+		if !permitted {
+			writeOpenAIError(w, http.StatusBadRequest, "previous_response_scope_mismatch", "previous_response_id belongs to another request scope; start a new conversation")
+			return
+		}
 		// Top-level Responses instructions apply to the current request. Keep
 		// them before the restored transcript and never insert them between a
 		// prior assistant tool call and its function_call_output.
@@ -4276,14 +4290,14 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		}
 		response := chatToResponse(chat, responseID)
 		if assistant := chatAssistantMessage(chat, responseID); assistant != nil {
-			responseHistoryResult(response, h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID))
+			responseHistoryResult(response, h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), h.playgroundStoreRoute(r, routeKey), previousID))
 		}
 		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	sw := &responsesStreamWriter{header: make(http.Header), dst: w, fallbackID: fallbackResponseID}
 	sw.onComplete = func(responseID string, assistant map[string]any) error {
-		return h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), routeKey, previousID)
+		return h.storeResponse(responseID, append(responseInputMessages(turnMessages), assistant), h.playgroundStoreRoute(r, routeKey), previousID)
 	}
 	h.chatCompletions(sw, chatReq)
 }
@@ -5327,6 +5341,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 	defer captureChatStat(r.Context(), st)
+	defer finishPlaygroundStat(r, st)
 	captureNormalized(r.Context(), body)
 	// The upstream client canonicalizes public aliases before sending the body.
 	// Use the same canonical ID for model-level routing/cooldowns so a limit
@@ -5384,6 +5399,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
+		if scopeFromRequest(r).kind == "playground" {
+			scopeAllow = h.allowSet(scopeFromRequest(r))
+		}
 		acct, routeErr := route.acquire(r.Context(), tried, scopeAllow)
 		if routeErr != nil {
 			writeOpenAIError(w, http.StatusRequestTimeout, "request_cancelled", routeErr.Error())
@@ -5394,6 +5412,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
 			break
+		}
+		if scopeFromRequest(r).kind == "playground" && !h.allowSet(scopeFromRequest(r))[acct.UID] {
+			route.release(acct.UID)
+			writeOpenAIError(w, http.StatusConflict, "account_scope_changed", "selected account scope changed; reload options and retry")
+			st.status = http.StatusConflict
+			return
 		}
 		st.uid = acct.UID
 		st.region = acct.Region()
@@ -5556,6 +5580,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.errorCode = ""
 		st.errorMessage = ""
 		st.toks = completionTokens(resp)
+		return
+	}
+	if finishPlaygroundError(w, r, st, lastErr) {
 		return
 	}
 	// A deterministic upstream 4xx (for example code=11128, which means the

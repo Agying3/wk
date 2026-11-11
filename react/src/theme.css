@@ -203,6 +203,8 @@ button, input, textarea, select { font: inherit; }
 @media (max-width: 640px) {
   .ant-layout-content { padding: 18px !important; }
   .ant-layout-header { padding: 0 16px !important; }
+  .ant-layout-header.console-header { padding-left: 48px !important; }
+  .console-header-title { display: none; }
   .ant-layout-header .ant-space { gap: 8px !important; }
   .ant-layout-header .ant-btn > span:not(.ant-btn-icon) { display: none; }
   .trend-grid { grid-template-columns: 1fr; }
