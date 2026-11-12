@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ACCOUNT_CREDENTIAL_MAX_BYTES, ACCOUNT_IMPORT_MAX_BYTES, accountImportDeviceLabel, accountImportResultType, buildAccountImportRequest,
-  createAccountImportFileLoader, identifyAccountImport, normalizeAccountImportOptions, validTransferPassword,
+  createAccountImportFileLoader, identifyAccountImport, normalizeAccountImportOptions, runMultiAccountImport, validTransferPassword,
 } from './accountTransfer.js';
 
 const official = uid => ({ auth: { accessToken: 'fake-access-token', refreshToken: 'fake-refresh-token', expiresAt: 1900000000000 }, account: { uid, nickname: 'Test account' } });
@@ -135,6 +135,35 @@ test('nickname overrides require a single-account document and validate Unicode 
   // Selecting one UID from a multi-account encrypted document does not permit a nickname override.
   assert.throws(() => buildAccountImportRequest(identifyAccountImport(bundle), password, ['u1'], { nickname: 'name' }));
   assert.deepEqual(normalizeAccountImportOptions({ nickname: '   ' }, false), { group_mode: 'source' });
+});
+
+test('multiple credential files load together and reject duplicate or mixed files', async () => {
+  const loader = createAccountImportFileLoader();
+  const result = await loader.loadMany([file('one.json', official('u1')), file('two.json', official('u2'))]);
+  assert.equal(result.source.kind, 'credentials');
+  assert.equal(result.source.sources.length, 2);
+  assert.match((await loader.loadMany([file('a', official('u1')), file('b', official('u1'))])).error, /重复/);
+  assert.match((await loader.loadMany([file('a', official('u1')), file('bundle', bundle)])).error, /单独选择/);
+  assert.equal((await loader.loadMany([file('a', official('u1'))])).source.kind, 'credential');
+});
+
+test('multiple imports preview each credential and stop after uncertain write', async () => {
+  const sources = (await createAccountImportFileLoader().loadMany([file('a', official('u1')), file('b', official('u2')), file('c', official('u3'))])).source.sources;
+  const calls = [];
+  const post = async (path, body) => {
+    const uid = JSON.parse(body.credential_json).account.uid;
+    calls.push([path, uid]);
+    if (path.endsWith('/preview')) return { accounts: [{ uid, exists: uid === 'u2' }] };
+    if (uid === 'u2') throw new Error('network error');
+    return { results: [{ uid, ok: true }] };
+  };
+  const preview = await runMultiAccountImport(post, sources, { group_mode: 'source' });
+  assert.deepEqual(preview.accounts.map(row => row.uid), ['u1', 'u2', 'u3']);
+  const result = await runMultiAccountImport(post, sources, { group_mode: 'source' }, ['u1', 'u2', 'u3']);
+  assert.equal(result.success, 1);
+  assert.equal(result.stop, true);
+  assert.match(result.results[2].detail, /未提交/);
+  assert.deepEqual(calls.slice(3).map(call => call[1]), ['u1', 'u2']);
 });
 
 test('device preview shows the planned platform decision and never device identity', () => {
