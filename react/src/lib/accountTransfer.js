@@ -119,16 +119,19 @@ export function createAccountImportFileLoader() {
 
 // Each official credential uses the existing single-account endpoint. Stop on
 // uncertain writes so the remaining accounts are never silently replayed.
-export async function runMultiAccountImport(post, sources, options, selected) {
+export async function runMultiAccountImport(post, sources, options, selected, cancelled = () => false, onProgress = () => {}) {
   const preview = selected === undefined;
   const wanted = new Set(selected || []);
+  const targets = preview ? sources : sources.filter(source => wanted.has(source.credential.account.uid));
   const rows = [];
   let stopped = false;
-  for (const source of sources) {
+  let completed = 0;
+  onProgress({ completed, total: targets.length });
+  for (const source of targets) {
     const uid = source.credential.account.uid;
-    if (!preview && !wanted.has(uid)) continue;
-    if (stopped) {
-      rows.push({ uid, ok: false, detail: '未提交，请重新预览' });
+    if (cancelled() || stopped) {
+      stopped = true;
+      if (!preview) rows.push({ uid, ok: false, cancelled: true, detail: '未提交，请重新预览' });
       continue;
     }
     try {
@@ -143,17 +146,22 @@ export async function runMultiAccountImport(post, sources, options, selected) {
         if (body.stop || body.results[0].pending) stopped = true;
       }
     } catch (error) {
-      if (preview) rows.push({ uid, nickname: source.credential.account.nickname || '', issue: error.message || '预览失败' });
-      else {
+      if (preview) {
+        if (!error.status || error.status >= 500 || [401, 403, 429].includes(error.status)) throw error;
+        const nickname = source.credential.account.nickname;
+        rows.push({ uid, nickname: typeof nickname === 'string' ? nickname : '', issue: error.message || '预览失败' });
+      } else {
         rows.push({ uid, ok: false, detail: `${error.message || '导入请求失败'}；请刷新账号列表核对状态` });
         stopped = true;
       }
     }
+    completed++;
+    onProgress({ completed, total: targets.length });
   }
-  if (preview) return { accounts: rows, count: rows.length };
+  if (preview) return { accounts: rows, count: rows.length, stop: stopped };
   const success = rows.filter(row => row.ok).length;
   const skipped = rows.filter(row => row.skipped).length;
-  return { ok: success === rows.length, success, skipped, stop: stopped, results: rows };
+  return { ok: success === rows.length && !stopped, success, skipped, stop: stopped, results: rows };
 }
 
 export function accountImportResultType(result) {
